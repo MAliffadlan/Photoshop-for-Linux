@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-mectov-project">
+    <comment>mectov image project</comment>
+    <glob pattern="*.mectov"/>
+    <icon name="me.silverl.mectov"/>
+    <sub-class-of type="application/zip"/>
+  </mime-type>
+</mime-info>

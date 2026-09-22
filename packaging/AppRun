@@ -1,0 +1,5 @@
+#!/bin/sh
+# AppRun for the mectov AppImage: launch the editor with a predictable environment.
+set -eu
+HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec "$HERE/usr/bin/mectov" "$@"

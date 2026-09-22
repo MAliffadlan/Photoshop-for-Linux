@@ -1,0 +1,7 @@
+/target/
+/dist/
+*.tmp
+.agents/
+.codex/
+.freebuff/
+
