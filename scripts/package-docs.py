@@ -31,7 +31,7 @@ def main():
     parser.add_argument("version")
     args = parser.parse_args()
     args.destination.mkdir(parents=True)
-    repository = "https://github.com/MAliffadlan/mectov"
+    repository = "https://github.com/MAliffadlan/Photoshop-for-Linux"
     tag = quote(f"v{args.version}", safe="")
 
     for relative, name in DOCUMENTS.items():

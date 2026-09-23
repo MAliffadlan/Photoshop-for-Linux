@@ -70,7 +70,7 @@ After validation succeeds, [changelogithub](https://github.com/antfu-collective/
 Preview release notes locally without publishing:
 
 ```sh
-npx --yes changelogithub@15.0.5 --dry --to HEAD --github MAliffadlan/mectov
+npx --yes changelogithub@15.0.5 --dry --to HEAD --github MAliffadlan/Photoshop-for-Linux
 ```
 
 The first release uses the available commit history; subsequent notes start after the preceding release tag. To retry a failed release, rerun its workflow in GitHub Actions.

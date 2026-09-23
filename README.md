@@ -15,7 +15,7 @@ mectov started as my Rust port of [Compositor](https://github.com/robbietilton/C
 
 ## Get started
 
-Download a `.deb`, `.rpm`, or portable archive from [Releases](https://github.com/MAliffadlan/mectov/releases). Follow the [installation instructions](docs/USAGE.md#install-and-launch), then launch the demo:
+Download a `.deb`, `.rpm`, or portable archive from [Releases](https://github.com/MAliffadlan/Photoshop-for-Linux/releases). Follow the [installation instructions](docs/USAGE.md#install-and-launch), then launch the demo:
 
 ```sh
 mectov --demo

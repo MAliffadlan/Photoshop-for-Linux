@@ -4,7 +4,7 @@
 
 mectov runs on Linux with Wayland or X11 and working Vulkan drivers. Mesa software Vulkan can also run the editor. Native file dialogs use the desktop portal; install the portal backend for your desktop if dialogs do not appear.
 
-Download the package for your distribution from [Releases](https://github.com/MAliffadlan/mectov/releases). GitHub releases provide x86_64 builds.
+Download the package for your distribution from [Releases](https://github.com/MAliffadlan/Photoshop-for-Linux/releases). GitHub releases provide x86_64 builds.
 
 On Debian or Ubuntu, install the downloaded `.deb` with APT so runtime dependencies are installed too:
 
