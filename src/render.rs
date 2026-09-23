@@ -340,8 +340,9 @@ fn render_pixels(document: &Document, width: u32, height: u32) -> RgbaImage {
     };
     let pixels = render_window(document, &window);
     let mut output = RgbaImage::new(width, height);
-    for (target, pixel) in output.as_mut().chunks_exact_mut(4).zip(pixels) {
-        target.copy_from_slice(&pixel.map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8));
+    let (texels, _) = output.as_mut().as_chunks_mut::<4>();
+    for (target, pixel) in texels.iter_mut().zip(pixels) {
+        *target = pixel.map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8);
     }
     output
 }
