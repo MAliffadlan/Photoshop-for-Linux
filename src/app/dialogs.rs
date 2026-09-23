@@ -507,6 +507,52 @@ impl EditorApp {
                                 .changed();
                             changed |= widgets::checkbox(ui, monochrome, "Monochromatic").changed();
                         }
+                        Adjustment::GaussianBlur { radius } => {
+                            changed |= ui
+                                .add(
+                                    widgets::Slider::new(radius, 0.1..=250.0)
+                                        .logarithmic(true)
+                                        .text("Radius")
+                                        .suffix(" px"),
+                                )
+                                .changed();
+                            ui.label("Softens everything beneath this layer.");
+                        }
+                        Adjustment::MotionBlur { angle, distance } => {
+                            changed |= ui
+                                .add(
+                                    widgets::Slider::new(angle, -90.0..=90.0)
+                                        .text("Angle")
+                                        .suffix("°"),
+                                )
+                                .changed();
+                            changed |= ui
+                                .add(
+                                    widgets::Slider::new(distance, 1.0..=2000.0)
+                                        .logarithmic(true)
+                                        .text("Distance")
+                                        .suffix(" px"),
+                                )
+                                .changed();
+                            ui.label("Blurs everything beneath this layer along one direction.");
+                        }
+                        Adjustment::AddNoise {
+                            amount,
+                            gaussian,
+                            monochromatic,
+                            ..
+                        } => {
+                            changed |= ui
+                                .add(
+                                    widgets::Slider::new(amount, 0.1..=400.0)
+                                        .text("Amount")
+                                        .suffix("%"),
+                                )
+                                .changed();
+                            changed |= widgets::checkbox(ui, gaussian, "Gaussian").changed();
+                            changed |=
+                                widgets::checkbox(ui, monochromatic, "Monochromatic").changed();
+                        }
                         Adjustment::Invert => {}
                         Adjustment::BlackWhite {
                             reds,

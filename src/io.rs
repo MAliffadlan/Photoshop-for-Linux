@@ -16,9 +16,9 @@ use zip::{ZipArchive, ZipWriter, write::SimpleFileOptions};
 use crate::{
     blend::BlendMode,
     document::{
-        Adjustment, ColorOverlayEffect, Document, Guide, GuideAxis, InnerShadowEffect, Layer,
-        LayerEffects, MAX_PIXELS, Mask, OuterGlowEffect, Point, ShadowEffect, StrokeEffect,
-        Transform, validate_size,
+        Adjustment, ColorOverlayEffect, Document, Guide, GuideAxis, InnerGlowEffect,
+        InnerShadowEffect, Layer, LayerEffects, MAX_PIXELS, Mask, OuterGlowEffect, Point,
+        ShadowEffect, StrokeEffect, Transform, validate_size,
     },
     render,
 };
@@ -120,15 +120,27 @@ pub fn save(document: &Document, path: &Path) -> Result<()> {
         let mut archive = ZipWriter::new(temporary.as_file_mut());
         let options =
             SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
-        // Guides and layer effects are version 3: older readers must not silently drop them.
-        let version =
-            if !document.guides.is_empty() || document.layers.iter().any(|l| l.effects.is_some()) {
-                3
-            } else if document.layers.iter().any(|l| l.raw.is_some()) {
-                2
-            } else {
-                1
-            };
+        // Guides, layer effects and the 1.2.3 blur and noise adjustment layers all raise the version,
+        // because an older reader must refuse the file rather than silently drop what it cannot draw.
+        let version = if document.layers.iter().any(|layer| {
+            layer.adjustment.as_ref().is_some_and(|adjustment| {
+                matches!(
+                    adjustment,
+                    Adjustment::GaussianBlur { .. }
+                        | Adjustment::MotionBlur { .. }
+                        | Adjustment::AddNoise { .. }
+                )
+            })
+        }) {
+            4
+        } else if !document.guides.is_empty() || document.layers.iter().any(|l| l.effects.is_some())
+        {
+            3
+        } else if document.layers.iter().any(|l| l.raw.is_some()) {
+            2
+        } else {
+            1
+        };
         let manifest = Manifest {
             format: FORMAT_ID.into(),
             version,
@@ -200,7 +212,7 @@ pub fn load(path: &Path) -> Result<Document> {
     let mut manifest: Manifest =
         serde_json::from_slice(&zip_read(&mut archive, "manifest.json", MAX_MANIFEST)?)?;
     ensure!(
-        READ_FORMATS.contains(&manifest.format.as_str()) && (1..=3).contains(&manifest.version),
+        READ_FORMATS.contains(&manifest.format.as_str()) && (1..=4).contains(&manifest.version),
         "Unsupported mectov project version"
     );
     let mut used_pixels = 0;
@@ -484,6 +496,21 @@ fn comp_adjustment(value: &Value) -> Result<Adjustment> {
                 preserve_luminosity: settings["preserveLuminosity"].as_bool().unwrap_or(true),
             }
         }
+        // Compositor 1.2.3's three additions. Each key is optional there, so an absent one keeps the
+        // value Core Image opens with, and a project that leaves them out imports unchanged.
+        "Add Noise" => Adjustment::AddNoise {
+            amount: number(value, "noiseAmount", 10.0),
+            gaussian: value["noiseGaussian"].as_bool().unwrap_or(false),
+            monochromatic: value["noiseMonochromatic"].as_bool().unwrap_or(false),
+            seed: value["noiseSeed"].as_u64().unwrap_or(0) as u32,
+        },
+        "Gaussian Blur" => Adjustment::GaussianBlur {
+            radius: number(value, "blurRadius", 10.0),
+        },
+        "Motion Blur" => Adjustment::MotionBlur {
+            angle: number(value, "motionAngle", 0.0),
+            distance: number(value, "motionDistance", 10.0),
+        },
         _ => bail!("Unsupported Compositor adjustment: {kind}"),
     };
     crate::effects::validate_adjustment(&result)?;
@@ -564,6 +591,18 @@ fn comp_effects(value: &Value) -> Result<Option<LayerEffects>> {
                 opacity: number(glow, "opacity", default.opacity),
             }
         }),
+        // Compositor 1.2.3 added this one; the field keeps it so a project can be saved back without
+        // the glow quietly disappearing, even though nothing draws layer effects yet.
+        inner_glow: present(value, "innerGlow").then(|| {
+            let default = InnerGlowEffect::default();
+            let glow = &value["innerGlow"];
+            InnerGlowEffect {
+                enabled: comp_enabled(glow),
+                size: number(glow, "size", default.size),
+                color: comp_color(glow, default.color),
+                opacity: number(glow, "opacity", default.opacity),
+            }
+        }),
     };
     if effects.is_empty() {
         return Ok(None);
@@ -585,8 +624,9 @@ pub fn load_compositor(path: &Path) -> Result<Document> {
     let version = manifest["version"]
         .as_u64()
         .context("Project version missing")?;
+    // Compositor 1.2.3 writes 9, which adds blur and noise adjustment layers to 1.2.0's version 8.
     ensure!(
-        (1..=8).contains(&version),
+        (1..=9).contains(&version),
         "Unsupported Compositor project version {version}"
     );
     ensure!(
@@ -891,10 +931,10 @@ mod tests {
     }
 
     /// The version 8 manifest Compositor 1.2 writes: guides on the document, layer effects on a layer.
-    fn compositor_v8_manifest(id: Uuid) -> Value {
+    fn compositor_manifest(id: Uuid, version: u64) -> Value {
         serde_json::json!({
             "format": "com.compositor.project",
-            "version": 8,
+            "version": version,
             "colorSpace": "sRGB",
             "documentID": Uuid::new_v4(),
             "width": 2,
@@ -917,6 +957,38 @@ mod tests {
                 },
             }],
         })
+    }
+
+    fn compositor_v8_manifest(id: Uuid) -> Value {
+        compositor_manifest(id, 8)
+    }
+
+    /// A project as Compositor 1.2.3 writes one: version 9, Inner Glow on the layer that carries the
+    /// effects, and the three adjustment kinds the source only allows from this version on.
+    fn compositor_v9_manifest() -> (Value, Vec<Uuid>) {
+        let ids: Vec<Uuid> = (0..4).map(|_| Uuid::new_v4()).collect();
+        let mut manifest = compositor_manifest(ids[0], 9);
+        manifest["activeLayerID"] = serde_json::json!(ids[0]);
+        manifest["layers"][0]["effects"]["innerGlow"] =
+            serde_json::json!({"size": 24, "red": 0.5, "green": 0.75, "blue": 1.0, "opacity": 0.9});
+        let mut layers = manifest["layers"].as_array().unwrap().clone();
+        layers.extend(
+            ["Gaussian Blur", "Motion Blur", "Add Noise"]
+                .iter()
+                .zip(&ids[1..])
+                .map(|(kind, id)| {
+                    serde_json::json!({
+                        "id": id,
+                        "name": kind,
+                        "isVisible": true,
+                        "transform": {"origin": [0, 0], "size": [2, 2], "rotation": 0, "flipX": false, "flipY": false},
+                        "blendMode": "Normal",
+                        "adjustment": {"kind": kind},
+                    })
+                }),
+        );
+        manifest["layers"] = Value::Array(layers);
+        (manifest, ids)
     }
 
     #[test]
@@ -1108,17 +1180,110 @@ mod tests {
         assert_eq!(kinds, ["Invert", "Black & White", "Color Balance"]);
     }
 
+    /// Compositor 1.2.3 writes version 9. A project that carries the kinds it added has to import
+    /// whole, and everything the blur and noise layers set has to arrive with it.
+    #[test]
+    fn imports_version_nine_projects_with_blur_and_noise_layers() {
+        assert_eq!(
+            comp_adjustment(&serde_json::json!({"kind": "Gaussian Blur"})).unwrap(),
+            Adjustment::GaussianBlur { radius: 10.0 }
+        );
+        assert_eq!(
+            comp_adjustment(&serde_json::json!({
+                "kind": "Motion Blur", "motionAngle": -45, "motionDistance": 120
+            }))
+            .unwrap(),
+            Adjustment::MotionBlur {
+                angle: -45.0,
+                distance: 120.0,
+            }
+        );
+        assert_eq!(
+            comp_adjustment(&serde_json::json!({
+                "kind": "Add Noise", "noiseAmount": 65, "noiseGaussian": true,
+                "noiseMonochromatic": true, "noiseSeed": 99
+            }))
+            .unwrap(),
+            Adjustment::AddNoise {
+                amount: 65.0,
+                gaussian: true,
+                monochromatic: true,
+                seed: 99,
+            }
+        );
+        // Keys the source leaves optional keep the settings its own adjustments open with.
+        assert_eq!(
+            comp_adjustment(&serde_json::json!({"kind": "Add Noise"})).unwrap(),
+            Adjustment::AddNoise {
+                amount: 10.0,
+                gaussian: false,
+                monochromatic: false,
+                seed: 0,
+            }
+        );
+        // Settings outside the source's ranges are refused with the project, not imported.
+        assert!(
+            comp_adjustment(&serde_json::json!({"kind": "Gaussian Blur", "blurRadius": 900}))
+                .is_err()
+        );
+        assert!(
+            comp_adjustment(&serde_json::json!({"kind": "Motion Blur", "motionAngle": 180}))
+                .is_err()
+        );
+
+        let directory = tempfile::tempdir().unwrap();
+        let (manifest, ids) = compositor_v9_manifest();
+        fs::write(
+            directory.path().join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let document = load_compositor(directory.path()).unwrap();
+        let kinds: Vec<&str> = document
+            .layers
+            .iter()
+            .filter_map(|layer| layer.adjustment.as_ref())
+            .map(|adjustment| adjustment.name())
+            .collect();
+        assert_eq!(kinds, ["Gaussian Blur", "Motion Blur", "Add Noise"]);
+        assert_eq!(
+            document.layers[0].effects.unwrap().inner_glow,
+            Some(InnerGlowEffect {
+                enabled: true,
+                size: 24.0,
+                color: [0.5, 0.75, 1.0],
+                opacity: 0.9,
+            })
+        );
+        // The blur layers name the ids the project gave them, and the whole set round trips as version
+        // 4 of mectov's own format, which is the version that understands these kinds.
+        let path = directory.path().join("blur.mectov");
+        save(&document, &path).unwrap();
+        let mut archive = ZipArchive::new(File::open(&path).unwrap()).unwrap();
+        let stored: Value =
+            serde_json::from_slice(&zip_read(&mut archive, "manifest.json", MAX_MANIFEST).unwrap())
+                .unwrap();
+        assert_eq!(stored["version"], 4);
+        let loaded = load(&path).unwrap();
+        for (before, after) in document.layers.iter().zip(&loaded.layers) {
+            assert_eq!(before.id, after.id);
+            assert_eq!(before.adjustment, after.adjustment);
+            assert_eq!(before.effects, after.effects);
+        }
+        assert_eq!(loaded.layers[1].id, ids[1]);
+    }
+
     #[test]
     fn rejects_later_project_versions_and_invalid_effects() {
         let directory = tempfile::tempdir().unwrap();
         let manifest_path = directory.path().join("manifest.json");
         let id = Uuid::new_v4();
         let mut manifest = compositor_v8_manifest(id);
-        manifest["version"] = serde_json::json!(9);
+        manifest["version"] = serde_json::json!(10);
         fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
         assert_eq!(
             load_compositor(directory.path()).unwrap_err().to_string(),
-            "Unsupported Compositor project version 9"
+            "Unsupported Compositor project version 10"
         );
         manifest["version"] = serde_json::json!(8);
         manifest["layers"][0]["effects"]["stroke"]["opacity"] = serde_json::json!(2.0);

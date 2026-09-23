@@ -74,6 +74,15 @@ struct Source {
     texture: wgpu::Texture,
 }
 
+/// What one backdrop blur pass needs beyond its parameters.
+struct BackdropPass<'a> {
+    current: usize,
+    coverage: &'a wgpu::Texture,
+    scale: f32,
+    size: [u32; 2],
+    adjustment: &'a Adjustment,
+}
+
 pub struct GpuCompositor {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -82,6 +91,8 @@ pub struct GpuCompositor {
     sources: HashMap<(usize, [u32; 2]), Source>,
     size: [u32; 2],
     buffers: [wgpu::Texture; 2],
+    /// Held between the two halves of a backdrop blur, and only allocated once a document has one.
+    blur: Option<wgpu::Texture>,
     display: wgpu::Texture,
     blank: wgpu::Texture,
     motion_blur: GpuMotionBlur,
@@ -132,6 +143,7 @@ impl GpuCompositor {
             sources: HashMap::new(),
             size: [1, 1],
             buffers,
+            blur: None,
             display,
             blank,
             motion_blur,
@@ -187,6 +199,7 @@ impl GpuCompositor {
             self.buffers = std::array::from_fn(|_| {
                 target(&self.device, size, wgpu::TextureFormat::Rgba16Float, 1)
             });
+            self.blur = None;
             self.display = target(
                 &self.device,
                 size,
@@ -339,6 +352,25 @@ impl GpuCompositor {
                 params.appearance[2] = distance * cos / pixels.width() as f32;
                 params.appearance[3] = distance * sin / pixels.height() as f32;
             }
+            if let Some(adjustment) = layer
+                .adjustment
+                .as_ref()
+                .filter(|adjustment| adjustment.is_backdrop_filter())
+            {
+                let blank = self.blank.clone();
+                let pass = BackdropPass {
+                    current,
+                    coverage: coverage.as_ref().unwrap_or(&blank),
+                    // Compositor draws these at the canvas scale, so a radius or a distance counts
+                    // document pixels and a preview blurs proportionally less.
+                    scale: size[0] as f32 / document.width as f32,
+                    size,
+                    adjustment,
+                };
+                self.blur_backdrop(&mut encoder, pass, &mut params);
+                current = 1 - current;
+                continue;
+            }
             self.dispatch(
                 &mut encoder,
                 current,
@@ -402,12 +434,107 @@ impl GpuCompositor {
         }
     }
 
+    /// A blur adjustment reads what has been drawn beneath it, so it runs as passes of its own
+    /// between the layers below and the layers above instead of inside one compositing pass.
+    fn blur_backdrop(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        pass: BackdropPass<'_>,
+        params: &mut Parameters,
+    ) {
+        let BackdropPass {
+            current,
+            coverage,
+            scale,
+            size,
+            adjustment,
+        } = pass;
+        match adjustment {
+            Adjustment::GaussianBlur { radius } => {
+                params.first[0] = radius * scale;
+                let scratch = self.blur_target(size);
+                // One axis, then the other, leaving the softened backdrop in the other buffer.
+                params.flags[1] = 20;
+                self.dispatch_to(
+                    encoder,
+                    &self.buffers[current],
+                    &self.blank,
+                    coverage,
+                    &scratch,
+                    params,
+                );
+                params.flags[1] = 21;
+                self.dispatch_to(
+                    encoder,
+                    &scratch,
+                    &self.buffers[current],
+                    coverage,
+                    &self.buffers[1 - current],
+                    params,
+                );
+            }
+            Adjustment::MotionBlur { angle, distance } => {
+                let (sin, cos) = angle.to_radians().sin_cos();
+                let distance = distance * scale;
+                params.flags[1] = 22;
+                params.appearance[1] = crate::backdrop::motion_steps(distance) as f32;
+                params.appearance[2] = distance * cos / size[0] as f32;
+                params.appearance[3] = distance * sin / size[1] as f32;
+                self.dispatch_to(
+                    encoder,
+                    &self.blank,
+                    &self.buffers[current],
+                    coverage,
+                    &self.buffers[1 - current],
+                    params,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    /// The scratch texture a two-pass backdrop blur holds its first axis in.
+    fn blur_target(&mut self, size: [u32; 2]) -> wgpu::Texture {
+        let stale = self
+            .blur
+            .as_ref()
+            .is_none_or(|texture| [texture.width(), texture.height()] != size);
+        if stale {
+            self.blur = Some(target(
+                &self.device,
+                size,
+                wgpu::TextureFormat::Rgba16Float,
+                1,
+            ));
+        }
+        self.blur.clone().unwrap()
+    }
+
     fn dispatch(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         current: usize,
         source: &wgpu::Texture,
         coverage: &wgpu::Texture,
+        params: &Parameters,
+    ) {
+        self.dispatch_to(
+            encoder,
+            &self.buffers[current],
+            source,
+            coverage,
+            &self.buffers[1 - current],
+            params,
+        );
+    }
+
+    fn dispatch_to(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        previous: &wgpu::Texture,
+        source: &wgpu::Texture,
+        coverage: &wgpu::Texture,
+        output: &wgpu::Texture,
         params: &Parameters,
     ) {
         let uniform = self
@@ -417,14 +544,7 @@ impl GpuCompositor {
                 contents: bytemuck::bytes_of(params),
                 usage: wgpu::BufferUsages::UNIFORM,
             });
-        let views = [
-            &self.buffers[current],
-            source,
-            coverage,
-            &self.buffers[1 - current],
-            &self.display,
-        ]
-        .map(|texture| {
+        let views = [previous, source, coverage, output, &self.display].map(|texture| {
             texture.create_view(&wgpu::TextureViewDescriptor {
                 mip_level_count: Some(1),
                 ..Default::default()
@@ -679,6 +799,31 @@ fn parameters(document: &Document, layer: &Layer, size: [u32; 2]) -> Parameters 
                     f32::from_bits(*seed),
                     0.0,
                 ];
+            }
+            Adjustment::AddNoise {
+                amount,
+                gaussian,
+                monochromatic,
+                seed,
+            } => {
+                p.flags[1] = 14;
+                p.first = [
+                    *amount,
+                    if *gaussian { 1.0 } else { 0.0 },
+                    if *monochromatic { 1.0 } else { 0.0 },
+                    f32::from_bits(*seed),
+                ];
+            }
+            // A backdrop blur needs the canvas scale and passes of its own, so `blur_backdrop` sets
+            // the mode and fills the rest in once the layers beneath this one have been drawn. Its
+            // modes sit above the adjustment kinds, which already run from 1 to 14.
+            Adjustment::GaussianBlur { radius } => {
+                p.flags[1] = 20;
+                p.first[0] = *radius;
+            }
+            Adjustment::MotionBlur { angle, distance } => {
+                p.flags[1] = 22;
+                p.first = [*distance, *angle, 0.0, 0.0];
             }
             Adjustment::Invert => p.flags[1] = 7,
         }

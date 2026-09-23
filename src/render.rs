@@ -208,58 +208,166 @@ pub fn render_thumbnail(document: &Document, width: u32, height: u32) -> RgbaIma
     )
 }
 
-fn render_pixels(document: &Document, width: u32, height: u32) -> RgbaImage {
-    let mut output = RgbaImage::new(width, height);
+/// A rectangle of the document drawn at a fixed scale. The whole canvas is one window; a point query
+/// draws a small one, because a blur adjustment has to read around the pixel it answers for.
+struct Window {
+    /// Where the window's top-left corner sits, in document pixels.
+    x: f32,
+    y: f32,
+    width: u32,
+    height: u32,
+    /// How many render pixels one document pixel covers, per axis.
+    scale: [f32; 2],
+}
+
+impl Window {
+    fn point(&self, x: u32, y: u32) -> Point {
+        Point::new(
+            self.x + (x as f32 + 0.5) / self.scale[0],
+            self.y + (y as f32 + 0.5) / self.scale[1],
+        )
+    }
+}
+
+/// How far the widest backdrop blur in the document reaches, in document pixels.
+pub fn blur_margin(document: &Document) -> f32 {
+    document
+        .layers
+        .iter()
+        .filter_map(|layer| layer.adjustment.as_ref())
+        .filter(|adjustment| adjustment.is_backdrop_filter())
+        .map(|adjustment| crate::backdrop::margin(adjustment, 1.0))
+        .fold(0.0, f32::max)
+}
+
+/// How much of what this layer draws reaches the pixel: its own opacity and mask, everything its
+/// folders contribute, and the layer it is clipped to.
+fn layer_amount(document: &Document, layer: &Layer, point: Point, coverage: f32) -> f32 {
+    let mut amount = coverage * layer.opacity * own_mask(layer, point);
+    if let Some(source) = layer
+        .clip_to
+        .and_then(|id| document.layers.iter().find(|l| l.id == id))
+    {
+        amount *= layer_alpha(document, source, point, 0);
+    }
+    amount
+}
+
+fn draw_layer(document: &Document, layer: &Layer, point: Point, pixel: &mut [f32; 4]) {
+    let coverage = inherited_coverage(document, layer, point);
+    if coverage == 0.0 {
+        return;
+    }
+    if let Some(adjustment) = &layer.adjustment {
+        let adjusted = crate::effects::adjust(*pixel, adjustment, point);
+        let amount = layer_amount(document, layer, point, coverage);
+        for i in 0..3 {
+            pixel[i] += (adjusted[i] - pixel[i]) * amount;
+        }
+        return;
+    }
+    if let Some(image) = &layer.pixels {
+        let mut source = sample(image, layer.transform.inverse(point));
+        source[3] = layer_alpha(document, layer, point, 0) * coverage;
+        *pixel = composite(*pixel, source, layer.blend);
+    }
+}
+
+fn render_window(document: &Document, window: &Window) -> Vec<[f32; 4]> {
     let layers = paint_order(document);
-    output
-        .as_mut()
-        .par_chunks_exact_mut(4)
-        .enumerate()
-        .for_each(|(index, target)| {
-            let x = index as u32 % width;
-            let y = index as u32 / width;
-            let point = Point::new(
-                (x as f32 + 0.5) * document.width as f32 / width as f32,
-                (y as f32 + 0.5) * document.height as f32 / height as f32,
+    let width = window.width as usize;
+    let height = window.height as usize;
+    let mut pixels = vec![[0.0_f32; 4]; width * height];
+    for layer in layers {
+        if layer
+            .adjustment
+            .as_ref()
+            .is_some_and(|adjustment| adjustment.is_backdrop_filter())
+        {
+            // A blur adjustment redraws the backdrop instead of the pixel it lands on, so it reads
+            // what has been drawn so far and puts the softened version back.
+            let adjustment = layer.adjustment.as_ref().unwrap();
+            let amounts: Vec<f32> = (0..pixels.len())
+                .into_par_iter()
+                .map(|index| {
+                    let point = window.point((index % width) as u32, (index / width) as u32);
+                    layer_amount(
+                        document,
+                        layer,
+                        point,
+                        inherited_coverage(document, layer, point),
+                    )
+                })
+                .collect();
+            if amounts.iter().all(|amount| *amount <= 0.0) {
+                continue;
+            }
+            crate::backdrop::blur(
+                &mut pixels,
+                width,
+                height,
+                adjustment,
+                &amounts,
+                window.scale[0],
             );
-            let pixel = composite_at(document, &layers, point);
-            target.copy_from_slice(&pixel.map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8));
-        });
+            continue;
+        }
+        pixels
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(index, pixel)| {
+                draw_layer(
+                    document,
+                    layer,
+                    window.point((index % width) as u32, (index / width) as u32),
+                    pixel,
+                );
+            });
+    }
+    pixels
+}
+
+fn render_pixels(document: &Document, width: u32, height: u32) -> RgbaImage {
+    let window = Window {
+        x: 0.0,
+        y: 0.0,
+        width,
+        height,
+        scale: [
+            width as f32 / document.width as f32,
+            height as f32 / document.height as f32,
+        ],
+    };
+    let pixels = render_window(document, &window);
+    let mut output = RgbaImage::new(width, height);
+    for (target, pixel) in output.as_mut().chunks_exact_mut(4).zip(pixels) {
+        target.copy_from_slice(&pixel.map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8));
+    }
     output
 }
 
 pub fn pixel_at(document: &Document, point: Point) -> [f32; 4] {
-    composite_at(document, &paint_order(document), point)
-}
-
-fn composite_at(document: &Document, layers: &[&Layer], point: Point) -> [f32; 4] {
-    let mut pixel = [0.0; 4];
-    for layer in layers {
-        let coverage = inherited_coverage(document, layer, point);
-        if coverage == 0.0 {
-            continue;
+    let half = blur_margin(document).ceil();
+    if half <= 0.0 {
+        let layers = paint_order(document);
+        let mut pixel = [0.0; 4];
+        for layer in layers {
+            draw_layer(document, layer, point, &mut pixel);
         }
-        if let Some(adjustment) = &layer.adjustment {
-            let adjusted = crate::effects::adjust(pixel, adjustment, point);
-            let mut amount = coverage * layer.opacity * own_mask(layer, point);
-            if let Some(source) = layer
-                .clip_to
-                .and_then(|id| document.layers.iter().find(|l| l.id == id))
-            {
-                amount *= layer_alpha(document, source, point, 0);
-            }
-            for i in 0..3 {
-                pixel[i] += (adjusted[i] - pixel[i]) * amount;
-            }
-            continue;
-        }
-        if let Some(image) = &layer.pixels {
-            let mut source = sample(image, layer.transform.inverse(point));
-            source[3] = layer_alpha(document, layer, point, 0) * coverage;
-            pixel = composite(pixel, source, layer.blend);
-        }
+        return pixel;
     }
-    pixel
+    // Answer from the centre of a window wide enough for the widest kernel, so the blur has the
+    // backdrop it would have had while drawing the whole canvas.
+    let side = half as u32 * 2 + 1;
+    let window = Window {
+        x: point.x - half - 0.5,
+        y: point.y - half - 0.5,
+        width: side,
+        height: side,
+        scale: [1.0, 1.0],
+    };
+    let pixels = render_window(document, &window);
+    pixels[half as usize * side as usize + half as usize]
 }
 
 pub fn hit_test(document: &Document, point: Point) -> Option<uuid::Uuid> {
@@ -317,7 +425,7 @@ pub fn flatten_white(image: &RgbaImage) -> image::RgbImage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::document::Mask;
+    use crate::document::{Adjustment, Mask};
     use std::sync::Arc;
 
     #[test]
@@ -450,5 +558,88 @@ mod tests {
         assert_eq!(image.get_pixel(1, 0).0, [0, 0, 0, 0]);
         doc.layers[1].visible = false;
         assert_eq!(render(&doc).get_pixel(0, 0).0, [255, 0, 0, 255]);
+    }
+
+    /// A hard edge down the middle of an 8×1 canvas, with `adjustment` on a layer above it.
+    fn document_with_adjustment(adjustment: Adjustment) -> Document {
+        let mut doc = Document::new(8, 1).unwrap();
+        doc.layers.clear();
+        let base = Layer::image(
+            "Base",
+            RgbaImage::from_fn(8, 1, |x, _| {
+                Rgba(if x < 4 {
+                    [0, 0, 0, 255]
+                } else {
+                    [255, 255, 255, 255]
+                })
+            }),
+        );
+        let mut layer = Layer::blank("Adjustment", 8, 1);
+        layer.adjustment = Some(adjustment);
+        doc.layers = vec![base.clone(), layer];
+        doc.active = Some(base.id);
+        doc
+    }
+
+    /// A blur adjustment redraws everything beneath it, so the hard edge softens while a patch above
+    /// the blur layer stays sharp.
+    #[test]
+    fn a_gaussian_blur_adjustment_softens_only_what_is_beneath_it() {
+        let mut doc = document_with_adjustment(Adjustment::GaussianBlur { radius: 3.0 });
+        let softened = render(&doc);
+        let edge = |image: &RgbaImage| image.get_pixel(3, 0)[0] as i32;
+        let far = |image: &RgbaImage| image.get_pixel(0, 0)[0] as i32;
+        assert!(edge(&softened) > 20, "the edge should carry light across");
+        assert!(edge(&softened) < 235);
+        assert!(far(&softened) < 20, "the far side should stay dark");
+
+        // Something drawn above the blur layer is not blurred by it.
+        let mut patch = Layer::image("Patch", RgbaImage::from_pixel(2, 1, Rgba([0, 255, 0, 255])));
+        patch.transform.x = 3.0;
+        doc.layers.push(patch);
+        let image = render(&doc);
+        assert_eq!(image.get_pixel(3, 0).0, [0, 255, 0, 255]);
+        assert_eq!(image.get_pixel(4, 0).0, [0, 255, 0, 255]);
+        // The softened backdrop still shows where the patch does not reach.
+        assert!(image.get_pixel(2, 0)[0] > 20);
+        assert!(image.get_pixel(5, 0)[0] < 235);
+    }
+
+    #[test]
+    fn a_motion_blur_adjustment_spreads_the_backdrop_along_its_angle() {
+        let doc = document_with_adjustment(Adjustment::MotionBlur {
+            angle: 0.0,
+            distance: 4.0,
+        });
+        let image = render(&doc);
+        let row: Vec<u8> = (0..8).map(|x| image.get_pixel(x, 0)[0]).collect();
+        // Dark on the left, light on the right, with the crossing spread over the distance.
+        assert!(row[0] < row[7]);
+        let softening = row.windows(2).filter(|w| w[1].abs_diff(w[0]) > 0).count();
+        assert!(softening > 1, "the crossing should be spread: {row:?}");
+        assert_eq!(row[0], 0, "far from the edge nothing changes");
+    }
+
+    #[test]
+    fn a_blur_adjustment_at_zero_opacity_leaves_the_backdrop_alone() {
+        let mut doc = document_with_adjustment(Adjustment::GaussianBlur { radius: 3.0 });
+        doc.layers[1].opacity = 0.0;
+        let image = render(&doc);
+        assert_eq!(image.get_pixel(3, 0).0, [0, 0, 0, 255]);
+        assert_eq!(image.get_pixel(4, 0).0, [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn a_point_query_agrees_with_the_full_render_under_a_blur() {
+        let doc = document_with_adjustment(Adjustment::GaussianBlur { radius: 3.0 });
+        let image = render(&doc);
+        for x in 0..8 {
+            let sampled = pixel_at(&doc, Point::new(x as f32 + 0.5, 0.5));
+            let painted = image.get_pixel(x, 0)[0] as f32 / 255.0;
+            assert!(
+                (sampled[0] - painted).abs() < 0.02,
+                "pixel {x}: {sampled:?} against {painted}"
+            );
+        }
     }
 }

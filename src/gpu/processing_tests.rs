@@ -163,6 +163,18 @@ fn processing_adjustments_and_composition_match_cpu() {
             monochrome: false,
             seed: 7931,
         },
+        Adjustment::AddNoise {
+            amount: 55.0,
+            gaussian: false,
+            monochromatic: false,
+            seed: 313,
+        },
+        Adjustment::AddNoise {
+            amount: 90.0,
+            gaussian: true,
+            monochromatic: true,
+            seed: 5150,
+        },
         Adjustment::Invert,
         Adjustment::Exposure {
             exposure: 0.7,
@@ -793,6 +805,82 @@ fn processing_selection_projection_and_alpha_baking_match_cpu() {
             .iter()
             .zip(actual.as_raw())
             .all(|(a, b)| a.abs_diff(*b) <= 1)
+    );
+}
+
+/// The blur and noise adjustment layers Compositor 1.2.3 added. A blur redraws the backdrop, so the
+/// GPU runs it as passes of its own between the layers below and the layers above, and the CPU
+/// renderer in `render.rs` is the reference it has to answer to.
+#[test]
+#[ignore = "requires native compute adapter"]
+fn processing_backdrop_blurs_and_noise_match_cpu() {
+    let gpu = processor();
+    let mut base = Document::new(96, 72).unwrap();
+    let mut layer = Layer::image("Base", fixture(96, 72));
+    layer.transform = crate::document::Transform::new(96, 72);
+    base.insert(layer);
+    let mut patch = Layer::image("Patch", fixture(31, 19));
+    patch.transform.x = 38.0;
+    patch.transform.y = 27.0;
+    base.layers.push(patch);
+
+    for adjustment in [
+        Adjustment::GaussianBlur { radius: 6.5 },
+        Adjustment::GaussianBlur { radius: 0.4 },
+        Adjustment::GaussianBlur { radius: 40.0 },
+        Adjustment::MotionBlur {
+            angle: 33.0,
+            distance: 12.0,
+        },
+        Adjustment::MotionBlur {
+            angle: -90.0,
+            distance: 1.0,
+        },
+        Adjustment::AddNoise {
+            amount: 45.0,
+            gaussian: false,
+            monochromatic: false,
+            seed: 4729,
+        },
+        Adjustment::AddNoise {
+            amount: 120.0,
+            gaussian: true,
+            monochromatic: true,
+            seed: 77,
+        },
+    ] {
+        let mut document = base.clone();
+        let mut adjustment_layer = Layer::blank("Adjustment", 96, 72);
+        adjustment_layer.adjustment = Some(adjustment.clone());
+        document.layers.push(adjustment_layer);
+        compare(
+            &gpu.compose(&document, 96, 72).unwrap(),
+            &crate::render::render(&document),
+            3,
+        );
+    }
+
+    // A blur layer answers for the layers beneath it only, so a layer with a mask and less than full
+    // opacity above it has to leave the same picture behind on both renderers.
+    let mut document = base.clone();
+    let mut blurred = Layer::blank("Adjustment", 96, 72);
+    blurred.adjustment = Some(Adjustment::GaussianBlur { radius: 5.0 });
+    blurred.opacity = 0.75;
+    document.layers.push(blurred);
+    let mut top = Layer::image("Top", fixture(96, 72));
+    top.transform = crate::document::Transform::new(96, 72);
+    top.opacity = 0.5;
+    top.mask = Some(crate::document::Mask {
+        pixels: Arc::new(image::GrayImage::from_fn(96, 72, |x, y| {
+            image::Luma([(x * 5 + y * 7) as u8])
+        })),
+        ..crate::document::Mask::white()
+    });
+    document.layers.push(top);
+    compare(
+        &gpu.compose(&document, 96, 72).unwrap(),
+        &crate::render::render(&document),
+        3,
     );
 }
 

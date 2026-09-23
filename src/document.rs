@@ -249,6 +249,23 @@ pub enum Adjustment {
         monochrome: bool,
         seed: u32,
     },
+    /// Digital noise over everything the adjustment covers. Compositor's Add Noise: `gaussian` swaps
+    /// the even distribution for a bell curve, and a monochrome seed keeps one value per pixel.
+    AddNoise {
+        amount: f32,
+        gaussian: bool,
+        monochromatic: bool,
+        seed: u32,
+    },
+    /// A blur of everything under the layer, not of the layer itself. Compositor draws these with Core
+    /// Image at the scale the canvas is being drawn, so the radius is in document pixels.
+    GaussianBlur {
+        radius: f32,
+    },
+    MotionBlur {
+        angle: f32,
+        distance: f32,
+    },
     Invert,
     /// Photoshop's Black & White: each family of colors has its own weight, so reds and greens stay
     /// apart instead of flattening into one gray. The weights are percentages, −200…300.
@@ -285,10 +302,19 @@ impl Adjustment {
             Self::Exposure { .. } => "Exposure",
             Self::GradientMap { .. } => "Gradient Map",
             Self::Grain { .. } | Self::FilmGrain { .. } => "Grain",
+            Self::AddNoise { .. } => "Add Noise",
+            Self::GaussianBlur { .. } => "Gaussian Blur",
+            Self::MotionBlur { .. } => "Motion Blur",
             Self::Invert => "Invert",
             Self::BlackWhite { .. } => "Black & White",
             Self::ColorBalance { .. } => "Color Balance",
         }
+    }
+
+    /// The blur and noise adjustments redraw everything beneath them rather than the pixel they land
+    /// on, so the compositor has to blur the backdrop before the layers above are drawn.
+    pub fn is_backdrop_filter(&self) -> bool {
+        matches!(self, Self::GaussianBlur { .. } | Self::MotionBlur { .. })
     }
 
     /// The defaults Photoshop opens with, which Compositor uses too.
@@ -467,6 +493,28 @@ impl Default for OuterGlowEffect {
     }
 }
 
+/// A soft glow drawn inside the layer's own edges, so its interior brightens away from where it ends.
+/// Compositor added this in 1.2.3; mectov keeps it with the layer and draws no effects yet.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct InnerGlowEffect {
+    #[serde(default = "visible_by_default")]
+    pub enabled: bool,
+    pub size: f32,
+    pub color: [f32; 3],
+    pub opacity: f32,
+}
+
+impl Default for InnerGlowEffect {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            size: 10.0,
+            color: [1.0; 3],
+            opacity: 0.75,
+        }
+    }
+}
+
 /// What a layer draws around itself, kept with the layer so it follows every edit and can be changed or
 /// removed at any time. Compositor projects carry these on their layers; mectov preserves them and keeps
 /// disabled ones, which Compositor hides rather than deletes. Drawing them is not implemented yet.
@@ -482,6 +530,8 @@ pub struct LayerEffects {
     pub inner_shadow: Option<InnerShadowEffect>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outer_glow: Option<OuterGlowEffect>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inner_glow: Option<InnerGlowEffect>,
 }
 
 impl LayerEffects {
@@ -491,6 +541,7 @@ impl LayerEffects {
             && self.color_overlay.is_none()
             && self.inner_shadow.is_none()
             && self.outer_glow.is_none()
+            && self.inner_glow.is_none()
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -540,6 +591,16 @@ impl LayerEffects {
             ensure!(
                 color_in_range(glow.color) && opacity_in_range(glow.opacity),
                 "Invalid outer glow color"
+            );
+        }
+        if let Some(glow) = &self.inner_glow {
+            ensure!(
+                amount_in_range(glow.size, MAX_EFFECT_SIZE),
+                "Invalid inner glow size"
+            );
+            ensure!(
+                color_in_range(glow.color) && opacity_in_range(glow.opacity),
+                "Invalid inner glow color"
             );
         }
         Ok(())

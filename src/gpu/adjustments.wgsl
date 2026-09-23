@@ -230,6 +230,46 @@ fn adjust_color_balance(rgb: vec3<f32>) -> vec3<f32> {
     return balanced;
 }
 
+/// Compositor's Add Noise hash and its uniform range, so the GPU draws the pattern the CPU reference
+/// in `backdrop.rs` and `effects.rs` draws.
+fn noise_hash(value: u32) -> u32 {
+    var x = value;
+    x ^= x >> 16u;
+    x *= 0x7feb352du;
+    x ^= x >> 15u;
+    x *= 0x846ca68bu;
+    x ^= x >> 16u;
+    return x;
+}
+
+fn noise_unit(key: u32) -> f32 { return f32(noise_hash(key) >> 8u) * (1.0 / 16777216.0); }
+
+fn noise_delta(key: u32, spread: f32, gaussian: bool) -> f32 {
+    if gaussian {
+        // Box–Muller: two uniform values make one normally distributed one.
+        let u1 = noise_unit(key);
+        let u2 = noise_unit(key ^ 0x68e31da4u);
+        return sqrt(-2.0 * log(1.0 - u1)) * cos(6.2831853 * u2) * spread * (2.0 / 3.0);
+    }
+    return (noise_unit(key) * 2.0 - 1.0) * spread;
+}
+
+fn add_noise(rgb: vec3<f32>, point: vec2<f32>) -> vec3<f32> {
+    let seed = bitcast<u32>(params.first.w);
+    let x = u32(max(point.x, 0.0));
+    let y = u32(max(point.y, 0.0));
+    let base = noise_hash(seed ^ noise_hash(x * 0x9e3779b9u + y * 0x85ebca6bu));
+    let spread = params.first.x / 100.0 * 127.5 / 255.0;
+    let gaussian = params.first.y > 0.0;
+    // One seed for all three channels when the noise is monochromatic, one each otherwise.
+    let channel = select(0x9e3779b9u, 0u, params.first.z > 0.0);
+    return rgb + vec3(
+        noise_delta(base, spread, gaussian),
+        noise_delta(base + channel, spread, gaussian),
+        noise_delta(base + channel * 2u, spread, gaussian),
+    );
+}
+
 fn adjust(rgb: vec3<f32>, point: vec2<f32>) -> vec3<f32> {
     let a = params.first;
     let b = params.second;
@@ -289,6 +329,7 @@ fn adjust(rgb: vec3<f32>, point: vec2<f32>) -> vec3<f32> {
         }
         case 12u: { return adjust_black_white(rgb); }
         case 13u: { return adjust_color_balance(rgb); }
+        case 14u: { return add_noise(rgb, point); }
         default: { return rgb; }
     }
 }

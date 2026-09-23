@@ -1,3 +1,4 @@
+pub mod backdrop;
 pub mod blend;
 pub mod color;
 pub mod document;

@@ -98,6 +98,33 @@ pub fn curve_value(points: &[Point], value: f32) -> f32 {
     .clamp(0.0, 1.0)
 }
 
+/// Compositor's noise hash, which mixes a value into a value nothing like it.
+fn noise_hash(mut value: u32) -> u32 {
+    value ^= value >> 16;
+    value = value.wrapping_mul(0x7feb_352d);
+    value ^= value >> 15;
+    value = value.wrapping_mul(0x846c_a68b);
+    value ^= value >> 16;
+    value
+}
+
+/// Uniform in [0, 1).
+fn noise_unit(key: u32) -> f32 {
+    (noise_hash(key) >> 8) as f32 / 16_777_216.0
+}
+
+/// A pixel's noise key: the seed, the pixel and the channel, mixed as the source mixes them.
+fn noise_key(seed: u32, point: Point) -> u32 {
+    let x = point.x.max(0.0) as u32;
+    let y = point.y.max(0.0) as u32;
+    noise_hash(
+        seed ^ noise_hash(
+            x.wrapping_mul(0x9e37_79b9)
+                .wrapping_add(y.wrapping_mul(0x85eb_ca6b)),
+        ),
+    )
+}
+
 fn noise(x: u32, y: u32, seed: u32) -> f32 {
     let mut value = x
         .wrapping_mul(374761393)
@@ -236,6 +263,39 @@ pub fn adjust(pixel: [f32; 4], adjustment: &Adjustment, point: Point) -> [f32; 4
                 ) * amount
                     / 100.0
         }),
+        Adjustment::AddNoise {
+            amount,
+            gaussian,
+            monochromatic,
+            seed,
+        } => {
+            // Compositor's own noise kernel: one hash per pixel, either a flat spread or a bell curve,
+            // scaled so 100 spans 127.5 steps of the 255.
+            let spread = amount / 100.0 * 127.5 / 255.0;
+            let base = noise_key(*seed, point);
+            std::array::from_fn(|i| {
+                let key = if *monochromatic {
+                    base
+                } else {
+                    base.wrapping_add(0x9e37_79b9_u32.wrapping_mul(i as u32))
+                };
+                let delta = if *gaussian {
+                    // Box–Muller: two uniform values make one normally distributed one.
+                    let u1 = noise_unit(key);
+                    let u2 = noise_unit(key ^ 0x68e3_1da4);
+                    (-2.0 * (1.0 - u1).ln()).sqrt()
+                        * (std::f32::consts::TAU * u2).cos()
+                        * spread
+                        * (2.0 / 3.0)
+                } else {
+                    (noise_unit(key) * 2.0 - 1.0) * spread
+                };
+                rgb[i] + delta
+            })
+        }
+        // A blur redraws the backdrop instead of the pixel it lands on. The compositor runs it before
+        // the layers above are drawn, so there is nothing left to do by the time a pixel is reached.
+        Adjustment::GaussianBlur { .. } | Adjustment::MotionBlur { .. } => rgb,
         Adjustment::Invert => rgb.map(|v| 1.0 - v),
         Adjustment::BlackWhite {
             reds,
@@ -309,6 +369,19 @@ pub fn apply_adjustment(
     adjustment: &Adjustment,
     mask_target: bool,
 ) -> Result<()> {
+    // Applied straight to a layer, a blur is the filter of the same name, on the whole image rather
+    // than on the backdrop: there is nothing underneath to redraw.
+    let blur = match adjustment {
+        Adjustment::GaussianBlur { radius } => Some(Filter::GaussianBlur { radius: *radius }),
+        Adjustment::MotionBlur { angle, distance } => Some(Filter::MotionBlur {
+            distance: *distance,
+            angle: *angle,
+        }),
+        _ => None,
+    };
+    if let Some(filter) = blur {
+        return apply_filter(document, &filter, mask_target);
+    }
     let selection = document.selection.clone();
     let layer = document
         .active_mut()
@@ -861,6 +934,15 @@ pub fn validate_adjustment(adjustment: &Adjustment) -> Result<()> {
                 && (0.0..=100.0).contains(roughness)
         }
         Adjustment::Grain { amount, .. } => amount.is_finite() && (0.0..=100.0).contains(amount),
+        // The ranges and defaults Compositor gives its blur and noise adjustments.
+        Adjustment::AddNoise { amount, .. } => amount.is_finite() && (0.1..=400.0).contains(amount),
+        Adjustment::GaussianBlur { radius } => radius.is_finite() && (0.1..=250.0).contains(radius),
+        Adjustment::MotionBlur { angle, distance } => {
+            angle.is_finite()
+                && (-90.0..=90.0).contains(angle)
+                && distance.is_finite()
+                && (1.0..=2000.0).contains(distance)
+        }
         Adjustment::GradientMap { .. } | Adjustment::Invert => true,
         // The ranges Compositor validates with: Photoshop's weight limits and the tint's HSL.
         Adjustment::BlackWhite {
@@ -1250,6 +1332,101 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    /// Compositor 1.2.3's Add Noise, which is its own kernel rather than the Grain adjustment: a
+    /// hashed pattern per pixel, flat or bell shaped, and one seed across the channels or one each.
+    #[test]
+    fn add_noise_follows_its_seed_and_channel_settings() {
+        let point = Point::new(11.0, 7.0);
+        let noise = |gaussian, monochromatic, seed| Adjustment::AddNoise {
+            amount: 60.0,
+            gaussian,
+            monochromatic,
+            seed,
+        };
+        let gray = adjust([0.5, 0.5, 0.5, 1.0], &noise(false, true, 7), point);
+        let colored = adjust([0.5, 0.5, 0.5, 1.0], &noise(false, false, 7), point);
+        assert_eq!(gray[0], gray[1]);
+        assert_eq!(gray[1], gray[2]);
+        assert!(colored[0] != colored[1] || colored[1] != colored[2]);
+        // The same seed and pixel draw the same pattern; another seed draws a different one, and a
+        // neighbouring pixel is unrelated to this one.
+        assert_eq!(
+            gray,
+            adjust([0.5, 0.5, 0.5, 1.0], &noise(false, true, 7), point)
+        );
+        assert_ne!(
+            gray,
+            adjust([0.5, 0.5, 0.5, 1.0], &noise(false, true, 8), point)
+        );
+        assert_ne!(
+            gray,
+            adjust(
+                [0.5, 0.5, 0.5, 1.0],
+                &noise(false, true, 7),
+                Point::new(12.0, 7.0)
+            )
+        );
+        // A flat spread never pushes a pixel further than the amount, while the bell curve does, which
+        // is what makes the two settings look different.
+        let deviations = |gaussian| {
+            (0..400)
+                .map(|x| {
+                    let point = Point::new(x as f32, 0.0);
+                    (adjust([0.5; 4], &noise(gaussian, true, 3), point)[0] - 0.5).abs()
+                })
+                .collect::<Vec<f32>>()
+        };
+        let spread = 60.0 / 100.0 * 127.5 / 255.0;
+        let flat = deviations(false);
+        let bell = deviations(true);
+        assert!(flat.iter().all(|deviation| *deviation <= spread + 1e-5));
+        assert!(bell.iter().any(|deviation| *deviation > spread));
+    }
+
+    #[test]
+    fn blur_and_noise_adjustments_validate_their_source_ranges() {
+        for valid in [
+            Adjustment::GaussianBlur { radius: 0.1 },
+            Adjustment::GaussianBlur { radius: 250.0 },
+            Adjustment::MotionBlur {
+                angle: -90.0,
+                distance: 1.0,
+            },
+            Adjustment::MotionBlur {
+                angle: 90.0,
+                distance: 2000.0,
+            },
+            Adjustment::AddNoise {
+                amount: 400.0,
+                gaussian: true,
+                monochromatic: true,
+                seed: 0,
+            },
+        ] {
+            assert!(validate_adjustment(&valid).is_ok(), "{valid:?}");
+        }
+        for invalid in [
+            Adjustment::GaussianBlur { radius: 0.0 },
+            Adjustment::GaussianBlur { radius: f32::NAN },
+            Adjustment::MotionBlur {
+                angle: 91.0,
+                distance: 10.0,
+            },
+            Adjustment::MotionBlur {
+                angle: 0.0,
+                distance: 0.5,
+            },
+            Adjustment::AddNoise {
+                amount: 0.0,
+                gaussian: false,
+                monochromatic: false,
+                seed: 1,
+            },
+        ] {
+            assert!(validate_adjustment(&invalid).is_err(), "{invalid:?}");
+        }
     }
 
     #[test]

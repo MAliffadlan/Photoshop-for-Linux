@@ -65,9 +65,22 @@ pub(super) fn adjustment_menu(ui: &mut egui::Ui) -> Option<Adjustment> {
             roughness: 50.0,
             seed: 1,
         },
+        // Compositor's order from here on is its menu's: the blur and noise adjustments it added in
+        // 1.2.3 sit between Grain and the rest.
+        Adjustment::AddNoise {
+            amount: 10.0,
+            gaussian: false,
+            monochromatic: false,
+            seed: 1,
+        },
+        Adjustment::GaussianBlur { radius: 10.0 },
+        Adjustment::MotionBlur {
+            angle: 0.0,
+            distance: 10.0,
+        },
+        Adjustment::Invert,
         Adjustment::photoshop_black_white(),
         Adjustment::neutral_color_balance(),
-        Adjustment::Invert,
     ] {
         if ui.button(adjustment.name()).clicked() {
             result = Some(adjustment);
