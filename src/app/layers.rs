@@ -571,10 +571,17 @@ impl EditorApp {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 4.0;
                         for (tip, command) in [
-                            ("New layer (Ctrl+Shift+N)", "new_layer"),
-                            ("Group layers (Ctrl+G)", "group"),
+                            ("New layer", "new_layer"),
+                            ("Group layers", "group"),
                             ("Add layer mask", "mask"),
                         ] {
+                            let tip = match command {
+                                "new_layer" => {
+                                    format!("{tip} ({})", self.command_shortcut(command))
+                                }
+                                "group" => format!("{tip} ({})", self.command_shortcut(command)),
+                                _ => tip.to_owned(),
+                            };
                             if icons::action_button(ui, command)
                                 .on_hover_text(tip)
                                 .clicked()

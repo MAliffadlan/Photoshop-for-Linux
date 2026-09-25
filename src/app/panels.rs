@@ -31,6 +31,7 @@ impl EditorApp {
             .session()
             .and_then(|s| mectov::operations::transform_box(&s.document, self.mask_target));
         let mut changed = false;
+        let fit_shortcut = self.command_shortcut("fit");
         egui::TopBottomPanel::top("tool_options")
             .exact_height(42.0)
             .frame(theme::frame())
@@ -284,7 +285,7 @@ impl EditorApp {
                                     Tool::Hand | Tool::Zoom => {
                                         ui.label(
                                         RichText::new(
-                                            "Scroll to zoom · Space-drag to pan · Ctrl+0 to fit",
+                                             format!("Scroll to zoom · Space-drag to pan · {fit_shortcut} to fit"),
                                         )
                                         .color(theme::MUTED),
                                     );
@@ -350,7 +351,7 @@ impl EditorApp {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add(
                             egui::Label::new(
-                                RichText::new(self.tool.hint())
+                                RichText::new(self.tool_hint(self.tool))
                                     .size(11.0)
                                     .color(theme::MUTED),
                             )
@@ -378,7 +379,8 @@ impl EditorApp {
                         .show(ui, |ui| {
                             ui.spacing_mut().item_spacing.y = 5.0;
                             for t in Tool::ALL {
-                                if icons::tool_button(ui, t, self.tool == t).clicked() {
+                                let shortcut = self.tool_shortcut(t);
+                                if icons::tool_button(ui, t, self.tool == t, &shortcut).clicked() {
                                     tool = Some(t);
                                 }
                             }

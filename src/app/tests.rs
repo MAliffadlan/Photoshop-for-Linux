@@ -3555,6 +3555,201 @@ fn blend_mode_cycles_along_the_menu_order() {
     );
 }
 
+#[test]
+fn remapped_command_and_tool_shortcuts_dispatch_without_reacting_to_old_keys() {
+    let (context, mut app) = app();
+    app.set_shortcut_binding(
+        ShortcutAction::Command("new"),
+        shortcuts::Shortcut::new(egui::Key::K, true, false, false),
+    )
+    .unwrap();
+    keyboard_frame(
+        &context,
+        &mut app,
+        vec![text_key(egui::Key::N, egui::Modifiers::CTRL)],
+        egui::Modifiers::CTRL,
+    );
+    assert!(app.dialog != Some(Dialog::New));
+    keyboard_frame(
+        &context,
+        &mut app,
+        vec![text_key(egui::Key::K, egui::Modifiers::CTRL)],
+        egui::Modifiers::CTRL,
+    );
+    assert!(app.dialog == Some(Dialog::New));
+}
+
+#[test]
+fn remapped_tool_shortcut_updates_the_tool_and_hover_label() {
+    let (context, mut app) = app();
+    app.set_shortcut_binding(
+        ShortcutAction::Tool(Tool::Brush),
+        shortcuts::Shortcut::new(egui::Key::K, false, false, true),
+    )
+    .unwrap();
+    assert_eq!(app.tool_shortcut(Tool::Brush), "Alt+K");
+    keyboard_frame(
+        &context,
+        &mut app,
+        vec![text_key(egui::Key::B, egui::Modifiers::NONE)],
+        egui::Modifiers::NONE,
+    );
+    assert_eq!(app.tool, Tool::Move);
+    keyboard_frame(
+        &context,
+        &mut app,
+        vec![text_key(egui::Key::K, egui::Modifiers::ALT)],
+        egui::Modifiers::ALT,
+    );
+    assert_eq!(app.tool, Tool::Brush);
+}
+
+#[test]
+fn shortcut_capture_updates_a_binding_and_keeps_conflicts_active() {
+    let (context, mut app) = app();
+    app.dialog = Some(Dialog::Shortcuts);
+    app.shortcut_capture = Some(ShortcutAction::Command("new"));
+    keyboard_frame(
+        &context,
+        &mut app,
+        vec![text_key(egui::Key::K, egui::Modifiers::CTRL)],
+        egui::Modifiers::CTRL,
+    );
+    assert!(app.shortcut_capture.is_none());
+    assert_eq!(
+        app.command_shortcut_labels().get("new").map(String::as_str),
+        Some("Ctrl+K")
+    );
+
+    app.shortcut_capture = Some(ShortcutAction::Command("open"));
+    keyboard_frame(
+        &context,
+        &mut app,
+        vec![text_key(egui::Key::S, egui::Modifiers::CTRL)],
+        egui::Modifiers::CTRL,
+    );
+    assert!(app.shortcut_capture.is_some());
+    assert!(app.shortcut_error.is_some());
+}
+
+#[test]
+fn remapped_native_copy_uses_the_new_clipboard_chord_only() {
+    let _clipboard_guard = CLIPBOARD_TEST_LOCK.lock().unwrap();
+    let (context, mut app) = app();
+    app.dimensions = [16, 12];
+    app.new_document();
+    app.command("fill_fg");
+    app.command("select_all");
+    app.set_shortcut_binding(
+        ShortcutAction::Command("copy"),
+        shortcuts::Shortcut::new(egui::Key::C, true, false, true),
+    )
+    .unwrap();
+    keyboard_frame(
+        &context,
+        &mut app,
+        vec![egui::Event::Copy],
+        egui::Modifiers::CTRL,
+    );
+    assert!(app.clipboard.is_none());
+    keyboard_frame(
+        &context,
+        &mut app,
+        vec![egui::Event::Copy],
+        egui::Modifiers {
+            ctrl: true,
+            alt: true,
+            ..egui::Modifiers::NONE
+        },
+    );
+    assert!(app.clipboard.is_some());
+}
+
+#[test]
+fn remapped_delete_chord_disables_the_old_delete_key() {
+    let (context, mut app) = app();
+    app.dimensions = [16, 12];
+    app.new_document();
+    app.set_shortcut_binding(
+        ShortcutAction::Command("clear_or_delete"),
+        shortcuts::Shortcut::new(egui::Key::F2, false, false, false),
+    )
+    .unwrap();
+    keyboard_frame(
+        &context,
+        &mut app,
+        vec![text_key(egui::Key::Delete, egui::Modifiers::NONE)],
+        egui::Modifiers::NONE,
+    );
+    assert_eq!(app.session().unwrap().document.layers.len(), 1);
+    keyboard_frame(
+        &context,
+        &mut app,
+        vec![text_key(egui::Key::F2, egui::Modifiers::NONE)],
+        egui::Modifiers::NONE,
+    );
+    assert!(app.session().unwrap().document.layers.is_empty());
+}
+
+#[test]
+fn zoom_in_accepts_the_physical_shift_plus_chord() {
+    let (context, mut app) = app();
+    app.new_document();
+    let before = app.session().unwrap().zoom;
+    keyboard_frame(
+        &context,
+        &mut app,
+        vec![text_key(
+            egui::Key::Plus,
+            egui::Modifiers {
+                ctrl: true,
+                shift: true,
+                ..egui::Modifiers::NONE
+            },
+        )],
+        egui::Modifiers {
+            ctrl: true,
+            shift: true,
+            ..egui::Modifiers::NONE
+        },
+    );
+    assert!(app.session().unwrap().zoom > before);
+}
+
+#[test]
+fn reserved_fixed_keys_cannot_be_assigned_to_commands() {
+    let (_, mut app) = app();
+    assert!(
+        app.set_shortcut_binding(
+            ShortcutAction::Command("new"),
+            shortcuts::Shortcut::new(egui::Key::Escape, false, false, false),
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn shortcut_settings_are_saved_with_the_global_tool_settings() {
+    let (_, mut editor) = app();
+    editor
+        .set_shortcut_binding(
+            ShortcutAction::Command("save"),
+            shortcuts::Shortcut::new(egui::Key::K, true, false, false),
+        )
+        .unwrap();
+    let mut storage = TestStorage::default();
+    eframe::App::save(&mut editor, &mut storage);
+    let stored = eframe::get_value::<ShortcutSettings>(&storage, shortcuts::STORAGE_KEY).unwrap();
+    assert!(stored.is_valid());
+    assert_eq!(
+        editor
+            .command_shortcut_labels()
+            .get("save")
+            .map(String::as_str),
+        Some("Ctrl+K")
+    );
+}
+
 #[derive(Default)]
 struct TestStorage(std::collections::HashMap<String, String>);
 

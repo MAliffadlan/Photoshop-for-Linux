@@ -41,6 +41,8 @@ use mectov::{
 };
 use serde::{Deserialize, Serialize};
 
+use self::shortcuts::{ShortcutAction, ShortcutSettings};
+
 /// The tool settings Compositor 1.2.1 keeps between runs — Auto Select, Show Controls and Snap.
 /// Rulers, guides and the grid are not ported yet, so only these three have anything to store.
 #[derive(Default, Serialize, Deserialize)]
@@ -112,26 +114,6 @@ impl Tool {
             Self::Dropper => "Eyedropper",
             Self::Hand => "Hand",
             Self::Zoom => "Zoom",
-        }
-    }
-    fn shortcut(self) -> &'static str {
-        match self {
-            Self::Move => "V",
-            Self::Marquee => "M",
-            Self::Lasso => "L",
-            Self::Wand => "W",
-            Self::Crop => "C",
-            Self::Brush => "B",
-            Self::Erase => "E",
-            Self::Heal => "J",
-            Self::Clone => "S",
-            Self::Blur => "R",
-            Self::Gradient => "G",
-            Self::Shape => "U",
-            Self::Text => "T",
-            Self::Dropper => "I",
-            Self::Hand => "H",
-            Self::Zoom => "Z",
         }
     }
     fn is_brush(self) -> bool {
@@ -397,6 +379,9 @@ pub struct EditorApp {
     ignore_transparent_pixels: bool,
     show_controls: bool,
     snap: bool,
+    shortcut_settings: ShortcutSettings,
+    shortcut_capture: Option<ShortcutAction>,
+    shortcut_error: Option<String>,
     lock_ratio: bool,
     clone_source: Option<Point>,
     clone_offset: Option<Point>,
@@ -458,6 +443,12 @@ impl EditorApp {
             app.auto_select = stored.auto_select;
             app.show_controls = stored.show_controls;
             app.snap = stored.snap;
+        }
+        if let Some(stored) = cc.storage.as_ref().and_then(|storage| {
+            eframe::get_value::<ShortcutSettings>(&**storage, shortcuts::STORAGE_KEY)
+        }) && stored.is_valid()
+        {
+            app.shortcut_settings = stored;
         }
         app.processor = processor;
         app.gpu_state = cc.wgpu_render_state.clone();
@@ -526,6 +517,9 @@ impl EditorApp {
             ignore_transparent_pixels: true,
             show_controls: true,
             snap: true,
+            shortcut_settings: ShortcutSettings::default(),
+            shortcut_capture: None,
+            shortcut_error: None,
             lock_ratio: true,
             clone_source: None,
             clone_offset: None,
@@ -1337,6 +1331,7 @@ impl eframe::App for EditorApp {
                 snap: self.snap,
             },
         );
+        eframe::set_value(storage, shortcuts::STORAGE_KEY, &self.shortcut_settings);
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {

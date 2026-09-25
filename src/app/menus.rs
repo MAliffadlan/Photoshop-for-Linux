@@ -25,19 +25,6 @@ fn menu_bar_button(ui: &mut egui::Ui, label: &str, content: impl FnOnce(&mut egu
     );
 }
 
-fn item(
-    ui: &mut egui::Ui,
-    label: &str,
-    shortcut: &str,
-    command: &'static str,
-    action: &mut Option<&'static str>,
-) {
-    if ui.add(Button::new(label).shortcut_text(shortcut)).clicked() {
-        *action = Some(command);
-        ui.close();
-    }
-}
-
 pub(super) fn adjustment_menu(ui: &mut egui::Ui) -> Option<Adjustment> {
     let mut result = None;
     for adjustment in [
@@ -92,6 +79,21 @@ pub(super) fn adjustment_menu(ui: &mut egui::Ui) -> Option<Adjustment> {
 
 impl EditorApp {
     pub(super) fn menus(&mut self, ctx: &egui::Context) {
+        let shortcut_labels = self.command_shortcut_labels();
+        let item = |ui: &mut egui::Ui,
+                    label: &str,
+                    default_shortcut: &str,
+                    command: &'static str,
+                    action: &mut Option<&'static str>| {
+            let shortcut = shortcut_labels
+                .get(command)
+                .map(String::as_str)
+                .unwrap_or(default_shortcut);
+            if ui.add(Button::new(label).shortcut_text(shortcut)).clicked() {
+                *action = Some(command);
+                ui.close();
+            }
+        };
         let mut action = None;
         let mut adjustment = None;
         let mut filter = None;
@@ -428,6 +430,7 @@ impl EditorApp {
     }
 
     pub(super) fn tabs(&mut self, ctx: &egui::Context) {
+        let new_shortcut = self.command_shortcut("new");
         let mut action = None;
         let mut switch = None;
         let mut copy = None;
@@ -442,7 +445,7 @@ impl EditorApp {
                 ui.horizontal(|ui| {
                     if ui
                         .add(widgets::Button::new("+").min_size(egui::vec2(28.0, 28.0)))
-                        .on_hover_text("New canvas (Ctrl+N)")
+                        .on_hover_text(format!("New canvas ({new_shortcut})"))
                         .clicked()
                     {
                         action = Some("new");

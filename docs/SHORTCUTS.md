@@ -14,6 +14,7 @@
 | Cut / Copy / Paste / Copy Merged | Ctrl+X / Ctrl+C / Ctrl+V / Ctrl+Shift+C |
 | Foreground / Background fill | Alt+Backspace / Ctrl+Backspace |
 | Content-aware fill | Shift+F5 |
+| Clear pixels / Delete layer | Delete |
 | Levels / Hue-Saturation / Curves | Ctrl+L / Ctrl+U / Ctrl+M |
 | Invert pixels or mask | Ctrl+I |
 | Next / previous blend mode | Shift+Plus / Shift+Minus |
@@ -33,6 +34,8 @@
 | Adjust slider or number | Wheel up / down over the control (increase / decrease) |
 | Apply crop or polygon / Cancel | Enter / Escape |
 | Shortcut reference | F1 |
+
+Command and tool bindings can be changed in the same **Keyboard Shortcuts** window. Use **Change** to record a new chord, **Reset** to restore one action, or **Reset all** to restore the defaults. Configurations are stored between runs and can be exported or imported as JSON; fixed canvas gestures such as color swap, brush size, opacity, nudging, and crop confirmation keep their existing keys. Clipboard chords based on Ctrl/⌘+C, X, or V remain reserved for the clipboard commands.
 
 Copy an image in another app, or copy one or more image files in a file manager, then use Ctrl+V (or Edit → Paste) to add them as layers. External images are centered on the canvas; a new document is created if none is open. Local file URLs and absolute file paths can also be pasted. Multiple files are imported together in one undo step, without changing the source files. When a text field has focus, Ctrl+V pastes text into that field.
 

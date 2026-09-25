@@ -33,55 +33,134 @@ impl EditorApp {
                 Dialog::Text => self.text_dialog(ctx),
                 Dialog::Export => self.export_dialog(ctx),
                 Dialog::Shortcuts => {
+                    self.capture_shortcut(ctx);
                     let mut open = true;
+                    let mut close = false;
+                    let entries = self.shortcut_entries();
+                    let mut capture = self.shortcut_capture;
+                    let mut error = self.shortcut_error.clone();
+                    let capture_label = capture.map(|action| self.shortcut_action_label(action));
+                    let mut reset = None;
+                    let mut reset_all = false;
+                    let mut import = false;
+                    let mut export = false;
                     widgets::Window::new("Keyboard shortcuts")
-                        .default_width(690.0)
+                        .default_width(760.0)
                         .open(&mut open)
                         .show(ctx, |ui| {
-                            egui::Grid::new("shortcut_grid")
-                                .spacing(vec2(35.0, 10.0))
-                                .show(ui, |ui| {
-                                    for (key, label) in [
-                                        ("Ctrl+N / O / S", "New / Open / Save"),
-                                        ("Ctrl+Shift+O", "Import image as layer"),
-                                        ("Ctrl+Alt+Shift+S", "Export image"),
-                                        ("Ctrl+Z / Ctrl+Shift+Z", "Undo / Redo"),
-                                        ("Ctrl+J / Ctrl+E / Ctrl+G", "Duplicate / Merge / Group"),
-                                        ("Ctrl+A / Ctrl+D", "Select all / Deselect"),
-                                        ("Ctrl+C / Ctrl+V", "Copy / Paste image"),
-                                        ("Ctrl+0 / Ctrl+1", "Fit / Actual pixels"),
-                                        (
-                                            "V / M / L / W / C",
-                                            "Move / Marquee / Lasso / Wand / Crop",
-                                        ),
-                                        (
-                                            "B / E / J / S / R",
-                                            "Brush / Eraser / Heal / Clone / Blur",
-                                        ),
-                                        (
-                                            "G / U / I / H / Z",
-                                            "Gradient / Shape / Eyedropper / Hand / Zoom",
-                                        ),
-                                        ("[ / ] · Shift+[ / ]", "Brush size / Hardness"),
-                                        ("T", "Text"),
-                                        ("1–0", "Brush or layer opacity"),
-                                        ("Alt-click", "Set clone source"),
-                                        ("X / D", "Swap / Reset colors"),
-                                        ("Space-drag", "Pan canvas"),
-                                        (
-                                            "Horizontal wheel / Shift+wheel",
-                                            "Pan canvas horizontally",
-                                        ),
-                                        ("Wheel over a slider or number", "Adjust value"),
-                                        ("Enter / Escape", "Apply crop / Cancel gesture"),
-                                    ] {
-                                        ui.label(RichText::new(key).strong());
-                                        ui.label(label);
-                                        ui.end_row();
+                            if let Some(error) = error.as_deref() {
+                                ui.label(
+                                    RichText::new(error)
+                                        .color(egui::Color32::from_rgb(255, 120, 120)),
+                                );
+                            }
+                            if let Some(label) = capture_label {
+                                ui.label(
+                                    RichText::new(format!("Press a shortcut for {label}"))
+                                        .color(theme::ACCENT),
+                                );
+                            }
+                            ui.horizontal(|ui| {
+                                if widgets::button(ui, "Reset all").clicked() {
+                                    reset_all = true;
+                                    capture = None;
+                                    error = None;
+                                }
+                                if widgets::button(ui, "Import…").clicked() {
+                                    import = true;
+                                }
+                                if widgets::button(ui, "Export…").clicked() {
+                                    export = true;
+                                }
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if widgets::button(ui, "Close").clicked() {
+                                            close = true;
+                                        }
+                                    },
+                                );
+                            });
+                            ui.separator();
+                            let mut last_group = "";
+                            for entry in &entries {
+                                if entry.group != last_group {
+                                    ui.label(RichText::new(entry.group).strong());
+                                    last_group = entry.group;
+                                }
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(entry.label).strong());
+                                    ui.label(
+                                        RichText::new(if entry.shortcuts.is_empty() {
+                                            "—"
+                                        } else {
+                                            entry.shortcuts.as_str()
+                                        })
+                                        .color(theme::MUTED),
+                                    );
+                                    if widgets::button(
+                                        ui,
+                                        if capture == Some(entry.action) {
+                                            "Cancel"
+                                        } else {
+                                            "Change"
+                                        },
+                                    )
+                                    .clicked()
+                                    {
+                                        capture = if capture == Some(entry.action) {
+                                            None
+                                        } else {
+                                            error = None;
+                                            Some(entry.action)
+                                        };
+                                    }
+                                    if widgets::button(ui, "Reset").clicked() {
+                                        reset = Some(entry.action);
+                                        capture = None;
+                                        error = None;
                                     }
                                 });
+                            }
+                            ui.separator();
+                            ui.label(RichText::new("Fixed canvas gestures").strong());
+                            for (keys, label) in [
+                                ("[ / ] · Shift+[ / ]", "Brush size / hardness"),
+                                ("1–0", "Brush or layer opacity"),
+                                ("X / D", "Swap / reset colors"),
+                                ("Space-drag", "Pan canvas"),
+                                ("Alt-click", "Set clone source"),
+                                ("Enter / Escape", "Apply crop or cancel gesture"),
+                                ("Ctrl+T / Ctrl+H", "Move tool / transform controls"),
+                                ("Wheel", "Adjust controls or zoom"),
+                            ] {
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(keys).strong());
+                                    ui.label(label);
+                                });
+                            }
                         });
+                    self.shortcut_capture = capture;
+                    self.shortcut_error = error;
+                    if reset_all {
+                        self.reset_all_shortcuts();
+                        self.shortcut_error = None;
+                    }
+                    if let Some(action) = reset {
+                        self.reset_shortcut_binding(action);
+                    }
+                    if import {
+                        self.import_shortcuts();
+                    }
+                    if export {
+                        self.export_shortcuts();
+                    }
+                    if close {
+                        open = false;
+                    }
                     if !open {
+                        self.shortcut_capture = None;
+                        self.shortcut_error = None;
                         self.dialog = None;
                     }
                 }

@@ -2,7 +2,7 @@ use egui::{Color32, Pos2, Rect, Stroke, StrokeKind, Ui, Vec2, pos2, vec2};
 
 use super::{Tool, theme};
 
-pub fn tool_button(ui: &mut Ui, tool: Tool, selected: bool) -> egui::Response {
+pub fn tool_button(ui: &mut Ui, tool: Tool, selected: bool, shortcut: &str) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(vec2(36.0, 36.0), egui::Sense::click());
     let painter = ui.painter();
     if selected || response.hovered() {
@@ -22,7 +22,7 @@ pub fn tool_button(ui: &mut Ui, tool: Tool, selected: bool) -> egui::Response {
         );
     }
     draw(ui, tool, rect.shrink(9.0), theme::TEXT);
-    response.on_hover_text(format!("{} ({})", tool.label(), tool.shortcut()))
+    response.on_hover_text(format!("{} ({})", tool.label(), shortcut))
 }
 
 pub fn draw(ui: &Ui, tool: Tool, rect: Rect, color: Color32) {
