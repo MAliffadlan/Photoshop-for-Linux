@@ -2,6 +2,8 @@
 
 The Linux port is implemented in Rust with egui 0.33 and wgpu 27. The source baseline is Compositor commit `a19db9011282399785dc18efcfded904627bdcc2` (Compositor 1.0.4), which writes `.comp` version 7. Later releases are ported on top of it, up to `679e66fe2586e071e4a91e44a5fb0eef9779ad48` (Compositor 1.2.4, 2026-09-22): the version 8 manifest from 1.2.0 (`0a7342442223526fe7ac0bed7284f4c237d7d783`) with its alignment guides, layer effects and Soft Light; Photoshop's full blend menu from 1.2.2; Black & White, Color Balance and Invert from 1.2.2; 1.2.1's wider camera RAW support and persisted tool settings; and 1.2.3's version 9 manifest with its Add Noise, Gaussian Blur and Motion Blur adjustment layers and its Inner Glow effect. Neither source tree was changed by this port.
 
+Releases after 1.2.4 are listed in [Not ported from 1.2.5 onward](#not-ported-from-125-onward).
+
 ## Architecture
 
 | Module | Responsibility |
@@ -77,3 +79,19 @@ The GitHub workflow is supplied for future repository runs; it has not been disp
 - The local release archive requires glibc 2.43. For older distributions, build from source on the target distribution. The CI definition uses Ubuntu 24.04 as its packaging baseline.
 
 Completed features are recorded as conventional Git commits. No source repository files, system installation directories, or remote repositories were modified by this port.
+
+## Not ported from 1.2.5 onward
+
+Compositor 1.2.4 is the last release this port was taken from. Everything below shipped upstream afterwards; each item says what mectov does instead, so the gap is deliberate rather than forgotten.
+
+| Release | Upstream feature | State in mectov |
+| --- | --- | --- |
+| 1.2.6 | Vignette paints an empty layer across the whole canvas; roundness starts at 100 | ported |
+| 1.2.7 | Text previews its new colour live while the colour is picked; title-bar and tab-fade fixes | ported through the dialog's live preview; the macOS title-bar fixes have no Linux counterpart |
+| 1.2.8 | Large documents: one image up to 200 megapixels, a document up to 800, scaled to the machine's memory | not ported. `MAX_PIXELS` in `src/document.rs` is a fixed 100 megapixels for a canvas, for layer assets, and for masks |
+| 1.2.9 | PSD and PSB type layers import as editable text with their wording, font, size, colour and alignment; clicking with the Type tool starts the text on the pointer's baseline | import ported, with two limits: a layer with several styles takes the first run's font, size and colour, and Photoshop's own raster is kept until the text is edited, so mectov's font metrics only show afterwards. Inline editing stays in the dialog, as noted above |
+| 1.2.10 | SVG import; a PSD too large for memory has its layers cropped to the canvas with a report; Magic Wand no longer risks freezing when zoomed out | SVG import and the Magic Wand fix are ported; cropping an oversized PSD to the canvas is not, so such a file is still refused with an explicit error |
+| 1.2.11 | Masks can be painted anywhere on the canvas, past the layer's own pixels; layer effects stay on screen while text, masks, undo and redo change; a number's label can be dragged to change its value | label scrubbing and the effect-refresh behaviour are ported; masks are still sized to their layer, so painting outside the layer is not available |
+| 1.3 | An AI agent or script can write a `.comp` package while the project is open and the canvas updates live; saving happens in the background | not ported. mectov neither watches a package for outside writers nor saves in the background; a project is written in one synchronous call |
+| 1.3.1 | Quitting or closing the window while typing text commits the text and offers the usual save prompt; the pointer returns to an arrow when it leaves the canvas while editing | not applicable in the same form: text is edited in a dialog, which is dismissed before the window can close |
+| after 1.3.1 | File > Open Recent with a Clear Menu entry; the Camera Raw colour-grading wheels move under Color and open by default | not ported. mectov has no recent-projects list, and it has no Camera Raw filter, so the colour-grading panel has nothing to move |
