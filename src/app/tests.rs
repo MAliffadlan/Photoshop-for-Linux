@@ -682,6 +682,7 @@ fn motion_blur_preview_toggles_cancels_and_applies_full_resolution() {
     }
 
     let apply = layer_label(&context, &mut app, "Apply") + Vec2::splat(5.0);
+    pointer_frame(&context, &mut app, apply, None, egui::Modifiers::NONE);
     pointer_frame(&context, &mut app, apply, Some(true), egui::Modifiers::NONE);
     pointer_frame(
         &context,
@@ -1095,6 +1096,7 @@ fn layer_effect_dialog_previews_and_commits_one_undoable_edit() {
     let rendered = render::render(&app.session().unwrap().document);
     assert!(rendered.get_pixel(1, 12)[3] > 0);
     let apply = layer_label(&context, &mut app, "Apply") + Vec2::splat(5.0);
+    pointer_frame(&context, &mut app, apply, None, egui::Modifiers::NONE);
     pointer_frame(&context, &mut app, apply, Some(true), egui::Modifiers::NONE);
     pointer_frame(
         &context,
@@ -2644,7 +2646,9 @@ fn levels_reuses_original_histogram_source_until_dialog_closes() {
                 );
             }
 
+            eprintln!("PRE-APPLY grid={:?}", app.session().unwrap().document.grid);
             let apply = layer_label(&context, &mut app, "Apply") + Vec2::splat(5.0);
+            eprintln!("APPLY AT {apply:?}");
             pointer_frame(&context, &mut app, apply, Some(true), egui::Modifiers::NONE);
             pointer_frame(
                 &context,
@@ -3772,15 +3776,375 @@ fn tool_settings_survive_a_restart() {
     editor.auto_select = false;
     editor.show_controls = false;
     editor.snap = true;
+    editor.show_rulers = false;
+    editor.show_grid = true;
+    editor.snap_targets.guides = false;
+    editor.snap_targets.grid = false;
     let mut storage = TestStorage::default();
     eframe::App::save(&mut editor, &mut storage);
     let stored = eframe::get_value::<ToolSettings>(&storage, TOOL_SETTINGS_KEY).unwrap();
     assert!(!stored.auto_select);
     assert!(!stored.show_controls);
     assert!(stored.snap);
-    let (_, mut reopened) = app();
-    reopened.auto_select = stored.auto_select;
-    reopened.show_controls = stored.show_controls;
-    reopened.snap = stored.snap;
-    assert!(!reopened.auto_select && !reopened.show_controls);
+    assert!(!stored.show_rulers);
+    assert!(stored.show_grid);
+    assert!(!stored.snap_targets.guides);
+    assert!(!stored.snap_targets.grid);
+    assert!(stored.snap_targets.canvas);
+
+    // A value written by an older build keeps working and picks up the new defaults.
+    let mut legacy = TestStorage::default();
+    legacy.0.insert(
+        TOOL_SETTINGS_KEY.to_string(),
+        "(auto_select:false, show_controls:true, snap:true)".to_string(),
+    );
+    let stored = eframe::get_value::<ToolSettings>(&legacy, TOOL_SETTINGS_KEY).unwrap();
+    assert!(!stored.auto_select);
+    assert!(stored.show_controls);
+    assert!(stored.snap);
+    assert!(stored.show_rulers);
+    assert!(!stored.show_grid);
+    assert_eq!(stored.snap_targets, SnapTargets::default());
+}
+
+#[test]
+fn grid_toggle_and_settings_use_document_history() {
+    let (context, mut app) = app();
+    app.dimensions = [64, 48];
+    app.new_document();
+
+    let mut revision = app.session().unwrap().history.revision;
+    app.command("toggle_grid");
+    assert!(app.show_grid);
+    assert_eq!(
+        app.session().unwrap().document.grid,
+        Some(mectov::document::GridSettings::default())
+    );
+    assert!(app.session().unwrap().history.revision > revision);
+
+    // Hiding and showing a grid the document already carries is not an edit.
+    revision = app.session().unwrap().history.revision;
+    app.command("toggle_grid");
+    assert!(!app.show_grid);
+    app.command("toggle_grid");
+    assert!(app.show_grid);
+    assert_eq!(app.session().unwrap().history.revision, revision);
+
+    app.command("undo");
+    assert!(app.session().unwrap().document.grid.is_none());
+    assert!(app.session().unwrap().history.revision < revision);
+
+    app.show_grid = false;
+    revision = app.session().unwrap().history.revision;
+    app.command("toggle_grid");
+    assert!(app.show_grid);
+    assert!(
+        app.session().unwrap().history.revision > revision,
+        "the grid comes back as a new edit"
+    );
+    revision = app.session().unwrap().history.revision;
+
+    app.command("grid_settings");
+    assert!(app.dialog == Some(Dialog::Grid));
+    frame(&context, &mut app);
+    let cancel = layer_label(&context, &mut app, "Cancel") + Vec2::splat(5.0);
+    pointer_frame(&context, &mut app, cancel, None, egui::Modifiers::NONE);
+    pointer_frame(
+        &context,
+        &mut app,
+        cancel,
+        Some(true),
+        egui::Modifiers::NONE,
+    );
+    pointer_frame(
+        &context,
+        &mut app,
+        cancel,
+        Some(false),
+        egui::Modifiers::NONE,
+    );
+    assert!(app.dialog.is_none());
+    assert_eq!(app.session().unwrap().history.revision, revision);
+
+    // Applying the dialog writes the edited spacing through the document history.
+    app.command("grid_settings");
+    frame(&context, &mut app);
+    let field = layer_label(&context, &mut app, "32 px") + Vec2::new(16.0, 8.0);
+    pointer_frame(&context, &mut app, field, None, egui::Modifiers::NONE);
+    let _ = context.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                Pos2::ZERO,
+                Vec2::new(1280.0, 860.0),
+            )),
+            events: vec![
+                egui::Event::PointerMoved(field),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: Vec2::new(0.0, 3.0),
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            time: Some(app.frames as f64 / 60.0),
+            ..Default::default()
+        },
+        |ctx| app.show(ctx),
+    );
+    let apply = layer_label(&context, &mut app, "Apply") + Vec2::splat(5.0);
+    pointer_frame(&context, &mut app, apply, None, egui::Modifiers::NONE);
+    pointer_frame(&context, &mut app, apply, Some(true), egui::Modifiers::NONE);
+    pointer_frame(
+        &context,
+        &mut app,
+        apply,
+        Some(false),
+        egui::Modifiers::NONE,
+    );
+    assert!(app.dialog.is_none());
+    let grid = app.session().unwrap().document.grid.unwrap();
+    assert_ne!(grid.spacing, 32.0, "{grid:?}");
+    assert_eq!(grid.subdivisions, 1);
+    assert!(app.session().unwrap().history.revision > revision);
+    app.command("undo");
+    assert_eq!(
+        app.session().unwrap().document.grid,
+        Some(mectov::document::GridSettings::default())
+    );
+}
+
+#[test]
+fn dragging_a_ruler_creates_one_undoable_guide() {
+    let (context, mut app) = app();
+    app.dimensions = [64, 48];
+    app.new_document();
+    frame(&context, &mut app);
+    let rects = app.ruler_rects.unwrap();
+    let position = Pos2::new(rects[0].center().x, rects[0].center().y);
+    pointer_frame(
+        &context,
+        &mut app,
+        position,
+        Some(true),
+        egui::Modifiers::NONE,
+    );
+    pointer_frame(
+        &context,
+        &mut app,
+        position + Vec2::new(20.0, 0.0),
+        None,
+        egui::Modifiers::NONE,
+    );
+    pointer_frame(
+        &context,
+        &mut app,
+        position + Vec2::new(20.0, 0.0),
+        Some(false),
+        egui::Modifiers::NONE,
+    );
+    assert_eq!(app.session().unwrap().document.guides.len(), 1);
+    assert_eq!(
+        app.session().unwrap().document.guides[0].axis,
+        GuideAxis::Vertical
+    );
+    app.command("undo");
+    assert!(app.session().unwrap().document.guides.is_empty());
+}
+
+#[test]
+fn dragging_an_existing_guide_moves_it_and_undoes() {
+    let (context, mut app) = app();
+    app.dimensions = [64, 48];
+    app.new_document();
+    frame(&context, &mut app);
+    let rects = app.ruler_rects.unwrap();
+    let position = Pos2::new(rects[0].center().x, rects[0].center().y);
+    pointer_frame(
+        &context,
+        &mut app,
+        position,
+        Some(true),
+        egui::Modifiers::NONE,
+    );
+    pointer_frame(
+        &context,
+        &mut app,
+        position,
+        Some(false),
+        egui::Modifiers::NONE,
+    );
+    let created = app.session().unwrap().document.guides[0].position;
+
+    app.command("undo");
+    app.tool = Tool::Move;
+    app.session_mut()
+        .unwrap()
+        .document
+        .guides
+        .push(mectov::document::Guide {
+            axis: GuideAxis::Vertical,
+            position: created,
+        });
+    frame(&context, &mut app);
+    let canvas = app.canvas_rect.unwrap();
+    let zoom = app.session().unwrap().zoom;
+    let grab = Pos2::new(canvas.left() + created * zoom, canvas.center().y);
+    let dropped = Pos2::new(grab.x + 40.0, grab.y);
+    pointer_frame(&context, &mut app, grab, Some(true), egui::Modifiers::NONE);
+    pointer_frame(
+        &context,
+        &mut app,
+        dropped,
+        Some(false),
+        egui::Modifiers::NONE,
+    );
+    let guides = &app.session().unwrap().document.guides;
+    assert_eq!(guides.len(), 1);
+    assert!(guides[0].position > created, "{created} -> {:?}", guides[0]);
+    assert!(app.session().unwrap().document.selection.is_none());
+    app.command("undo");
+    assert_eq!(app.session().unwrap().document.guides[0].position, created);
+}
+
+#[test]
+fn releasing_a_guide_outside_the_canvas_deletes_it() {
+    let (context, mut app) = app();
+    app.dimensions = [64, 48];
+    app.new_document();
+    frame(&context, &mut app);
+    let rects = app.ruler_rects.unwrap();
+    let position = Pos2::new(rects[0].center().x, rects[0].center().y);
+    pointer_frame(
+        &context,
+        &mut app,
+        position,
+        Some(true),
+        egui::Modifiers::NONE,
+    );
+    pointer_frame(
+        &context,
+        &mut app,
+        position,
+        Some(false),
+        egui::Modifiers::NONE,
+    );
+    assert_eq!(app.session().unwrap().document.guides.len(), 1);
+
+    app.tool = Tool::Move;
+    frame(&context, &mut app);
+    let canvas = app.canvas_rect.unwrap();
+    let zoom = app.session().unwrap().zoom;
+    let guide = app.session().unwrap().document.guides[0].position;
+    let grab = Pos2::new(canvas.left() + guide * zoom, canvas.center().y);
+    pointer_frame(&context, &mut app, grab, Some(true), egui::Modifiers::NONE);
+    pointer_frame(
+        &context,
+        &mut app,
+        Pos2::new(grab.x, rects[0].center().y),
+        Some(false),
+        egui::Modifiers::NONE,
+    );
+    assert!(app.session().unwrap().document.guides.is_empty());
+    app.command("undo");
+    assert_eq!(app.session().unwrap().document.guides.len(), 1);
+}
+
+#[test]
+fn moving_a_layer_snaps_to_guides_and_the_grid() {
+    let (context, mut app) = app();
+    let [bottom, _] = canvas_layers(&mut app);
+    app.snap = true;
+    app.snap_targets = SnapTargets {
+        canvas: true,
+        layers: true,
+        guides: true,
+        grid: true,
+    };
+    app.session_mut()
+        .unwrap()
+        .document
+        .guides
+        .push(mectov::document::Guide {
+            axis: GuideAxis::Vertical,
+            position: 22.0,
+        });
+    app.command("toggle_grid");
+    app.session_mut().unwrap().document.grid = Some(mectov::document::GridSettings {
+        spacing: 25.0,
+        subdivisions: 1,
+    });
+    app.session_mut().unwrap().document.select(bottom, false);
+    app.tool = Tool::Move;
+
+    // The left edge lands within a pixel of the guide, so it locks onto the guide
+    // rather than the 25 px grid step that also covers it.
+    let start = Point::new(15.0, 45.0);
+    drag(
+        &context,
+        &mut app,
+        start,
+        Point::new(start.x + 11.6, start.y),
+        egui::Modifiers::NONE,
+    );
+    let x = app.session().unwrap().document.layers[0].transform.x;
+    assert!((x - 22.0).abs() < 0.01, "{x}");
+    app.command("undo");
+    assert_eq!(app.session().unwrap().document.layers[0].transform.x, 10.0);
+
+    // With guides out of the picture the grid rounds the same drag on its own.
+    app.snap_targets.guides = false;
+    app.snap_targets.canvas = false;
+    drag(
+        &context,
+        &mut app,
+        start,
+        Point::new(start.x + 15.4, start.y),
+        egui::Modifiers::NONE,
+    );
+    let x = app.session().unwrap().document.layers[0].transform.x;
+    assert!((x - 25.0).abs() < 0.01, "{x}");
+}
+
+#[test]
+fn grid_snapping_can_be_disabled_per_target() {
+    let (context, mut app) = app();
+    let [bottom, _] = canvas_layers(&mut app);
+    app.snap = true;
+    app.snap_targets = SnapTargets {
+        canvas: false,
+        layers: false,
+        guides: false,
+        grid: false,
+    };
+    app.command("toggle_grid");
+    app.session_mut().unwrap().document.grid = Some(mectov::document::GridSettings {
+        spacing: 8.0,
+        subdivisions: 1,
+    });
+    app.session_mut().unwrap().document.select(bottom, false);
+    app.tool = Tool::Move;
+
+    let start = Point::new(15.0, 45.0);
+    drag(
+        &context,
+        &mut app,
+        start,
+        Point::new(start.x + 11.6, start.y),
+        egui::Modifiers::NONE,
+    );
+    let x = app.session().unwrap().document.layers[0].transform.x;
+    assert!((x - 21.6).abs() < 0.01, "{x}");
+    app.command("undo");
+
+    app.snap_targets.grid = true;
+    drag(
+        &context,
+        &mut app,
+        start,
+        Point::new(start.x + 11.6, start.y),
+        egui::Modifiers::NONE,
+    );
+    let x = app.session().unwrap().document.layers[0].transform.x;
+    // The right edge is the closest grid multiple, so the 50 px wide layer
+    // settles with its right edge on 72 and its left edge on 22.
+    assert!((x + 50.0 - 72.0).abs() < 0.01, "{x}");
 }

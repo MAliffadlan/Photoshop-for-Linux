@@ -407,7 +407,41 @@ impl EditorApp {
                                     &mut self.show_controls,
                                     "Show Transform Controls",
                                 );
-                                widgets::checkbox(ui, &mut self.snap, "Snap to Canvas and Layers");
+                                item(
+                                    ui,
+                                    if self.show_rulers {
+                                        "Hide Rulers"
+                                    } else {
+                                        "Show Rulers"
+                                    },
+                                    "",
+                                    "toggle_rulers",
+                                    &mut action,
+                                );
+                                item(
+                                    ui,
+                                    if self.show_grid {
+                                        "Hide Layout Grid"
+                                    } else {
+                                        "Show Layout Grid"
+                                    },
+                                    "",
+                                    "toggle_grid",
+                                    &mut action,
+                                );
+                                if self
+                                    .session()
+                                    .is_some_and(|session| session.document.grid.is_some())
+                                {
+                                    item(ui, "Grid Settings…", "", "grid_settings", &mut action);
+                                }
+                                widgets::checkbox(ui, &mut self.snap, "Snap");
+                                ui.menu_button("Snap To", |ui| {
+                                    widgets::checkbox(ui, &mut self.snap_targets.canvas, "Canvas");
+                                    widgets::checkbox(ui, &mut self.snap_targets.layers, "Layers");
+                                    widgets::checkbox(ui, &mut self.snap_targets.guides, "Guides");
+                                    widgets::checkbox(ui, &mut self.snap_targets.grid, "Grid");
+                                });
                                 item(ui, "Clear Guides", "", "clear_guides", &mut action);
                             });
                             menu_bar_button(ui, "Help", |ui| {

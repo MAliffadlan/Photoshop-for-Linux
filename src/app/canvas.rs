@@ -1,16 +1,18 @@
 use super::widgets;
 use std::sync::Arc;
 
-use egui::{Color32, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2, pos2, vec2};
+use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2, pos2, vec2};
 use mectov::{
-    document::{GuideAxis, Point},
+    document::{GridSettings, Guide, GuideAxis, MAX_GUIDES, Point},
     operations,
     paint::{self, PaintMode},
     render,
     selection::{self, SelectionMode},
 };
 
-use super::{EditorApp, Gesture, Tool, TransformDrag, theme};
+use super::{
+    EditorApp, Gesture, GuideDrag, GuideEdit, SnapLine, SnapSource, Tool, TransformDrag, theme,
+};
 
 const HANDLES: [Point; 8] = [
     Point::new(0.0, 0.0),
@@ -24,6 +26,47 @@ const HANDLES: [Point; 8] = [
 ];
 
 const MAX_SMOOTHING_HISTORY: usize = 8;
+const RULER_SIZE: f32 = 20.0;
+const GUIDE_GRAB_PX: f32 = 6.0;
+
+fn nice_step(target: f32) -> f32 {
+    if !target.is_finite() || target <= 0.0 {
+        return 1.0;
+    }
+    let exponent = target.log10().floor().clamp(-6.0, 6.0) as i32;
+    let base = 10.0_f32.powi(exponent);
+    [1.0, 2.0, 5.0, 10.0]
+        .into_iter()
+        .map(|factor| factor * base)
+        .find(|step| *step >= target)
+        .unwrap_or(10.0 * base)
+}
+
+fn effective_grid_step(grid: GridSettings, zoom: f32) -> Option<f32> {
+    let mut step = grid.minor_spacing();
+    if !step.is_finite() || step <= 0.0 || !zoom.is_finite() || zoom <= 0.0 {
+        return None;
+    }
+    while step * zoom < 2.0 {
+        step *= 10.0;
+        if !step.is_finite() {
+            return None;
+        }
+    }
+    Some(step)
+}
+
+fn line_values(min: f32, max: f32, step: f32) -> Vec<f32> {
+    if !min.is_finite() || !max.is_finite() || !step.is_finite() || step <= 0.0 || max < min {
+        return Vec::new();
+    }
+    let first = (min / step).ceil() * step;
+    let count = ((max - first) / step).floor().max(0.0) as usize;
+    (0..=count.min(512))
+        .map(|index| first + index as f32 * step)
+        .filter(|value| *value >= min && *value <= max)
+        .collect()
+}
 
 fn constrain_shape_point(start: Point, point: Point, kind: mectov::paint::ShapeKind) -> Point {
     if kind == mectov::paint::ShapeKind::Line {
@@ -159,19 +202,50 @@ fn drag_transform(
 
 impl EditorApp {
     pub(super) fn canvas(&mut self, ctx: &egui::Context) {
+        let mut pending_guide: Option<GuideEdit> = None;
+        let mut ruler_rects = None;
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(theme::CANVAS))
             .show(ctx, |ui| {
-                let (viewport, response) =
-                    ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
+                let show_rulers = self.show_rulers;
+                let (viewport, allocated) = ui.allocate_exact_size(
+                    ui.available_size(),
+                    if show_rulers {
+                        Sense::hover()
+                    } else {
+                        Sense::click_and_drag()
+                    },
+                );
+                let (canvas_area, horizontal_ruler, vertical_ruler) = if show_rulers {
+                    let horizontal =
+                        Rect::from_min_size(viewport.min, vec2(viewport.width(), RULER_SIZE));
+                    let vertical = Rect::from_min_max(
+                        pos2(viewport.left(), viewport.top() + RULER_SIZE),
+                        pos2(viewport.left() + RULER_SIZE, viewport.bottom()),
+                    );
+                    let area = Rect::from_min_max(
+                        pos2(viewport.left() + RULER_SIZE, viewport.top() + RULER_SIZE),
+                        viewport.max,
+                    );
+                    ruler_rects = Some([horizontal, vertical]);
+                    (area, horizontal, vertical)
+                } else {
+                    (viewport, Rect::NOTHING, Rect::NOTHING)
+                };
+                let response = if show_rulers {
+                    ui.interact(canvas_area, ui.id().with("canvas"), Sense::click_and_drag())
+                } else {
+                    allocated
+                };
+                self.ruler_rects = ruler_rects;
                 if self.sessions.is_empty() {
                     self.welcome(ui, viewport);
                     return;
                 }
                 let session = &mut self.sessions[self.current];
                 if session.fit {
-                    session.zoom = ((viewport.width() - 100.0) / session.document.width as f32)
-                        .min((viewport.height() - 90.0) / session.document.height as f32)
+                    session.zoom = ((canvas_area.width() - 100.0) / session.document.width as f32)
+                        .min((canvas_area.height() - 90.0) / session.document.height as f32)
                         .clamp(0.01, 8.0);
                     session.pan = Vec2::ZERO;
                     session.fit = false;
@@ -182,11 +256,144 @@ impl EditorApp {
                     session.document.width as f32,
                     session.document.height as f32,
                 ) * zoom;
-                let origin = viewport.center() - size * 0.5 + session.pan;
+                let origin = canvas_area.center() - size * 0.5 + session.pan;
                 let canvas = Rect::from_min_size(origin, size);
                 self.canvas_rect = Some(canvas);
-                let visible = canvas.intersect(viewport);
-                let painter = ui.painter().with_clip_rect(viewport);
+                let visible = canvas.intersect(canvas_area);
+                let painter = ui.painter().with_clip_rect(canvas_area);
+                if show_rulers {
+                    let horizontal_rect =
+                        Rect::from_min_size(viewport.min, vec2(viewport.width(), RULER_SIZE));
+                    let vertical_rect = Rect::from_min_max(
+                        pos2(viewport.left(), viewport.top() + RULER_SIZE),
+                        pos2(viewport.left() + RULER_SIZE, viewport.bottom()),
+                    );
+                    let horizontal = ui.painter().with_clip_rect(horizontal_rect);
+                    let vertical = ui.painter().with_clip_rect(vertical_rect);
+                    horizontal.rect_filled(horizontal_rect, 0.0, theme::PANEL);
+                    vertical.rect_filled(vertical_rect, 0.0, theme::PANEL);
+                    let step = nice_step(60.0 / zoom);
+                    let min_x = (viewport.left() - origin.x) / zoom;
+                    let max_x = (viewport.right() - origin.x) / zoom;
+                    let min_y = (viewport.top() + RULER_SIZE - origin.y) / zoom;
+                    let max_y = (viewport.bottom() - origin.y) / zoom;
+                    for x in line_values(min_x, max_x, step / 5.0) {
+                        let screen = origin.x + x * zoom;
+                        horizontal.line_segment(
+                            [
+                                pos2(screen, horizontal_rect.bottom()),
+                                pos2(screen, horizontal_rect.bottom() - 4.0),
+                            ],
+                            Stroke::new(0.5_f32, theme::MUTED),
+                        );
+                    }
+                    for y in line_values(min_y, max_y, step / 5.0) {
+                        let screen = origin.y + y * zoom;
+                        vertical.line_segment(
+                            [
+                                pos2(vertical_rect.right() - 4.0, screen),
+                                pos2(vertical_rect.right(), screen),
+                            ],
+                            Stroke::new(0.5_f32, theme::MUTED),
+                        );
+                    }
+                    for x in line_values(min_x, max_x, step) {
+                        let screen = origin.x + x * zoom;
+                        horizontal.line_segment(
+                            [
+                                pos2(screen, horizontal_rect.bottom()),
+                                pos2(screen, horizontal_rect.top() + 8.0),
+                            ],
+                            Stroke::new(0.75_f32, theme::TEXT),
+                        );
+                        horizontal.text(
+                            pos2(screen + 2.0, horizontal_rect.center().y),
+                            Align2::LEFT_CENTER,
+                            format!("{x:.0}"),
+                            FontId::proportional(9.0),
+                            theme::MUTED,
+                        );
+                    }
+                    for y in line_values(min_y, max_y, step) {
+                        let screen = origin.y + y * zoom;
+                        vertical.line_segment(
+                            [
+                                pos2(vertical_rect.left(), screen),
+                                pos2(vertical_rect.left() + 4.0, screen),
+                            ],
+                            Stroke::new(0.75_f32, theme::TEXT),
+                        );
+                        vertical.text(
+                            pos2(vertical_rect.left() + 6.0, screen),
+                            Align2::LEFT_CENTER,
+                            format!("{y:.0}"),
+                            FontId::proportional(9.0),
+                            theme::MUTED,
+                        );
+                    }
+                    let guide_color = Color32::from_rgb(0, 255, 255);
+                    for guide in &session.document.guides {
+                        match guide.axis {
+                            GuideAxis::Vertical => {
+                                let screen = origin.x + guide.position * zoom;
+                                if (horizontal_rect.left()..=horizontal_rect.right())
+                                    .contains(&screen)
+                                {
+                                    horizontal.line_segment(
+                                        [
+                                            pos2(screen - 4.0, horizontal_rect.bottom()),
+                                            pos2(screen + 4.0, horizontal_rect.bottom()),
+                                        ],
+                                        Stroke::new(1.5_f32, guide_color),
+                                    );
+                                }
+                            }
+                            GuideAxis::Horizontal => {
+                                let screen = origin.y + guide.position * zoom;
+                                if (vertical_rect.top()..=vertical_rect.bottom()).contains(&screen)
+                                {
+                                    vertical.line_segment(
+                                        [
+                                            pos2(vertical_rect.left(), screen - 4.0),
+                                            pos2(vertical_rect.left(), screen + 4.0),
+                                        ],
+                                        Stroke::new(1.5_f32, guide_color),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    if let Some(pointer) = ctx.input(|input| input.pointer.hover_pos())
+                        && canvas_area.contains(pointer)
+                    {
+                        let x = (pointer.x - origin.x) / zoom;
+                        let y = (pointer.y - origin.y) / zoom;
+                        let chip = Rect::from_min_size(
+                            pos2(viewport.left() + 1.0, viewport.top() + RULER_SIZE - 13.0),
+                            vec2(48.0, 12.0),
+                        );
+                        horizontal.rect_filled(chip, 0.0, theme::TITLEBAR);
+                        horizontal.text(
+                            pos2(pointer.x - 2.0, viewport.top() + RULER_SIZE - 2.0),
+                            Align2::RIGHT_BOTTOM,
+                            format!("{x:.1}"),
+                            FontId::proportional(9.0),
+                            theme::TEXT,
+                        );
+                        let chip = Rect::from_center_size(
+                            pos2(viewport.left() + 10.0, pointer.y),
+                            vec2(18.0, 12.0),
+                        );
+                        vertical.rect_filled(chip, 0.0, theme::TITLEBAR);
+                        vertical.text(
+                            pos2(viewport.left() + 2.0, pointer.y),
+                            Align2::LEFT_CENTER,
+                            format!("{y:.1}"),
+                            FontId::proportional(9.0),
+                            theme::TEXT,
+                        );
+                    }
+                }
                 painter.rect_filled(canvas.expand(3.0), 0.0, Color32::from_black_alpha(60));
                 if visible.is_positive() {
                     let checker = 12.0;
@@ -254,6 +461,50 @@ impl EditorApp {
                             ],
                             Stroke::new(0.5_f32, Color32::from_white_alpha(28)),
                         );
+                    }
+                }
+                if self.show_grid
+                    && let Some(grid) = session.document.grid
+                    && let Some(minor_step) = effective_grid_step(grid, zoom)
+                {
+                    let min_x = (visible.left() - origin.x) / zoom;
+                    let max_x = (visible.right() - origin.x) / zoom;
+                    let min_y = (visible.top() - origin.y) / zoom;
+                    let max_y = (visible.bottom() - origin.y) / zoom;
+                    let minor =
+                        Stroke::new(0.5_f32, Color32::from_rgba_unmultiplied(128, 128, 128, 46));
+                    let major =
+                        Stroke::new(0.75_f32, Color32::from_rgba_unmultiplied(160, 160, 160, 85));
+                    let grid_painter = painter.with_clip_rect(visible);
+                    for x in line_values(min_x, max_x, minor_step) {
+                        let screen = origin.x + x * zoom;
+                        grid_painter.line_segment(
+                            [pos2(screen, visible.top()), pos2(screen, visible.bottom())],
+                            minor,
+                        );
+                    }
+                    for y in line_values(min_y, max_y, minor_step) {
+                        let screen = origin.y + y * zoom;
+                        grid_painter.line_segment(
+                            [pos2(visible.left(), screen), pos2(visible.right(), screen)],
+                            minor,
+                        );
+                    }
+                    if (minor_step - grid.spacing).abs() > f32::EPSILON {
+                        for x in line_values(min_x, max_x, grid.spacing) {
+                            let screen = origin.x + x * zoom;
+                            grid_painter.line_segment(
+                                [pos2(screen, visible.top()), pos2(screen, visible.bottom())],
+                                major,
+                            );
+                        }
+                        for y in line_values(min_y, max_y, grid.spacing) {
+                            let screen = origin.y + y * zoom;
+                            grid_painter.line_segment(
+                                [pos2(visible.left(), screen), pos2(visible.right(), screen)],
+                                major,
+                            );
+                        }
                     }
                 }
                 if let Some(mask) = &session.document.selection {
@@ -357,7 +608,13 @@ impl EditorApp {
                 // Guides the document carries. They span the canvas rather than the viewport, so one pushed
                 // off the canvas edge stops at it.
                 let guide_painter = painter.with_clip_rect(canvas.intersect(viewport));
-                for guide in &session.document.guides {
+                for (index, guide) in session.document.guides.iter().enumerate() {
+                    if self
+                        .guide_drag
+                        .is_some_and(|drag| drag.existing == Some(index))
+                    {
+                        continue;
+                    }
                     let line = match guide.axis {
                         GuideAxis::Horizontal => [
                             pos2(canvas.left(), origin.y + guide.position * zoom),
@@ -373,20 +630,40 @@ impl EditorApp {
                         Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(0, 255, 255, 230)),
                     );
                 }
-                for (horizontal, coordinate) in &self.guides {
-                    let line = if *horizontal {
-                        [
-                            pos2(origin.x + coordinate * zoom, viewport.top()),
-                            pos2(origin.x + coordinate * zoom, viewport.bottom()),
-                        ]
-                    } else {
-                        [
-                            pos2(viewport.left(), origin.y + coordinate * zoom),
-                            pos2(viewport.right(), origin.y + coordinate * zoom),
-                        ]
+                if let Some(drag) = self.guide_drag {
+                    let line = match drag.axis {
+                        GuideAxis::Horizontal => [
+                            pos2(canvas.left(), origin.y + drag.position * zoom),
+                            pos2(canvas.right(), origin.y + drag.position * zoom),
+                        ],
+                        GuideAxis::Vertical => [
+                            pos2(origin.x + drag.position * zoom, canvas.top()),
+                            pos2(origin.x + drag.position * zoom, canvas.bottom()),
+                        ],
                     };
-                    painter
-                        .line_segment(line, Stroke::new(1.0_f32, Color32::from_rgb(219, 115, 213)));
+                    guide_painter.line_segment(
+                        line,
+                        Stroke::new(1.5_f32, Color32::from_rgba_unmultiplied(0, 255, 255, 255)),
+                    );
+                }
+                for indicator in &self.snap_indicators {
+                    let line = match indicator.axis {
+                        GuideAxis::Horizontal => [
+                            pos2(viewport.left(), origin.y + indicator.position * zoom),
+                            pos2(viewport.right(), origin.y + indicator.position * zoom),
+                        ],
+                        GuideAxis::Vertical => [
+                            pos2(origin.x + indicator.position * zoom, viewport.top()),
+                            pos2(origin.x + indicator.position * zoom, viewport.bottom()),
+                        ],
+                    };
+                    let color = match indicator.source {
+                        super::SnapSource::Guide | super::SnapSource::Grid => {
+                            Color32::from_rgb(0, 255, 255)
+                        }
+                        super::SnapSource::Layer => Color32::from_rgb(219, 115, 213),
+                    };
+                    painter.line_segment(line, Stroke::new(1.0_f32, color));
                 }
                 if let Some((start, end)) = self.crop_rect {
                     let rect = Rect::from_two_pos(map(start), map(end));
@@ -489,7 +766,94 @@ impl EditorApp {
                     || self.close_tab.is_some()
                     || self.rename.is_some();
                 if blocked {
+                    self.guide_drag = None;
                     return;
+                }
+                let global_pointer = ctx.input(|input| input.pointer.hover_pos());
+                let primary_down =
+                    ctx.input(|input| input.pointer.button_down(egui::PointerButton::Primary));
+                if self.guide_drag.is_none() && primary_down {
+                    let press = ctx
+                        .input(|input| input.pointer.press_origin())
+                        .or(global_pointer);
+                    let dragged_guide = press.and_then(|press| {
+                        if self.tool == Tool::Move && canvas_area.contains(press) {
+                            let doc_press = Point::new(
+                                (press.x - origin.x) / zoom,
+                                (press.y - origin.y) / zoom,
+                            );
+                            let session = &self.sessions[self.current];
+                            session.document.guides.iter().position(|guide| {
+                                let distance = match guide.axis {
+                                    GuideAxis::Vertical => (guide.position - doc_press.x).abs(),
+                                    GuideAxis::Horizontal => (guide.position - doc_press.y).abs(),
+                                };
+                                distance * zoom <= GUIDE_GRAB_PX
+                            })
+                        } else {
+                            None
+                        }
+                    });
+                    let axis = press.and_then(|press| {
+                        if horizontal_ruler.contains(press) {
+                            Some(GuideAxis::Vertical)
+                        } else if vertical_ruler.contains(press) {
+                            Some(GuideAxis::Horizontal)
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some(index) = dragged_guide {
+                        let guide = self.sessions[self.current].document.guides[index];
+                        self.guide_drag = Some(GuideDrag {
+                            axis: guide.axis,
+                            position: guide.position,
+                            existing: Some(index),
+                        });
+                    } else if let (Some(axis), Some(pointer)) = (axis, global_pointer) {
+                        let value = match axis {
+                            GuideAxis::Vertical => (pointer.x - origin.x) / zoom,
+                            GuideAxis::Horizontal => (pointer.y - origin.y) / zoom,
+                        };
+                        let step = nice_step(10.0 / zoom);
+                        self.guide_drag = Some(GuideDrag {
+                            axis,
+                            position: (value / step).round() * step,
+                            existing: None,
+                        });
+                    }
+                }
+                if let Some(drag) = self.guide_drag {
+                    let position = global_pointer.map(|pointer| {
+                        let value = match drag.axis {
+                            GuideAxis::Vertical => (pointer.x - origin.x) / zoom,
+                            GuideAxis::Horizontal => (pointer.y - origin.y) / zoom,
+                        };
+                        let step = nice_step(10.0 / zoom);
+                        ((value / step).round() * step).clamp(-1_000_000.0, 1_000_000.0)
+                    });
+                    if primary_down {
+                        if let Some(position) = position {
+                            self.guide_drag = Some(GuideDrag {
+                                axis: drag.axis,
+                                position,
+                                existing: drag.existing,
+                            });
+                        }
+                    } else {
+                        let released_inside =
+                            global_pointer.is_some_and(|p| canvas_area.contains(p));
+                        let guide = Guide {
+                            axis: drag.axis,
+                            position: position.unwrap_or(drag.position),
+                        };
+                        pending_guide = Some(match (drag.existing, released_inside) {
+                            (Some(index), true) => GuideEdit::Move(index, guide),
+                            (Some(index), false) => GuideEdit::Delete(index),
+                            (None, _) => GuideEdit::Create(guide),
+                        });
+                        self.guide_drag = None;
+                    }
                 }
                 let pointer = response
                     .interact_pointer_pos()
@@ -516,8 +880,31 @@ impl EditorApp {
                         session.zoom = new;
                         session.fit = false;
                     }
+                    let guide_axis = if self.tool == Tool::Move {
+                        doc_point.and_then(|point| {
+                            self.sessions[self.current]
+                                .document
+                                .guides
+                                .iter()
+                                .find(|guide| {
+                                    let distance = match guide.axis {
+                                        GuideAxis::Vertical => (guide.position - point.x).abs(),
+                                        GuideAxis::Horizontal => (guide.position - point.y).abs(),
+                                    };
+                                    distance * zoom <= GUIDE_GRAB_PX
+                                })
+                                .map(|guide| guide.axis)
+                        })
+                    } else {
+                        None
+                    };
                     let cursor = if panning {
                         egui::CursorIcon::Grab
+                    } else if let Some(axis) = guide_axis {
+                        match axis {
+                            GuideAxis::Vertical => egui::CursorIcon::ResizeHorizontal,
+                            GuideAxis::Horizontal => egui::CursorIcon::ResizeVertical,
+                        }
                     } else if hover_handle.is_some() {
                         egui::CursorIcon::ResizeNwSe
                     } else if self.tool == Tool::Move {
@@ -544,8 +931,10 @@ impl EditorApp {
                         );
                     }
                 }
-                let started = response.drag_started()
-                    || response.drag_started_by(egui::PointerButton::Middle);
+                let manipulating_guide = self.guide_drag.is_some() || pending_guide.is_some();
+                let started = (response.drag_started()
+                    || response.drag_started_by(egui::PointerButton::Middle))
+                    && !manipulating_guide;
                 if started {
                     if let (Some(screen), Some(point)) = (pointer, doc_point) {
                         let press = ctx.input(|i| i.pointer.press_origin()).unwrap_or(screen);
@@ -565,6 +954,7 @@ impl EditorApp {
                 }
                 if response.clicked()
                     && !panning
+                    && !manipulating_guide
                     && hover_handle.is_none()
                     && let Some(point) = doc_point
                 {
@@ -596,6 +986,30 @@ impl EditorApp {
                     );
                 }
             });
+        match pending_guide {
+            Some(GuideEdit::Create(guide)) => {
+                self.edit("New Guide", |doc| {
+                    anyhow::ensure!(doc.guides.len() < MAX_GUIDES, "Too many guides");
+                    doc.guides.push(guide);
+                    Ok(())
+                });
+            }
+            Some(GuideEdit::Move(index, guide)) => {
+                self.edit("Move Guide", |doc| {
+                    anyhow::ensure!(index < doc.guides.len(), "Guide no longer exists");
+                    *doc.guides.get_mut(index).expect("checked above") = guide;
+                    Ok(())
+                });
+            }
+            Some(GuideEdit::Delete(index)) => {
+                self.edit("Delete Guide", |doc| {
+                    anyhow::ensure!(index < doc.guides.len(), "Guide no longer exists");
+                    doc.guides.remove(index);
+                    Ok(())
+                });
+            }
+            None => {}
+        }
     }
 
     fn welcome(&mut self, ui: &mut egui::Ui, viewport: Rect) {
@@ -1069,61 +1483,125 @@ impl EditorApp {
                             dx = 0.0;
                         }
                     }
-                    self.guides.clear();
+                    self.snap_indicators.clear();
                     if self.snap
                         && !modifiers.ctrl
                         && matches!(gesture.kind, TransformDrag::Move)
                         && let Some(t) = gesture.reference
                     {
-                        let mut xs = vec![
-                            0.0,
-                            session.document.width as f32 * 0.5,
-                            session.document.width as f32,
-                        ];
-                        let mut ys = vec![
-                            0.0,
-                            session.document.height as f32 * 0.5,
-                            session.document.height as f32,
-                        ];
-                        for l in &gesture.original.layers {
-                            if !gesture.original.selected.contains(&l.id) && l.visible {
-                                xs.extend([
-                                    l.transform.x,
-                                    l.transform.center().x,
-                                    l.transform.x + l.transform.width,
-                                ]);
-                                ys.extend([
-                                    l.transform.y,
-                                    l.transform.center().y,
-                                    l.transform.y + l.transform.height,
-                                ]);
+                        let mut xs = Vec::new();
+                        let mut ys = Vec::new();
+                        if self.snap_targets.canvas {
+                            xs.extend([
+                                0.0,
+                                session.document.width as f32 * 0.5,
+                                session.document.width as f32,
+                            ]);
+                            ys.extend([
+                                0.0,
+                                session.document.height as f32 * 0.5,
+                                session.document.height as f32,
+                            ]);
+                        }
+                        if self.snap_targets.layers {
+                            for l in &gesture.original.layers {
+                                if !gesture.original.selected.contains(&l.id) && l.visible {
+                                    xs.extend([
+                                        l.transform.x,
+                                        l.transform.center().x,
+                                        l.transform.x + l.transform.width,
+                                    ]);
+                                    ys.extend([
+                                        l.transform.y,
+                                        l.transform.center().y,
+                                        l.transform.y + l.transform.height,
+                                    ]);
+                                }
                             }
                         }
-                        let snap = |guides: [f32; 3], targets: &[f32]| -> Option<(f32, f32)> {
-                            let mut best = None;
-                            let mut distance = 6.0 / session.zoom;
-                            for g in guides {
+                        let guide_xs = gesture
+                            .original
+                            .guides
+                            .iter()
+                            .filter(|guide| guide.axis == GuideAxis::Vertical)
+                            .map(|guide| guide.position)
+                            .collect::<Vec<_>>();
+                        let guide_ys = gesture
+                            .original
+                            .guides
+                            .iter()
+                            .filter(|guide| guide.axis == GuideAxis::Horizontal)
+                            .map(|guide| guide.position)
+                            .collect::<Vec<_>>();
+                        let grid_step = self
+                            .snap_targets
+                            .grid
+                            .then_some(gesture.original.grid)
+                            .flatten()
+                            .and_then(|grid| effective_grid_step(grid, session.zoom));
+                        let snap = |values: [f32; 3],
+                                    targets: &[f32],
+                                    guides: &[f32],
+                                    grid: Option<f32>|
+                         -> Option<(f32, f32, SnapSource)> {
+                            let threshold = 6.0 / session.zoom;
+                            let mut best: Option<(f32, f32, SnapSource)> = None;
+                            let consider = |value: f32,
+                                                 target: f32,
+                                                 source: SnapSource,
+                                                 best: &mut Option<(f32, f32, SnapSource)>| {
+                                let delta = target - value;
+                                if delta.abs() < threshold
+                                    && best.is_none_or(|current| delta.abs() < current.0.abs())
+                                {
+                                    *best = Some((delta, target, source));
+                                }
+                            };
+                            for value in values {
                                 for target in targets {
-                                    let d = *target - g;
-                                    if d.abs() < distance {
-                                        distance = d.abs();
-                                        best = Some((d, *target));
+                                    consider(value, *target, SnapSource::Layer, &mut best);
+                                }
+                                if self.snap_targets.guides {
+                                    for target in guides {
+                                        consider(value, *target, SnapSource::Guide, &mut best);
                                     }
+                                }
+                                if let Some(step) = grid {
+                                    consider(
+                                        value,
+                                        (value / step).round() * step,
+                                        SnapSource::Grid,
+                                        &mut best,
+                                    );
                                 }
                             }
                             best
                         };
-                        if let Some((delta, x)) =
-                            snap([t.x + dx, t.center().x + dx, t.x + t.width + dx], &xs)
-                        {
+                        if let Some((delta, x, source)) = snap(
+                            [t.x + dx, t.center().x + dx, t.x + t.width + dx],
+                            &xs,
+                            &guide_xs,
+                            grid_step,
+                        ) {
                             dx += delta;
-                            self.guides.push((true, x));
+                            self.snap_indicators.push(SnapLine {
+                                axis: GuideAxis::Vertical,
+                                position: x,
+                                source,
+                            });
                         }
-                        if let Some((delta, y)) =
-                            snap([t.y + dy, t.center().y + dy, t.y + t.height + dy], &ys)
-                        {
+                        if let Some((delta, y, source)) = snap(
+                            [t.y + dy, t.center().y + dy, t.y + t.height + dy],
+                            &ys,
+                            &guide_ys,
+                            grid_step,
+                        ) {
                             dy += delta;
-                            self.guides.push((false, y));
+                            self.snap_indicators.push(SnapLine {
+                                axis: GuideAxis::Horizontal,
+                                position: y,
+                                source,
+                            });
                         }
                     }
                     let targets = if self.mask_target {
@@ -1249,7 +1727,7 @@ impl EditorApp {
                     session.history.cancel(&mut session.document);
                     self.error = Some(error.to_string());
                     session.invalidate();
-                    self.guides.clear();
+                    self.snap_indicators.clear();
                     return;
                 }
             }
@@ -1345,7 +1823,7 @@ impl EditorApp {
             }
         }
         session.invalidate();
-        self.guides.clear();
+        self.snap_indicators.clear();
         if self.tool.is_brush() {
             self.last_brush = Some(end);
         }

@@ -1,6 +1,7 @@
 use super::widgets;
 use std::{io::Cursor, sync::Arc};
 
+use anyhow::Context as _;
 use egui::{Color32, RichText, Stroke, vec2};
 use mectov::{
     document::{Adjustment, Layer, LayerEffects, Point},
@@ -161,6 +162,70 @@ impl EditorApp {
                     if !open {
                         self.shortcut_capture = None;
                         self.shortcut_error = None;
+                        self.dialog = None;
+                    }
+                }
+                Dialog::Grid => {
+                    if let Some(mut grid) = self.grid_edit.take() {
+                        let mut open = true;
+                        let mut apply = false;
+                        let mut cancel = false;
+                        widgets::Window::new("Grid settings")
+                            .default_width(360.0)
+                            .open(&mut open)
+                            .show(ctx, |ui| {
+                                ui.label(RichText::new("Layout grid spacing").strong());
+                                ui.add(
+                                    widgets::Number::new(&mut grid.spacing)
+                                        .range(1.0..=5_000.0)
+                                        .max_decimals(1)
+                                        .suffix(" px"),
+                                );
+                                ui.label(RichText::new("Subdivisions per cell").strong());
+                                ui.add(
+                                    widgets::Number::new(&mut grid.subdivisions)
+                                        .range(1..=100),
+                                );
+                                ui.add_space(8.0);
+                                ui.label(
+                                    RichText::new("Smaller values are coarsened automatically when zoomed out.")
+                                        .small()
+                                        .color(theme::MUTED),
+                                );
+                                ui.horizontal(|ui| {
+                                    cancel = widgets::button(ui, "Cancel").clicked();
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            apply = widgets::primary_button(ui, "Apply").clicked();
+                                        },
+                                    );
+                                });
+                            });
+                        self.grid_edit = Some(grid);
+                        if apply {
+                            let applied = self.grid_edit.take();
+                            let before = self.session().map(|session| session.history.revision);
+                            self.edit("Grid Settings", |doc| {
+                                let grid = applied.context("Grid settings are gone")?;
+                                grid.validate()?;
+                                doc.grid = Some(grid);
+                                Ok(())
+                            });
+                            if before.is_some_and(|revision| {
+                                self.session()
+                                    .is_some_and(|session| session.history.revision != revision)
+                            }) {
+                                self.dialog = None;
+                            } else {
+                                self.grid_edit = applied;
+                            }
+                        }
+                        if !open || cancel {
+                            self.dialog = None;
+                            self.grid_edit = None;
+                        }
+                    } else {
                         self.dialog = None;
                     }
                 }

@@ -366,6 +366,12 @@ const DEFINITIONS: &[ShortcutDefinition] = &[
         defaults: &[chord(Key::Minus, true, false, false)],
     },
     ShortcutDefinition {
+        action: ShortcutAction::Command("toggle_rulers"),
+        label: "Show / Hide Rulers",
+        group: "View",
+        defaults: &[chord(Key::R, true, false, false)],
+    },
+    ShortcutDefinition {
         action: ShortcutAction::Command("shortcuts"),
         label: "Keyboard Shortcuts",
         group: "Help",

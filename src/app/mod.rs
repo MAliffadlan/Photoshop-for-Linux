@@ -31,7 +31,10 @@ use egui::{Pos2, TextureHandle, Vec2};
 use image::{GrayImage, RgbaImage};
 use mectov::{
     blend::BlendMode,
-    document::{Adjustment, Document, Layer, LayerEffects, Mask, Point, Transform},
+    document::{
+        Adjustment, Document, GridSettings, Guide, GuideAxis, Layer, LayerEffects, Mask, Point,
+        Transform,
+    },
     effects::Filter,
     history::History,
     io, operations,
@@ -43,13 +46,56 @@ use serde::{Deserialize, Serialize};
 
 use self::shortcuts::{ShortcutAction, ShortcutSettings};
 
-/// The tool settings Compositor 1.2.1 keeps between runs — Auto Select, Show Controls and Snap.
-/// Rulers, guides and the grid are not ported yet, so only these three have anything to store.
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct SnapTargets {
+    canvas: bool,
+    layers: bool,
+    guides: bool,
+    grid: bool,
+}
+
+impl Default for SnapTargets {
+    fn default() -> Self {
+        Self {
+            canvas: true,
+            layers: true,
+            guides: true,
+            grid: true,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Serialize, Deserialize)]
 struct ToolSettings {
+    #[serde(default = "default_true")]
     auto_select: bool,
+    #[serde(default = "default_true")]
     show_controls: bool,
+    #[serde(default = "default_true")]
     snap: bool,
+    #[serde(default = "default_true")]
+    show_rulers: bool,
+    #[serde(default)]
+    show_grid: bool,
+    #[serde(default)]
+    snap_targets: SnapTargets,
+}
+
+impl Default for ToolSettings {
+    fn default() -> Self {
+        Self {
+            auto_select: true,
+            show_controls: true,
+            snap: true,
+            show_rulers: true,
+            show_grid: false,
+            snap_targets: SnapTargets::default(),
+        }
+    }
 }
 
 const TOOL_SETTINGS_KEY: &str = "tool_settings";
@@ -275,6 +321,7 @@ enum Dialog {
     Text,
     Export,
     Shortcuts,
+    Grid,
     About,
 }
 
@@ -313,6 +360,34 @@ enum TransformDrag {
 struct LayerDrag {
     project: Uuid,
     layer: Uuid,
+}
+
+#[derive(Clone, Copy)]
+struct GuideDrag {
+    axis: GuideAxis,
+    position: f32,
+    existing: Option<usize>,
+}
+
+#[derive(Clone, Copy)]
+enum GuideEdit {
+    Create(Guide),
+    Move(usize, Guide),
+    Delete(usize),
+}
+
+#[derive(Clone, Copy)]
+enum SnapSource {
+    Layer,
+    Guide,
+    Grid,
+}
+
+#[derive(Clone, Copy)]
+struct SnapLine {
+    axis: GuideAxis,
+    position: f32,
+    source: SnapSource,
 }
 
 struct Gesture {
@@ -379,6 +454,9 @@ pub struct EditorApp {
     ignore_transparent_pixels: bool,
     show_controls: bool,
     snap: bool,
+    show_rulers: bool,
+    show_grid: bool,
+    snap_targets: SnapTargets,
     shortcut_settings: ShortcutSettings,
     shortcut_capture: Option<ShortcutAction>,
     shortcut_error: Option<String>,
@@ -389,14 +467,16 @@ pub struct EditorApp {
     clone_all: bool,
     last_brush: Option<Point>,
     gesture: Option<Gesture>,
+    guide_drag: Option<GuideDrag>,
     crop_rect: Option<(Point, Point)>,
     crop_ratio: Option<f32>,
-    guides: Vec<(bool, f32)>,
+    snap_indicators: Vec<SnapLine>,
     dialog: Option<Dialog>,
     dimensions: [u32; 2],
     resolution: f32,
     anchor: [f32; 2],
     effect: Option<EffectEdit>,
+    grid_edit: Option<GridSettings>,
     error: Option<String>,
     status: String,
     rename: Option<(Uuid, String)>,
@@ -415,6 +495,7 @@ pub struct EditorApp {
     screenshot_requested: bool,
     frames: usize,
     canvas_rect: Option<egui::Rect>,
+    ruler_rects: Option<[egui::Rect; 2]>,
 }
 
 impl EditorApp {
@@ -443,6 +524,9 @@ impl EditorApp {
             app.auto_select = stored.auto_select;
             app.show_controls = stored.show_controls;
             app.snap = stored.snap;
+            app.show_rulers = stored.show_rulers;
+            app.show_grid = stored.show_grid;
+            app.snap_targets = stored.snap_targets;
         }
         if let Some(stored) = cc.storage.as_ref().and_then(|storage| {
             eframe::get_value::<ShortcutSettings>(&**storage, shortcuts::STORAGE_KEY)
@@ -517,6 +601,9 @@ impl EditorApp {
             ignore_transparent_pixels: true,
             show_controls: true,
             snap: true,
+            show_rulers: true,
+            show_grid: false,
+            snap_targets: SnapTargets::default(),
             shortcut_settings: ShortcutSettings::default(),
             shortcut_capture: None,
             shortcut_error: None,
@@ -527,14 +614,16 @@ impl EditorApp {
             clone_all: true,
             last_brush: None,
             gesture: None,
+            guide_drag: None,
             crop_rect: None,
             crop_ratio: None,
-            guides: Vec::new(),
+            snap_indicators: Vec::new(),
             dialog: None,
             dimensions: [1920, 1080],
             resolution: 72.0,
             anchor: [0.5, 0.5],
             effect: None,
+            grid_edit: None,
             error: None,
             status: String::new(),
             rename: None,
@@ -553,6 +642,7 @@ impl EditorApp {
             screenshot_requested: false,
             frames: 0,
             canvas_rect: None,
+            ruler_rects: None,
         };
         if demo {
             app.add_demo();
@@ -720,6 +810,9 @@ impl EditorApp {
                 self.current = self.sessions.len() - 1;
                 self.mask_target = false;
                 self.dialog = None;
+                self.show_grid = self
+                    .session()
+                    .is_some_and(|session| session.document.grid.is_some());
             }
             Err(error) => {
                 self.error = Some(format!("Could not open {}\n\n{error:#}", path.display()))
@@ -824,7 +917,8 @@ impl EditorApp {
             session.history.cancel(&mut session.document);
             session.invalidate();
         }
-        self.guides.clear();
+        self.snap_indicators.clear();
+        self.guide_drag = None;
     }
 
     fn start_adjustment(&mut self, adjustment: Adjustment, as_layer: bool) {
@@ -1296,6 +1390,34 @@ impl EditorApp {
                     session.fit = false;
                 }
             }
+            "toggle_rulers" => {
+                self.show_rulers = !self.show_rulers;
+                if let Some(session) = self.session_mut() {
+                    session.fit = true;
+                }
+            }
+            "toggle_grid" => {
+                self.show_grid = !self.show_grid;
+                if self.show_grid
+                    && self
+                        .session()
+                        .is_some_and(|session| session.document.grid.is_none())
+                {
+                    self.edit("Show Grid", |doc| {
+                        doc.grid = Some(GridSettings::default());
+                        Ok(())
+                    });
+                }
+                if let Some(session) = self.session_mut() {
+                    session.fit = true;
+                }
+            }
+            "grid_settings" => {
+                if let Some(grid) = self.session().and_then(|session| session.document.grid) {
+                    self.grid_edit = Some(grid);
+                    self.dialog = Some(Dialog::Grid);
+                }
+            }
             "clear_guides" => self.edit("Clear Guides", |doc| {
                 doc.guides.clear();
                 Ok(())
@@ -1329,6 +1451,9 @@ impl eframe::App for EditorApp {
                 auto_select: self.auto_select,
                 show_controls: self.show_controls,
                 snap: self.snap,
+                show_rulers: self.show_rulers,
+                show_grid: self.show_grid,
+                snap_targets: self.snap_targets,
             },
         );
         eframe::set_value(storage, shortcuts::STORAGE_KEY, &self.shortcut_settings);

@@ -21,6 +21,8 @@
 | Fit / Actual pixels | Ctrl+0 / Ctrl+1 |
 | Zoom in / out | Ctrl+Plus / Ctrl+Minus, or mouse wheel |
 | Show transform / Hide controls | Ctrl+T / Ctrl+H |
+| Show / hide rulers | Ctrl+R |
+| Show / hide layout grid | View menu |
 | Move / Marquee / Lasso / Wand / Crop | V / M / L / W / C |
 | Brush / Eraser / Heal / Clone / Blur | B / E / J / S / R |
 | Gradient / Shape / Eyedropper / Hand / Zoom | G / U / I / H / Z |
@@ -44,6 +46,8 @@ For a marquee selection, Ctrl+C copies the active layer's selected pixels. If no
 Shift with a selection adds coverage, Alt subtracts, and Shift+Alt intersects. Drag inside a selection to move its outline; hold Ctrl to move selected pixels, or Ctrl+Alt to duplicate them. The contextual header also offers explicit selection modes.
 
 Move handles scale the selected layers, the circular handle rotates them, and Ctrl-dragging a corner applies perspective distortion. Shift constrains movement or rotation; the Link control toggles the size ratio. Alt-drag duplicates a layer. The mask thumbnail targets the mask for painting and transformations. Its context menu controls linking and visibility.
+
+Rulers run along the top and left of the canvas and show document coordinates. Drag out of a ruler to pull a guide onto the canvas; drag it again with the Move tool to reposition it, and release it over a ruler or outside the canvas to delete it. The layout grid is drawn over the canvas (**View > Show Layout Grid**) and configured with **View > Grid Settings…**. While **View > Snap** is on, a moved layer locks to the canvas, other layers, guides, and the grid; **View > Snap To** disables individual targets and Ctrl suspends snapping for one drag.
 
 Alt-click sets a Clone Stamp source. Shift-click continues a straight brush line. Clone alignment and sampling are configured in the contextual header. Use the same header to switch marquee/lasso/shape variants and linear/radial gradients.
 
