@@ -172,10 +172,16 @@ pub fn save(document: &Document, path: &Path) -> Result<()> {
         let mut archive = ZipWriter::new(temporary.as_file_mut());
         let options =
             SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
-        // Guides, layer effects, the 1.2.3 blur and noise adjustment layers and the layout grid all
-        // raise the version, because an older reader must refuse the file rather than silently drop
-        // what it cannot draw.
-        let version = if document.grid.is_some() {
+        // Guides, layer effects, the 1.2.3 blur and noise adjustment layers, the layout grid and
+        // paragraph text boxes all raise the version, because an older reader must refuse the file
+        // rather than silently drop what it cannot draw.
+        let version = if document
+            .layers
+            .iter()
+            .any(|layer| layer.text.as_ref().is_some_and(|text| text.r#box.is_some()))
+        {
+            7
+        } else if document.grid.is_some() {
             6
         } else if document.layers.iter().any(|layer| {
             layer
@@ -274,7 +280,7 @@ pub fn load(path: &Path) -> Result<Document> {
     let mut manifest: Manifest =
         serde_json::from_slice(&zip_read(&mut archive, "manifest.json", MAX_MANIFEST)?)?;
     ensure!(
-        READ_FORMATS.contains(&manifest.format.as_str()) && (1..=6).contains(&manifest.version),
+        READ_FORMATS.contains(&manifest.format.as_str()) && (1..=7).contains(&manifest.version),
         "Unsupported mectov project version"
     );
     let mut used_pixels = 0;
@@ -1484,15 +1490,15 @@ mod tests {
     }
 
     #[test]
-    fn reads_version_six_projects_and_refuses_later_ones() {
+    fn reads_version_seven_projects_and_refuses_later_ones() {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("six.mectov");
+        let path = directory.path().join("seven.mectov");
         let mut document = Document::new(2, 2).unwrap();
         document.grid = Some(GridSettings {
             spacing: 8.0,
             subdivisions: 2,
         });
-        let write = |manifest: &Value| {
+        let write = |manifest: &Value, layer: Option<Uuid>| {
             let mut archive = ZipWriter::new(File::create(&path).unwrap());
             archive
                 .start_file("manifest.json", SimpleFileOptions::default())
@@ -1500,6 +1506,21 @@ mod tests {
             archive
                 .write_all(&serde_json::to_vec(manifest).unwrap())
                 .unwrap();
+            if let Some(layer) = layer {
+                archive
+                    .start_file(format!("images/{layer}.png"), SimpleFileOptions::default())
+                    .unwrap();
+                archive
+                    .write_all(
+                        &encode_png(&DynamicImage::from(RgbaImage::from_pixel(
+                            120,
+                            40,
+                            Rgba([0, 0, 0, 0]),
+                        )))
+                        .unwrap(),
+                    )
+                    .unwrap();
+            }
             archive.finish().unwrap();
         };
         let mut manifest = serde_json::json!({
@@ -1508,20 +1529,98 @@ mod tests {
             "document": document,
             "pixel_layers": [],
         });
-        write(&manifest);
+        write(&manifest, None);
         let loaded = load(&path).unwrap();
         assert_eq!(loaded.grid.unwrap().minor_spacing(), 4.0);
 
         manifest["document"]["grid"] = serde_json::json!({"spacing": 0.0, "subdivisions": 1});
-        write(&manifest);
+        write(&manifest, None);
         assert_eq!(load(&path).unwrap_err().to_string(), "Invalid grid spacing");
 
+        // Version 7 carries a paragraph box, whose fields fill in their defaults.
         manifest["version"] = serde_json::json!(7);
-        write(&manifest);
+        manifest["document"]["grid"] = serde_json::json!({"spacing": 8.0, "subdivisions": 1});
+        let layer_id = Uuid::new_v4();
+        manifest["pixel_layers"] = serde_json::json!([layer_id]);
+        manifest["document"]["active"] = serde_json::json!(layer_id);
+        manifest["document"]["layers"] = serde_json::json!([{
+            "id": layer_id,
+            "name": "Text",
+            "visible": true,
+            "locked": false,
+            "opacity": 1.0,
+            "blend": "Normal",
+            "transform": {
+                "x": 0.0, "y": 0.0, "width": 120.0, "height": 40.0,
+                "rotation": 0.0, "flip_x": false, "flip_y": false
+            },
+            "parent": null, "group": false, "clip_to": null, "mask": null, "adjustment": null,
+            "text": {
+                "content": "Boxed", "family": "Inter Variable", "size": 12.0,
+                "color": [0, 0, 0, 255],
+                "bold": false, "italic": false, "underline": false, "strikethrough": false,
+                "box": { "width": 120.0 }
+            }
+        }]);
+        write(&manifest, Some(layer_id));
+        let loaded = load(&path).unwrap();
+        let text_box = loaded.layers[0].text.as_ref().unwrap().r#box.unwrap();
+        assert_eq!(text_box.width, 120.0);
+        assert_eq!(text_box.min_height, 0.0);
+
+        manifest["version"] = serde_json::json!(8);
+        write(&manifest, None);
         assert_eq!(
             load(&path).unwrap_err().to_string(),
             "Unsupported mectov project version"
         );
+    }
+
+    #[test]
+    fn paragraph_boxes_write_version_seven_and_plain_text_keeps_its_version() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("text.mectov");
+        let mut renderer = crate::text::TextRenderer::default();
+        let mut style = crate::text::TextStyle {
+            content: "Boxed paragraph text".into(),
+            size: 24.0,
+            ..Default::default()
+        };
+        let mut layer = Layer::image(style.layer_name(), renderer.render(&style).unwrap());
+        layer.text = Some(style.clone());
+        let mut document = Document::new(320, 240).unwrap();
+        document.insert(layer);
+        save(&document, &path).unwrap();
+        assert_eq!(saved_version(&path), 1);
+
+        let mut boxed = style.clone();
+        boxed.r#box = Some(crate::text::TextBox {
+            width: 200.0,
+            min_height: 40.0,
+            ..Default::default()
+        });
+        let mut layer = Layer::image(boxed.layer_name(), renderer.render(&boxed).unwrap());
+        layer.transform.x = 12.0;
+        layer.text = Some(boxed.clone());
+        let mut document = Document::new(320, 240).unwrap();
+        document.insert(layer);
+        document.grid = Some(GridSettings::default());
+        save(&document, &path).unwrap();
+        assert_eq!(saved_version(&path), 7);
+        let mut loaded = load(&path).unwrap();
+        assert_eq!(loaded.active().unwrap().text, Some(boxed));
+        assert_eq!(
+            loaded.active().unwrap().transform.width,
+            200.0,
+            "the layer is the box, not the ink"
+        );
+
+        // Removing the box drops the document back to the version it had before.
+        loaded.active_mut().unwrap().text.as_mut().unwrap().r#box = None;
+        save(&loaded, &path).unwrap();
+        assert_eq!(saved_version(&path), 6);
+        style.r#box = None;
+        assert!(style.validate().is_ok());
     }
 
     #[test]

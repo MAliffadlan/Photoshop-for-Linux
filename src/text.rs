@@ -7,10 +7,94 @@ use cosmic_text::{
 use image::{Pixel, Rgba, RgbaImage};
 use serde::{Deserialize, Serialize};
 
-use crate::document::{Layer, Point, validate_size};
+use crate::document::{Layer, MAX_SIDE, Point, validate_size};
 
 pub const MAX_TEXT_BYTES: usize = 16_384;
 const FALLBACK_FAMILY: &str = "Inter Variable";
+/// The leading a plain text layer uses, matching the multiplier a paragraph box defaults to.
+const DEFAULT_LINE_SPACING: f32 = 1.3;
+const DEFAULT_BOX_WIDTH: f32 = 512.0;
+const MAX_LINE_SPACING: f32 = 4.0;
+const MIN_LINE_SPACING: f32 = 0.5;
+const MAX_PARAGRAPH_SPACING: f32 = 2_000.0;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TextAlign {
+    #[default]
+    Left,
+    Center,
+    Right,
+}
+
+impl TextAlign {
+    /// How much of the leftover line width moves each line, as a fraction.
+    fn factor(self) -> f32 {
+        match self {
+            Self::Left => 0.0,
+            Self::Center => 0.5,
+            Self::Right => 1.0,
+        }
+    }
+}
+
+/// A paragraph box: text wraps to `width`, `min_height` reserves space the text may grow past.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TextBox {
+    #[serde(default = "default_box_width")]
+    pub width: f32,
+    #[serde(default)]
+    pub min_height: f32,
+    #[serde(default)]
+    pub align: TextAlign,
+    #[serde(default = "default_line_spacing")]
+    pub line_spacing: f32,
+    #[serde(default)]
+    pub paragraph_spacing: f32,
+}
+
+impl Default for TextBox {
+    fn default() -> Self {
+        Self {
+            width: DEFAULT_BOX_WIDTH,
+            min_height: 0.0,
+            align: TextAlign::default(),
+            line_spacing: DEFAULT_LINE_SPACING,
+            paragraph_spacing: 0.0,
+        }
+    }
+}
+
+impl TextBox {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.width.is_finite() && (1.0..=MAX_SIDE as f32).contains(&self.width),
+            "Text box width must be between 1 and {MAX_SIDE} pixels"
+        );
+        ensure!(
+            self.min_height.is_finite() && (0.0..=MAX_SIDE as f32).contains(&self.min_height),
+            "Text box height must be between 0 and {MAX_SIDE} pixels"
+        );
+        ensure!(
+            self.line_spacing.is_finite()
+                && (MIN_LINE_SPACING..=MAX_LINE_SPACING).contains(&self.line_spacing),
+            "Line spacing must be between {MIN_LINE_SPACING} and {MAX_LINE_SPACING}"
+        );
+        ensure!(
+            self.paragraph_spacing.is_finite()
+                && (0.0..=MAX_PARAGRAPH_SPACING).contains(&self.paragraph_spacing),
+            "Paragraph spacing must be between 0 and {MAX_PARAGRAPH_SPACING} pixels"
+        );
+        Ok(())
+    }
+}
+
+fn default_box_width() -> f32 {
+    DEFAULT_BOX_WIDTH
+}
+
+fn default_line_spacing() -> f32 {
+    DEFAULT_LINE_SPACING
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TextStyle {
@@ -22,6 +106,8 @@ pub struct TextStyle {
     pub italic: bool,
     pub underline: bool,
     pub strikethrough: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub r#box: Option<TextBox>,
 }
 
 impl Default for TextStyle {
@@ -35,6 +121,7 @@ impl Default for TextStyle {
             italic: false,
             underline: false,
             strikethrough: false,
+            r#box: None,
         }
     }
 }
@@ -53,7 +140,15 @@ impl TextStyle {
             self.size.is_finite() && (1.0..=1024.0).contains(&self.size),
             "Font size must be between 1 and 1024 pixels"
         );
+        if let Some(text_box) = &self.r#box {
+            text_box.validate()?;
+        }
         Ok(())
+    }
+
+    pub fn line_spacing(&self) -> f32 {
+        self.r#box
+            .map_or(DEFAULT_LINE_SPACING, |text_box| text_box.line_spacing)
     }
 
     pub fn layer_name(&self) -> String {
@@ -109,7 +204,7 @@ impl TextRenderer {
 
     pub fn render(&mut self, style: &TextStyle) -> Result<RgbaImage> {
         style.validate()?;
-        let line_height = style.size * 1.3;
+        let line_height = style.size * style.line_spacing();
         ensure!(
             (style.content.lines().count().max(1) as f32 * line_height) <= 30_000.0,
             "Text is too tall"
@@ -146,15 +241,34 @@ impl TextRenderer {
             .style(face.style)
             .stretch(face.stretch);
         let mut buffer = Buffer::new(&mut self.fonts, Metrics::new(style.size, line_height));
-        buffer.set_wrap(&mut self.fonts, Wrap::None);
-        buffer.set_size(&mut self.fonts, None, None);
+        // A paragraph box wraps at its width; plain text only breaks where the author did.
+        match style.r#box {
+            Some(text_box) => {
+                buffer.set_wrap(&mut self.fonts, Wrap::Word);
+                buffer.set_size(&mut self.fonts, Some(text_box.width), None);
+            }
+            None => {
+                buffer.set_wrap(&mut self.fonts, Wrap::None);
+                buffer.set_size(&mut self.fonts, None, None);
+            }
+        }
         buffer.set_text(&mut self.fonts, &style.content, &attrs, Shaping::Advanced);
+        // Boxes centre or right-align each wrapped line and open a gap between paragraphs.
+        let shift = |run: &cosmic_text::LayoutRun| -> (f32, f32) {
+            style.r#box.map_or((0.0, 0.0), |text_box| {
+                (
+                    text_box.align.factor() * (text_box.width - run.line_w),
+                    text_box.paragraph_spacing * run.line_i as f32,
+                )
+            })
+        };
 
         let mut right = 1.0_f32;
         let mut bottom = line_height;
         for run in buffer.layout_runs() {
-            right = right.max(run.line_w);
-            bottom = bottom.max(run.line_top + run.line_height);
+            let (x, y) = shift(&run);
+            right = right.max(run.line_w + x);
+            bottom = bottom.max(run.line_top + run.line_height + y);
         }
         validate_size(right.ceil() as u32, bottom.ceil() as u32)?;
 
@@ -166,6 +280,8 @@ impl TextRenderer {
         let mut glyphs = Vec::new();
         let mut rules = Vec::new();
         for run in buffer.layout_runs() {
+            let (offset_x, offset_y) = shift(&run);
+            let (offset_x, offset_y) = (offset_x.round() as i32, offset_y.round() as i32);
             for glyph in run.glyphs {
                 let mut physical = glyph.physical((0.0, 0.0), 1.0);
                 if style.italic
@@ -192,14 +308,14 @@ impl TextRenderer {
                 };
                 if let Some(image) = cache.get_image(&mut self.fonts, physical.cache_key) {
                     let placement = image.placement;
-                    let x = physical.x + placement.left;
-                    let y = y - placement.top;
+                    let x = physical.x + placement.left + offset_x;
+                    let y = y - placement.top + offset_y;
                     left = left.min(x);
                     top = top.min(y);
                     right = right.max(x + placement.width as i32 + embolden);
                     bottom = bottom.max(y + placement.height as i32);
                 }
-                glyphs.push((physical, y, embolden));
+                glyphs.push((physical, y, embolden, offset_x, offset_y));
             }
             let thickness = (style.size / 16.0).max(1.0);
             for (enabled, y) in [
@@ -207,22 +323,35 @@ impl TextRenderer {
                 (style.strikethrough, run.line_y - style.size * 0.3),
             ] {
                 if enabled && run.line_w > 0.0 {
+                    let y = y + offset_y as f32;
                     top = top.min(y.floor() as i32);
                     bottom = bottom.max((y + thickness).ceil() as i32);
-                    rules.push((run.line_w, y, thickness));
+                    rules.push((run.line_w + offset_x as f32, y, thickness));
                 }
             }
         }
-        let (width, height) = ((right - left) as u32, (bottom - top) as u32);
-        validate_size(width, height)?;
+        // A box keeps its own area, so the raster is the box rather than the ink it holds.
+        let (width, height, left, top): (u32, u32, i32, i32) = match style.r#box {
+            Some(text_box) => {
+                let width = text_box.width.round().max(1.0) as u32;
+                let height = bottom.max(text_box.min_height.ceil() as i32).max(1) as u32;
+                validate_size(width, height)?;
+                (width, height, 0, 0)
+            }
+            None => {
+                let (width, height) = ((right - left) as u32, (bottom - top) as u32);
+                validate_size(width, height)?;
+                (width, height, left, top)
+            }
+        };
         let mut pixels = RgbaImage::new(width, height);
         let color = Color::rgb(style.color[0], style.color[1], style.color[2]);
-        for (glyph, baseline, embolden) in glyphs {
+        for (glyph, baseline, embolden, offset_x, offset_y) in glyphs {
             cache.with_pixels(&mut self.fonts, glyph.cache_key, color, |x, y, color| {
                 for offset in 0..=embolden {
                     if let Some(pixel) = pixels.get_pixel_mut_checked(
-                        (glyph.x + x + offset - left) as u32,
-                        (baseline + y - top) as u32,
+                        (glyph.x + x + offset + offset_x - left) as u32,
+                        (baseline + offset_y + y - top) as u32,
                     ) {
                         pixel.blend(&Rgba(color.as_rgba()));
                     }
@@ -262,8 +391,14 @@ pub fn update_layer(layer: &mut Layer, style: TextStyle, pixels: RgbaImage) -> R
         .ok_or_else(|| anyhow::anyhow!("Text layer has no pixels"))?;
     let anchor = layer.transform.point(Point::new(0.0, 0.0));
     let mut transform = layer.transform;
-    transform.width *= pixels.width() as f32 / old.width() as f32;
-    transform.height *= pixels.height() as f32 / old.height() as f32;
+    if style.r#box.is_some() {
+        // A paragraph box owns its area, so the layer is exactly the box.
+        transform.width = pixels.width() as f32;
+        transform.height = pixels.height() as f32;
+    } else {
+        transform.width *= pixels.width() as f32 / old.width() as f32;
+        transform.height *= pixels.height() as f32 / old.height() as f32;
+    }
     let moved = transform.point(Point::new(0.0, 0.0));
     transform.x += anchor.x - moved.x;
     transform.y += anchor.y - moved.y;
@@ -428,5 +563,236 @@ mod tests {
                 .text
                 .is_none()
         );
+    }
+
+    fn boxed(width: f32, min_height: f32) -> TextBox {
+        TextBox {
+            width,
+            min_height,
+            ..Default::default()
+        }
+    }
+
+    fn ink_bounds(pixels: &RgbaImage) -> (u32, u32) {
+        let (mut left, mut top) = (u32::MAX, u32::MAX);
+        let (mut right, mut bottom) = (0, 0);
+        for (x, y, pixel) in pixels.enumerate_pixels() {
+            if pixel[3] > 0 {
+                left = left.min(x);
+                top = top.min(y);
+                right = right.max(x + 1);
+                bottom = bottom.max(y + 1);
+            }
+        }
+        if left > right {
+            return (0, 0);
+        }
+        (right - left, bottom - top)
+    }
+
+    fn first_ink(pixels: &RgbaImage) -> Option<(u32, u32)> {
+        pixels
+            .enumerate_pixels()
+            .find_map(|(x, y, pixel)| (pixel[3] > 0).then_some((x, y)))
+    }
+
+    #[test]
+    fn a_paragraph_box_wraps_and_keeps_its_own_area() {
+        let mut renderer = renderer();
+        let content = "Wrapping needs enough words to need more than one line in the box";
+        let plain = renderer
+            .render(&TextStyle {
+                content: content.into(),
+                size: 24.0,
+                ..Default::default()
+            })
+            .unwrap();
+        let style = TextStyle {
+            content: content.into(),
+            size: 24.0,
+            r#box: Some(boxed(200.0, 0.0)),
+            ..Default::default()
+        };
+        let wrapped = renderer.render(&style).unwrap();
+        assert_eq!(wrapped.width(), 200);
+        assert!(
+            wrapped.height() > plain.height(),
+            "wrapped {} vs plain {}",
+            wrapped.height(),
+            plain.height()
+        );
+        // The ink never leaves the box, and the layer is the box rather than the ink.
+        let (ink_width, _) = ink_bounds(&wrapped);
+        assert!(ink_width <= 200);
+        assert!(ink_width < 200, "wrapped lines should not fill the box");
+        let layer = layer(&mut renderer, style.clone());
+        assert_eq!(layer.transform.width, 200.0);
+        assert_eq!(layer.transform.height, wrapped.height() as f32);
+
+        // A box wide enough for the sentence needs only one line.
+        let mut wide = style.clone();
+        wide.r#box = Some(boxed(4_000.0, 0.0));
+        let single = renderer.render(&wide).unwrap();
+        assert_eq!(single.width(), 4_000);
+        assert!(single.height() < wrapped.height());
+    }
+
+    #[test]
+    fn box_height_reserves_space_and_grows_past_it() {
+        let mut renderer = renderer();
+        let base = TextStyle {
+            content: "Short".into(),
+            size: 20.0,
+            r#box: Some(boxed(300.0, 0.0)),
+            ..Default::default()
+        };
+        let fitted = renderer.render(&base).unwrap();
+        assert_eq!(fitted.width(), 300);
+        assert!(
+            ink_bounds(&fitted).1 < 400,
+            "the text is shorter than the box"
+        );
+        let mut roomy = base.clone();
+        roomy.r#box = Some(boxed(300.0, 400.0));
+        let reserved = renderer.render(&roomy).unwrap();
+        assert_eq!(reserved.width(), 300);
+        assert_eq!(reserved.height(), 400);
+        assert!(ink_bounds(&reserved).1 < 400, "the extra room stays empty");
+
+        // Content taller than the minimum grows the box instead of clipping.
+        let mut tall = base.clone();
+        tall.content = "line\n".repeat(20);
+        let grown = renderer.render(&tall).unwrap();
+        assert!(grown.height() > 400);
+        assert!(grown.height() as f32 > tall.size * 1.3 * 19.0);
+    }
+
+    #[test]
+    fn box_alignment_shifts_ink_and_paragraph_spacing_opens_gaps() {
+        let mut renderer = renderer();
+        let style = TextStyle {
+            content: "Alpha beta gamma delta epsilon zeta eta theta".into(),
+            size: 20.0,
+            r#box: Some(boxed(240.0, 0.0)),
+            ..Default::default()
+        };
+        let left = renderer.render(&style).unwrap();
+        let left_ink = first_ink(&left).unwrap();
+        let mut centered = style.clone();
+        centered.r#box.as_mut().unwrap().align = TextAlign::Center;
+        let center = renderer.render(&centered).unwrap();
+        let center_ink = first_ink(&center).unwrap();
+        let mut right_style = style.clone();
+        right_style.r#box.as_mut().unwrap().align = TextAlign::Right;
+        let right = renderer.render(&right_style).unwrap();
+        let right_ink = first_ink(&right).unwrap();
+        assert!(left != center && left != right && center != right);
+        assert!(
+            left_ink.0 < center_ink.0 && center_ink.0 < right_ink.0,
+            "alignment must step the first ink rightwards: {left_ink:?} {center_ink:?} {right_ink:?}"
+        );
+        assert_eq!(left_ink.1, center_ink.1);
+        assert_eq!(left_ink.1, right_ink.1);
+
+        // Paragraph spacing only moves lines that follow a break.
+        let mut paragraphs = style.clone();
+        paragraphs.content = "First paragraph\nSecond paragraph".into();
+        let tight = renderer.render(&paragraphs).unwrap();
+        let mut spaced = paragraphs.clone();
+        spaced.r#box.as_mut().unwrap().paragraph_spacing = 40.0;
+        let loose = renderer.render(&spaced).unwrap();
+        assert_eq!(tight.width(), loose.width());
+        assert_eq!(loose.height(), tight.height() + 40);
+        let first_row = |pixels: &RgbaImage| {
+            pixels
+                .enumerate_pixels()
+                .find_map(|(x, y, p)| (p[3] > 0 && y > 0).then_some((x, y)))
+        };
+        assert_eq!(
+            first_row(&tight).map(|(_, y)| y),
+            first_row(&loose).map(|(_, y)| y)
+        );
+    }
+
+    #[test]
+    fn box_settings_are_validated_and_survive_a_round_trip() {
+        let mut renderer = renderer();
+        let mut style = TextStyle {
+            content: "Boxed".into(),
+            r#box: Some(boxed(180.0, 60.0)),
+            ..Default::default()
+        };
+        style.r#box.as_mut().unwrap().align = TextAlign::Center;
+        let layer = layer(&mut renderer, style.clone());
+        let mut document = Document::new(400, 300).unwrap();
+        document.insert(layer);
+        let file = tempfile::NamedTempFile::new().unwrap();
+        io::save(&document, file.path()).unwrap();
+        let loaded = io::load(file.path()).unwrap();
+        assert_eq!(loaded.active().unwrap().text, Some(style.clone()));
+        assert_eq!(
+            loaded.active().unwrap().pixels,
+            document.active().unwrap().pixels
+        );
+        // A layer without a box keeps the appearance it always had.
+        let mut plain = style.clone();
+        plain.r#box = None;
+        assert_ne!(
+            plain.render_check(&mut renderer),
+            style.render_check(&mut renderer)
+        );
+
+        for width in [0.0, -1.0, f32::NAN, f32::INFINITY, 30_001.0] {
+            style.r#box.as_mut().unwrap().width = width;
+            assert!(style.validate().is_err(), "{width}");
+            assert!(renderer.render(&style).is_err(), "{width}");
+        }
+        style.r#box = Some(boxed(180.0, 60.0));
+        for height in [-1.0, f32::NAN, 30_001.0] {
+            style.r#box.as_mut().unwrap().min_height = height;
+            assert!(style.validate().is_err(), "{height}");
+        }
+        style.r#box = Some(boxed(180.0, 60.0));
+        for spacing in [0.49, 4.01, f32::NAN] {
+            style.r#box.as_mut().unwrap().line_spacing = spacing;
+            assert!(style.validate().is_err(), "{spacing}");
+        }
+        style.r#box = Some(boxed(180.0, 60.0));
+        for spacing in [-1.0, 2_001.0, f32::INFINITY] {
+            style.r#box.as_mut().unwrap().paragraph_spacing = spacing;
+            assert!(style.validate().is_err(), "{spacing}");
+        }
+        style.r#box = Some(boxed(180.0, 60.0));
+        assert!(style.validate().is_ok());
+
+        // Defaults fill in whatever a stored box leaves out.
+        let partial: TextStyle = serde_json::from_value(serde_json::json!({
+            "content": "Partial",
+            "family": "Inter Variable",
+            "size": 12.0,
+            "color": [0, 0, 0, 255],
+            "bold": false,
+            "italic": false,
+            "underline": false,
+            "strikethrough": false,
+            "box": { "width": 300.0 }
+        }))
+        .unwrap();
+        let text_box = partial.r#box.unwrap();
+        assert_eq!(text_box.width, 300.0);
+        assert_eq!(text_box.min_height, 0.0);
+        assert_eq!(text_box.align, TextAlign::Left);
+        assert!((text_box.line_spacing - DEFAULT_LINE_SPACING).abs() < f32::EPSILON);
+        assert_eq!(text_box.paragraph_spacing, 0.0);
+    }
+
+    trait RenderCheck {
+        fn render_check(&self, renderer: &mut TextRenderer) -> RgbaImage;
+    }
+
+    impl RenderCheck for TextStyle {
+        fn render_check(&self, renderer: &mut TextRenderer) -> RgbaImage {
+            renderer.render(self).unwrap()
+        }
     }
 }
