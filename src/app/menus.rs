@@ -218,6 +218,7 @@ impl EditorApp {
                                     ui.separator();
                                     item(ui, "Image Size…", "", "image_size", &mut action);
                                     item(ui, "Canvas Size…", "", "canvas_size", &mut action);
+                                    item(ui, "Trim", "", "trim", &mut action);
                                     ui.separator();
                                     item(
                                         ui,
@@ -332,6 +333,14 @@ impl EditorApp {
                                         &mut action,
                                     );
                                     item(ui, "Feather 3 px", "", "feather", &mut action);
+                                    item(ui, "Expand 3 px", "", "expand_selection", &mut action);
+                                    item(
+                                        ui,
+                                        "Contract 3 px",
+                                        "",
+                                        "contract_selection",
+                                        &mut action,
+                                    );
                                 });
                             });
                             menu_bar_button(ui, "Filter", |ui| {
@@ -353,6 +362,25 @@ impl EditorApp {
                                         Filter::Noise {
                                             amount: 10.0,
                                             monochrome: true,
+                                        },
+                                        Filter::Vignette {
+                                            amount: 35.0,
+                                            color: [0.0, 0.0, 0.0],
+                                            midpoint: 50.0,
+                                            roundness: 100.0,
+                                            feather: 60.0,
+                                            highlights: 25.0,
+                                        },
+                                        Filter::BloomGlow {
+                                            amount: 40.0,
+                                            radius: 24.0,
+                                        },
+                                        Filter::TonalContrast {
+                                            amount: 50.0,
+                                            radius: 16.0,
+                                            shadows: 40.0,
+                                            midtones: 60.0,
+                                            highlights: 30.0,
                                         },
                                         Filter::LensCorrection {
                                             distortion: 0.0,

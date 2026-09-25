@@ -8,7 +8,7 @@ use clap::Parser;
 #[command(
     version,
     about,
-    after_help = "Projects use .mectov; earlier project files and Compositor .comp packages can also be opened."
+    after_help = "Projects use .mectov; PSD/PSB, SVG/SVGZ, earlier project files and Compositor .comp packages can also be opened."
 )]
 struct Args {
     /// Images or projects to open
@@ -120,12 +120,21 @@ mod cli_tests {
             "--screenshot-panel",
             "levels",
             "original.comp",
+            "vector.svg",
+            "document.psd",
         ])
         .unwrap();
 
         assert_eq!(
             args.paths,
-            ["photo.png", "composition.mectov", "original.comp"].map(PathBuf::from)
+            [
+                "photo.png",
+                "composition.mectov",
+                "original.comp",
+                "vector.svg",
+                "document.psd",
+            ]
+            .map(PathBuf::from)
         );
         assert!(args.demo);
         assert_eq!(args.screenshot, Some(PathBuf::from("preview.png")));

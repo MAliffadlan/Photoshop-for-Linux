@@ -1,4 +1,7 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use anyhow::{Result, ensure};
 use image::{GrayImage, Luma, RgbaImage};
@@ -167,6 +170,52 @@ pub fn copy_layers(source: &Document, destination: &mut Document, root: Uuid) ->
     }
     destination.layers.extend(copies);
     destination.select(ids[&root], false);
+    destination.validate()
+}
+
+pub fn paste_layers(
+    source: &Document,
+    destination: &mut Document,
+    roots: &[Uuid],
+    offset: Point,
+) -> Result<()> {
+    let mut targets = HashSet::new();
+    for root in roots {
+        targets.extend(source.descendants(*root));
+    }
+    if targets.is_empty() {
+        return Ok(());
+    }
+    let ids: HashMap<_, _> = targets.iter().map(|id| (*id, Uuid::new_v4())).collect();
+    let existing: HashSet<_> = destination.layers.iter().map(|layer| layer.id).collect();
+    let mut copies = Vec::new();
+    for layer in source
+        .layers
+        .iter()
+        .filter(|layer| targets.contains(&layer.id))
+    {
+        let mut copy = layer.clone();
+        copy.id = ids[&layer.id];
+        copy.parent = layer.parent.and_then(|id| ids.get(&id).copied());
+        copy.clip_to = layer.clip_to.and_then(|id| {
+            ids.get(&id)
+                .copied()
+                .or_else(|| existing.contains(&id).then_some(id))
+        });
+        copy.transform.x += offset.x;
+        copy.transform.y += offset.y;
+        if let Some(placement) = copy.mask.as_mut().and_then(|mask| mask.placement.as_mut()) {
+            placement.x += offset.x;
+            placement.y += offset.y;
+        }
+        copies.push(copy);
+    }
+    destination.layers.extend(copies);
+    if let Some(root) = roots.first()
+        && let Some(id) = ids.get(root)
+    {
+        destination.select(*id, false);
+    }
     destination.validate()
 }
 
@@ -344,6 +393,27 @@ pub fn crop(document: &mut Document, start: Point, end: Point) -> Result<()> {
         GuideAxis::Horizontal => (0.0..=bottom).contains(&guide.position),
     });
     Ok(())
+}
+
+pub fn trim(document: &mut Document) -> Result<()> {
+    let image = render::render(document);
+    let mut bounds: Option<(u32, u32, u32, u32)> = None;
+    for (x, y, pixel) in image.enumerate_pixels() {
+        if pixel[3] > 0 {
+            bounds = Some((
+                bounds.map_or(x, |(left, _, _, _)| left.min(x)),
+                bounds.map_or(y, |(_, top, _, _)| top.min(y)),
+                bounds.map_or(x + 1, |(_, _, right, _)| right.max(x + 1)),
+                bounds.map_or(y + 1, |(_, _, _, bottom)| bottom.max(y + 1)),
+            ));
+        }
+    }
+    let (left, top, right, bottom) = bounds.ok_or_else(|| anyhow::anyhow!("The image is empty"))?;
+    crop(
+        document,
+        Point::new(left as f32, top as f32),
+        Point::new(right as f32, bottom as f32),
+    )
 }
 
 pub fn image_size(document: &mut Document, width: u32, height: u32) -> Result<()> {
@@ -619,6 +689,65 @@ mod tests {
         crop(&mut doc, Point::new(10.0, 5.0), Point::new(40.0, 35.0)).unwrap();
         assert_eq!((doc.width, doc.height), (30, 30));
         assert_eq!(doc.layers[0].transform.x, -10.0);
+    }
+
+    #[test]
+    fn trim_removes_transparent_canvas_edges() {
+        let mut doc = Document::new(10, 9).unwrap();
+        let mut layer = Layer::image(
+            "Content",
+            RgbaImage::from_pixel(3, 4, image::Rgba([255, 0, 0, 255])),
+        );
+        layer.transform.x = 4.0;
+        layer.transform.y = 2.0;
+        doc.layers = vec![layer];
+        trim(&mut doc).unwrap();
+        assert_eq!((doc.width, doc.height), (3, 4));
+        assert_eq!(
+            (doc.layers[0].transform.x, doc.layers[0].transform.y),
+            (0.0, 0.0)
+        );
+        assert!(
+            trim(&mut {
+                let mut empty = Document::new(2, 2).unwrap();
+                empty.layers.clear();
+                empty
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn paste_layers_preserves_hierarchy_effects_and_masks() {
+        let mut source = Document::new(20, 20).unwrap();
+        let mut group = Layer::blank("Folder", 8, 8);
+        group.group = true;
+        group.transform.x = 3.0;
+        let mut child = Layer::image(
+            "Child",
+            RgbaImage::from_pixel(4, 4, image::Rgba([255, 0, 0, 255])),
+        );
+        child.parent = Some(group.id);
+        child.effects = Some(crate::document::LayerEffects {
+            color_overlay: Some(crate::document::ColorOverlayEffect::default()),
+            ..Default::default()
+        });
+        source.layers = vec![child.clone(), group.clone()];
+        let root = group.id;
+        let mut destination = Document::new(20, 20).unwrap();
+        destination.layers.clear();
+        paste_layers(&source, &mut destination, &[root], Point::new(2.0, 3.0)).unwrap();
+        assert_eq!(destination.layers.len(), 2);
+        let pasted_group = destination.layers.iter().find(|layer| layer.group).unwrap();
+        let pasted_child = destination
+            .layers
+            .iter()
+            .find(|layer| layer.parent == Some(pasted_group.id))
+            .unwrap();
+        assert_eq!(pasted_child.effects, child.effects);
+        assert_eq!(pasted_child.transform.x, child.transform.x + 2.0);
+        assert_eq!(pasted_child.transform.y, child.transform.y + 3.0);
+        destination.validate().unwrap();
     }
 
     #[test]

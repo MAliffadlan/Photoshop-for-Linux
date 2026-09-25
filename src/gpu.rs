@@ -193,6 +193,8 @@ impl GpuCompositor {
         motion_blur: Option<[f32; 2]>,
         straight_output: bool,
     ) {
+        let baked = render::bake_layer_effects(document);
+        let document = baked.as_ref();
         let motion_blur = motion_blur.filter(|_| can_preview_motion_blur(document));
         if size != self.size {
             self.size = size;
@@ -833,8 +835,9 @@ fn parameters(document: &Document, layer: &Layer, size: [u32; 2]) -> Parameters 
 
 /// Full-resolution straight-alpha composition for exports, merges and retouching.
 pub(crate) fn compose(document: &Document, width: u32, height: u32) -> Option<RgbaImage> {
+    let baked = render::bake_layer_effects(document);
     processor::attempt(u64::from(width) * u64::from(height), 16_384, |gpu| {
-        gpu.compose(document, width, height)
+        gpu.compose(baked.as_ref(), width, height)
     })
 }
 
@@ -1281,6 +1284,72 @@ mod tests {
             compositor.render(&document, [12, 10]);
             compare(&document, &readback(&compositor), name);
         }
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan or OpenGL compute adapter; run explicitly for native verification"]
+    fn gpu_matches_cpu_layer_effects() {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let adapter =
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+                .unwrap();
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).unwrap();
+        let mut compositor = GpuCompositor::new(device, queue);
+        let mut document = Document::new(48, 40).unwrap();
+        let mut layer = Layer::image(
+            "Effects",
+            RgbaImage::from_fn(9, 7, |x, y| {
+                Rgba([
+                    (x * 25) as u8,
+                    (y * 31) as u8,
+                    180,
+                    if x == 0 || y == 0 { 80 } else { 255 },
+                ])
+            }),
+        );
+        layer.transform.x = 17.0;
+        layer.transform.y = 13.0;
+        layer.transform.rotation = 11.0;
+        layer.opacity = 0.78;
+        layer.mask = Some(crate::document::Mask {
+            pixels: Arc::new(image::GrayImage::from_fn(9, 7, |x, y| {
+                image::Luma([(x * 29 + y * 17).min(255) as u8])
+            })),
+            ..crate::document::Mask::white()
+        });
+        layer.effects = Some(crate::document::LayerEffects {
+            stroke: Some(crate::document::StrokeEffect {
+                size: 2.0,
+                ..crate::document::StrokeEffect::default()
+            }),
+            shadow: Some(crate::document::ShadowEffect {
+                distance: 4.0,
+                blur: 2.0,
+                ..crate::document::ShadowEffect::default()
+            }),
+            color_overlay: Some(crate::document::ColorOverlayEffect {
+                color: [0.2, 0.4, 1.0],
+                opacity: 0.35,
+                ..crate::document::ColorOverlayEffect::default()
+            }),
+            inner_shadow: Some(crate::document::InnerShadowEffect {
+                distance: 2.0,
+                blur: 1.0,
+                ..crate::document::InnerShadowEffect::default()
+            }),
+            outer_glow: Some(crate::document::OuterGlowEffect {
+                size: 3.0,
+                ..crate::document::OuterGlowEffect::default()
+            }),
+            inner_glow: Some(crate::document::InnerGlowEffect {
+                size: 2.0,
+                ..crate::document::InnerGlowEffect::default()
+            }),
+        });
+        document.layers = vec![layer];
+        compositor.render(&document, [48, 40]);
+        compare(&document, &readback(&compositor), "layer effects");
     }
 
     fn compare(document: &Document, gpu: &[u8], context: &str) {

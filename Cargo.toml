@@ -15,8 +15,11 @@ cosmic-text = "0.14.2"
 eframe = { version = "0.33.3", default-features = false, features = ["default_fonts", "wgpu", "x11", "wayland", "persistence"] }
 egui = "0.33.3"
 image = { version = "0.25.9", default-features = false, features = ["png", "jpeg", "tiff", "webp", "bmp", "gif"] }
+flate2 = "1.1"
 png = "0.18"
 rawler = "=0.7.2"
+resvg = { version = "0.48.1", default-features = false, features = ["svgz", "text", "system-fonts"] }
+tiny-skia = "0.12.0"
 rayon = "1.11"
 rfd = "0.15.4"
 serde = { version = "1.0", features = ["derive", "rc"] }

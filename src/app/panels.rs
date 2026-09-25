@@ -13,14 +13,16 @@ fn value(
     number: &mut f32,
     range: std::ops::RangeInclusive<f32>,
 ) -> bool {
-    ui.label(RichText::new(label).color(theme::MUTED));
-    ui.add(
-        widgets::Number::new(number)
-            .speed(1.0)
-            .range(range)
-            .max_decimals(1),
-    )
-    .changed()
+    let mut changed = widgets::scrub_label(ui, label, number, range.clone(), 1.0);
+    changed |= ui
+        .add(
+            widgets::Number::new(number)
+                .speed(1.0)
+                .range(range)
+                .max_decimals(1),
+        )
+        .changed();
+    changed
 }
 
 impl EditorApp {
@@ -148,14 +150,17 @@ impl EditorApp {
                                             .percentage(),
                                         );
                                         ui.label("Opacity");
-                                        ui.add(
-                                            widgets::Slider::new(
-                                                &mut self.brush.opacity,
-                                                0.01..=1.0,
-                                            )
-                                            .percentage(),
-                                        );
-                                        widgets::color_well(ui, &mut self.brush.color);
+                                         ui.add(
+                                             widgets::Slider::new(
+                                                 &mut self.brush.opacity,
+                                                 0.01..=1.0,
+                                             )
+                                             .percentage(),
+                                         );
+                                         if matches!(self.tool, Tool::Brush | Tool::Erase) {
+                                             value(ui, "Smoothing", &mut self.brush.smoothing, 0.0..=100.0);
+                                         }
+                                         widgets::color_well(ui, &mut self.brush.color);
                                     }
                                     tool if tool.is_selection() => {
                                         widgets::segmented(
@@ -226,6 +231,7 @@ impl EditorApp {
                                                 (ShapeKind::Rectangle, "Rectangle"),
                                                 (ShapeKind::RoundedRectangle, "Rounded"),
                                                 (ShapeKind::Ellipse, "Ellipse"),
+                                                (ShapeKind::Line, "Line"),
                                             ],
                                         );
                                         ui.separator();
@@ -240,16 +246,37 @@ impl EditorApp {
                                             );
                                             ui.label("px");
                                         }
+                                        if self.shape_kind == ShapeKind::Line {
+                                            value(
+                                                ui,
+                                                "Width",
+                                                &mut self.line_width,
+                                                1.0..=mectov::document::MAX_SHAPE_SIZE,
+                                            );
+                                            ui.label("px");
+                                        }
                                     }
                                     Tool::Text => self.text_options(ui),
-                                    Tool::Crop => {
-                                        ui.label(
-                                            RichText::new(
-                                                "Drag a crop area, then press Enter to apply",
-                                            )
-                                            .color(theme::MUTED),
-                                        );
-                                    }
+                                     Tool::Crop => {
+                                         widgets::segmented(
+                                             ui,
+                                             &mut self.crop_ratio,
+                                             &[
+                                                 (None, "Free"),
+                                                 (Some(1.0), "1:1"),
+                                                 (Some(3.0 / 4.0), "3:4"),
+                                                 (Some(4.0 / 3.0), "4:3"),
+                                                 (Some(9.0 / 16.0), "9:16"),
+                                                 (Some(16.0 / 9.0), "16:9"),
+                                             ],
+                                         );
+                                         ui.label(
+                                             RichText::new(
+                                                 "Drag a crop area, then press Enter to apply",
+                                             )
+                                             .color(theme::MUTED),
+                                         );
+                                     }
                                     Tool::Dropper => {
                                         ui.label("Sample: All visible layers");
                                         widgets::color_well(ui, &mut self.brush.color);

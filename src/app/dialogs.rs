@@ -3,7 +3,7 @@ use std::{io::Cursor, sync::Arc};
 
 use egui::{Color32, RichText, Stroke, vec2};
 use mectov::{
-    document::{Adjustment, Layer, Point},
+    document::{Adjustment, Layer, LayerEffects, Point},
     effects::{self, Filter},
     io, operations, render,
 };
@@ -291,6 +291,7 @@ impl EditorApp {
             .as_ref()
             .map(|a| a.name())
             .or_else(|| edit.filter.as_ref().map(|f| f.name()))
+            .or_else(|| edit.layer_effects.as_ref().map(|_| "Layer Effects"))
             .unwrap_or("Adjustment");
         let mut open = true;
         let mut apply = false;
@@ -301,6 +302,9 @@ impl EditorApp {
             .default_width(440.0)
             .show(ctx, |ui| {
                 ui.add_space(8.0);
+                if let Some(effects) = &mut edit.layer_effects {
+                    changed |= layer_effect_controls(ui, effects);
+                }
                 if let Some(adjustment) = &mut edit.adjustment {
                     match adjustment {
                         Adjustment::HueRanges { settings } => {
@@ -666,6 +670,114 @@ impl EditorApp {
                                 .changed();
                             changed |= widgets::checkbox(ui, monochrome, "Monochromatic").changed();
                         }
+                        Filter::Vignette {
+                            amount,
+                            color,
+                            midpoint,
+                            roundness,
+                            feather,
+                            highlights,
+                        } => {
+                            ui.horizontal(|ui| {
+                                ui.label("Color");
+                                changed |= effect_color(ui, color);
+                            });
+                            changed |= ui
+                                .add(
+                                    widgets::Slider::new(amount, 0.0..=100.0)
+                                        .percentage()
+                                        .text("Amount"),
+                                )
+                                .changed();
+                            changed |= ui
+                                .add(
+                                    widgets::Slider::new(midpoint, 0.0..=100.0)
+                                        .percentage()
+                                        .text("Midpoint"),
+                                )
+                                .changed();
+                            changed |= ui
+                                .add(
+                                    widgets::Slider::new(roundness, -100.0..=100.0)
+                                        .text("Roundness"),
+                                )
+                                .changed();
+                            changed |= ui
+                                .add(
+                                    widgets::Slider::new(feather, 0.0..=100.0)
+                                        .percentage()
+                                        .text("Feather"),
+                                )
+                                .changed();
+                            changed |= ui
+                                .add(
+                                    widgets::Slider::new(highlights, 0.0..=100.0)
+                                        .percentage()
+                                        .text("Highlights"),
+                                )
+                                .changed();
+                        }
+                        Filter::BloomGlow { amount, radius } => {
+                            changed |= ui
+                                .add(
+                                    widgets::Slider::new(amount, 0.0..=100.0)
+                                        .percentage()
+                                        .text("Amount"),
+                                )
+                                .changed();
+                            changed |= ui
+                                .add(
+                                    widgets::Slider::new(radius, 1.0..=150.0)
+                                        .logarithmic(true)
+                                        .text("Radius")
+                                        .suffix(" px"),
+                                )
+                                .changed();
+                        }
+                        Filter::TonalContrast {
+                            amount,
+                            shadows,
+                            midtones,
+                            highlights,
+                            radius,
+                        } => {
+                            changed |= ui
+                                .add(
+                                    widgets::Slider::new(amount, 0.0..=100.0)
+                                        .percentage()
+                                        .text("Amount"),
+                                )
+                                .changed();
+                            changed |= ui
+                                .add(
+                                    widgets::Slider::new(shadows, -100.0..=100.0)
+                                        .percentage()
+                                        .text("Shadows"),
+                                )
+                                .changed();
+                            changed |= ui
+                                .add(
+                                    widgets::Slider::new(midtones, -100.0..=100.0)
+                                        .percentage()
+                                        .text("Midtones"),
+                                )
+                                .changed();
+                            changed |= ui
+                                .add(
+                                    widgets::Slider::new(highlights, -100.0..=100.0)
+                                        .percentage()
+                                        .text("Highlights"),
+                                )
+                                .changed();
+                            changed |= ui
+                                .add(
+                                    widgets::Slider::new(radius, 1.0..=100.0)
+                                        .logarithmic(true)
+                                        .text("Radius")
+                                        .suffix(" px"),
+                                )
+                                .changed();
+                        }
                         Filter::LensCorrection {
                             distortion,
                             vignette,
@@ -735,7 +847,24 @@ impl EditorApp {
             if let Some(session) = self.session_mut() {
                 session.document = edit.original.clone();
                 if edit.preview || apply {
-                    let result = if let Some(adjustment) = &edit.adjustment {
+                    let result = if let Some(effects) = &edit.layer_effects {
+                        if let Some(target) = edit.target
+                            && let Some(layer) = session
+                                .document
+                                .layers
+                                .iter_mut()
+                                .find(|layer| layer.id == target)
+                        {
+                            if let Err(error) = effects.validate() {
+                                Err(error)
+                            } else {
+                                layer.effects = (!effects.is_empty()).then_some(*effects);
+                                Ok(())
+                            }
+                        } else {
+                            Ok(())
+                        }
+                    } else if let Some(adjustment) = &edit.adjustment {
                         if let Some(target) = edit.target {
                             if let Some(layer) =
                                 session.document.layers.iter_mut().find(|l| l.id == target)
@@ -989,6 +1118,251 @@ impl EditorApp {
             _ => {}
         }
     }
+}
+
+fn effect_color(ui: &mut egui::Ui, color: &mut [f32; 3]) -> bool {
+    let mut rgba = [
+        (color[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+        (color[1].clamp(0.0, 1.0) * 255.0).round() as u8,
+        (color[2].clamp(0.0, 1.0) * 255.0).round() as u8,
+        255,
+    ];
+    let changed = widgets::color_well(ui, &mut rgba).changed();
+    if changed {
+        *color = std::array::from_fn(|index| rgba[index] as f32 / 255.0);
+    }
+    changed
+}
+
+fn layer_effect_controls(ui: &mut egui::Ui, effects: &mut LayerEffects) -> bool {
+    let mut changed = false;
+    ui.label(
+        RichText::new("Effects follow the layer's mask, transform, opacity, and blend mode.")
+            .small()
+            .color(theme::MUTED),
+    );
+    ui.add_space(6.0);
+
+    if effects.stroke.is_none() {
+        if widgets::button(ui, "Add Stroke").clicked() {
+            effects.stroke = Some(Default::default());
+            changed = true;
+        }
+    } else {
+        let mut remove = false;
+        ui.collapsing("Stroke", |ui| {
+            let effect = effects.stroke.as_mut().unwrap();
+            changed |= widgets::checkbox(ui, &mut effect.enabled, "Enabled").changed();
+            changed |= ui
+                .add(
+                    widgets::Slider::new(&mut effect.size, 0.0..=500.0)
+                        .text("Size")
+                        .suffix(" px"),
+                )
+                .changed();
+            changed |= ui
+                .add(
+                    widgets::Slider::new(&mut effect.opacity, 0.0..=1.0)
+                        .percentage()
+                        .text("Opacity"),
+                )
+                .changed();
+            changed |= effect_color(ui, &mut effect.color);
+            changed |= widgets::checkbox(ui, &mut effect.inside, "Inside").changed();
+            remove = widgets::button(ui, "Remove").clicked();
+        });
+        if remove {
+            effects.stroke = None;
+            changed = true;
+        }
+    }
+
+    if effects.shadow.is_none() {
+        if widgets::button(ui, "Add Drop Shadow").clicked() {
+            effects.shadow = Some(Default::default());
+            changed = true;
+        }
+    } else {
+        let mut remove = false;
+        ui.collapsing("Drop Shadow", |ui| {
+            let effect = effects.shadow.as_mut().unwrap();
+            changed |= widgets::checkbox(ui, &mut effect.enabled, "Enabled").changed();
+            changed |= ui
+                .add(
+                    widgets::Slider::new(&mut effect.angle, -360.0..=360.0)
+                        .text("Angle")
+                        .suffix("°"),
+                )
+                .changed();
+            changed |= ui
+                .add(
+                    widgets::Slider::new(&mut effect.distance, 0.0..=5000.0)
+                        .text("Distance")
+                        .suffix(" px"),
+                )
+                .changed();
+            changed |= ui
+                .add(
+                    widgets::Slider::new(&mut effect.blur, 0.0..=500.0)
+                        .text("Blur")
+                        .suffix(" px"),
+                )
+                .changed();
+            changed |= effect_color(ui, &mut effect.color);
+            changed |= ui
+                .add(
+                    widgets::Slider::new(&mut effect.opacity, 0.0..=1.0)
+                        .percentage()
+                        .text("Opacity"),
+                )
+                .changed();
+            remove = widgets::button(ui, "Remove").clicked();
+        });
+        if remove {
+            effects.shadow = None;
+            changed = true;
+        }
+    }
+
+    if effects.color_overlay.is_none() {
+        if widgets::button(ui, "Add Color Overlay").clicked() {
+            effects.color_overlay = Some(Default::default());
+            changed = true;
+        }
+    } else {
+        let mut remove = false;
+        ui.collapsing("Color Overlay", |ui| {
+            let effect = effects.color_overlay.as_mut().unwrap();
+            changed |= widgets::checkbox(ui, &mut effect.enabled, "Enabled").changed();
+            changed |= effect_color(ui, &mut effect.color);
+            changed |= ui
+                .add(
+                    widgets::Slider::new(&mut effect.opacity, 0.0..=1.0)
+                        .percentage()
+                        .text("Opacity"),
+                )
+                .changed();
+            remove = widgets::button(ui, "Remove").clicked();
+        });
+        if remove {
+            effects.color_overlay = None;
+            changed = true;
+        }
+    }
+
+    if effects.inner_shadow.is_none() {
+        if widgets::button(ui, "Add Inner Shadow").clicked() {
+            effects.inner_shadow = Some(Default::default());
+            changed = true;
+        }
+    } else {
+        let mut remove = false;
+        ui.collapsing("Inner Shadow", |ui| {
+            let effect = effects.inner_shadow.as_mut().unwrap();
+            changed |= widgets::checkbox(ui, &mut effect.enabled, "Enabled").changed();
+            changed |= ui
+                .add(
+                    widgets::Slider::new(&mut effect.angle, -360.0..=360.0)
+                        .text("Angle")
+                        .suffix("°"),
+                )
+                .changed();
+            changed |= ui
+                .add(
+                    widgets::Slider::new(&mut effect.distance, 0.0..=5000.0)
+                        .text("Distance")
+                        .suffix(" px"),
+                )
+                .changed();
+            changed |= ui
+                .add(
+                    widgets::Slider::new(&mut effect.blur, 0.0..=500.0)
+                        .text("Blur")
+                        .suffix(" px"),
+                )
+                .changed();
+            changed |= effect_color(ui, &mut effect.color);
+            changed |= ui
+                .add(
+                    widgets::Slider::new(&mut effect.opacity, 0.0..=1.0)
+                        .percentage()
+                        .text("Opacity"),
+                )
+                .changed();
+            remove = widgets::button(ui, "Remove").clicked();
+        });
+        if remove {
+            effects.inner_shadow = None;
+            changed = true;
+        }
+    }
+
+    if effects.outer_glow.is_none() {
+        if widgets::button(ui, "Add Outer Glow").clicked() {
+            effects.outer_glow = Some(Default::default());
+            changed = true;
+        }
+    } else {
+        let mut remove = false;
+        ui.collapsing("Outer Glow", |ui| {
+            let effect = effects.outer_glow.as_mut().unwrap();
+            changed |= widgets::checkbox(ui, &mut effect.enabled, "Enabled").changed();
+            changed |= ui
+                .add(
+                    widgets::Slider::new(&mut effect.size, 0.0..=500.0)
+                        .text("Size")
+                        .suffix(" px"),
+                )
+                .changed();
+            changed |= effect_color(ui, &mut effect.color);
+            changed |= ui
+                .add(
+                    widgets::Slider::new(&mut effect.opacity, 0.0..=1.0)
+                        .percentage()
+                        .text("Opacity"),
+                )
+                .changed();
+            remove = widgets::button(ui, "Remove").clicked();
+        });
+        if remove {
+            effects.outer_glow = None;
+            changed = true;
+        }
+    }
+
+    if effects.inner_glow.is_none() {
+        if widgets::button(ui, "Add Inner Glow").clicked() {
+            effects.inner_glow = Some(Default::default());
+            changed = true;
+        }
+    } else {
+        let mut remove = false;
+        ui.collapsing("Inner Glow", |ui| {
+            let effect = effects.inner_glow.as_mut().unwrap();
+            changed |= widgets::checkbox(ui, &mut effect.enabled, "Enabled").changed();
+            changed |= ui
+                .add(
+                    widgets::Slider::new(&mut effect.size, 0.0..=500.0)
+                        .text("Size")
+                        .suffix(" px"),
+                )
+                .changed();
+            changed |= effect_color(ui, &mut effect.color);
+            changed |= ui
+                .add(
+                    widgets::Slider::new(&mut effect.opacity, 0.0..=1.0)
+                        .percentage()
+                        .text("Opacity"),
+                )
+                .changed();
+            remove = widgets::button(ui, "Remove").clicked();
+        });
+        if remove {
+            effects.inner_glow = None;
+            changed = true;
+        }
+    }
+    changed
 }
 
 fn channel_picker(ui: &mut egui::Ui, channel: &mut usize) {

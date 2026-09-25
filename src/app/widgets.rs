@@ -3,8 +3,8 @@
 use std::ops::RangeInclusive;
 
 use egui::{
-    Color32, CornerRadius, FontId, Rect, Response, Sense, Stroke, StrokeKind, Ui, Widget, pos2,
-    vec2,
+    Color32, CornerRadius, FontId, Rect, Response, RichText, Sense, Stroke, StrokeKind, Ui, Widget,
+    pos2, vec2,
 };
 
 use super::theme;
@@ -146,6 +146,23 @@ pub fn button(ui: &mut Ui, label: impl Into<String>) -> Response {
 }
 pub fn primary_button(ui: &mut Ui, label: impl Into<String>) -> Response {
     ui.add(Button::new(label).primary())
+}
+
+pub fn scrub_label(
+    ui: &mut Ui,
+    label: &str,
+    value: &mut f32,
+    range: RangeInclusive<f32>,
+    step: f32,
+) -> bool {
+    let mut response =
+        ui.add(egui::Label::new(RichText::new(label).color(theme::MUTED)).sense(Sense::drag()));
+    if response.dragged() {
+        let delta = response.drag_delta().x - response.drag_delta().y;
+        *value = (*value + delta * step).clamp(*range.start(), *range.end());
+        response.mark_changed();
+    }
+    response.changed()
 }
 
 /// Consume vertical wheel motion over a control, leaving horizontal scrolling to its parent.

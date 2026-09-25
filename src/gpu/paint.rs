@@ -99,27 +99,30 @@ pub(crate) fn adjust_mask(
     })
 }
 
-pub(crate) fn shape(
-    size: [u32; 2],
-    kind: crate::paint::ShapeKind,
-    color: [u8; 4],
-    radius: f32,
-) -> Option<RgbaImage> {
+pub(crate) fn shape(size: [u32; 2], style: &crate::document::ShapeStyle) -> Option<RgbaImage> {
     use crate::paint::ShapeKind;
-    // Solid rectangles are a memory fill; curved boundaries benefit from compute.
-    if kind == ShapeKind::Rectangle {
+    if style.kind == ShapeKind::Rectangle {
         return None;
     }
+    let (line_start, line_end, line_width) = if style.kind == ShapeKind::Line {
+        crate::paint::line_geometry(size, style).ok()?
+    } else {
+        (Point::default(), Point::default(), 1.0)
+    };
     attempt(u64::from(size[0]) * u64::from(size[1]), 65_536, |gpu| {
+        let mode = match style.kind {
+            ShapeKind::Ellipse => 1.0,
+            ShapeKind::RoundedRectangle => 2.0,
+            ShapeKind::Line => 3.0,
+            ShapeKind::Rectangle => 0.0,
+        };
+        let radius = style.corner_radius.min(size[0].min(size[1]) as f32 * 0.5);
         let config = [
             [size[0] as f32, size[1] as f32, 0.0, 0.0],
-            [
-                if kind == ShapeKind::Ellipse { 1.0 } else { 2.0 },
-                radius,
-                0.0,
-                0.0,
-            ],
-            color.map(|v| v as f32 / 255.0),
+            [mode, radius, 0.0, 0.0],
+            style.color.map(|value| value as f32 / 255.0),
+            [line_start.x, line_start.y, line_end.x, line_end.y],
+            [line_width, 0.0, 0.0, 0.0],
         ];
         let bytes = gpu.simple("shape_pixels", SHADER, &[], &[], &config, size)?;
         Ok(RgbaImage::from_raw(size[0], size[1], bytes).unwrap())

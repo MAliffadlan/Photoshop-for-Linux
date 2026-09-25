@@ -4,7 +4,7 @@ use std::sync::{Arc, Weak};
 use egui::{Color32, RichText, Sense, Stroke, StrokeKind, TextureOptions, vec2};
 use mectov::{
     blend::BlendMode,
-    document::{Adjustment, Document, Layer},
+    document::{Adjustment, Document, Layer, LayerEffects},
 };
 use uuid::Uuid;
 
@@ -14,6 +14,7 @@ pub(super) struct LayerThumbnail {
     texture: egui::TextureHandle,
     canvas: [u32; 2],
     transform: mectov::document::Transform,
+    effects: Option<LayerEffects>,
     // Weak references identify assets without copying a large image on every brush dab.
     pixels: Option<Weak<image::RgbaImage>>,
     mask: Option<Weak<image::GrayImage>>,
@@ -31,6 +32,7 @@ impl LayerThumbnail {
         } else {
             self.canvas == [document.width, document.height]
                 && self.transform == layer.transform
+                && self.effects == layer.effects
                 && self.pixels.as_ref().map(Weak::as_ptr) == layer.pixels.as_ref().map(Arc::as_ptr)
         }
     }
@@ -48,6 +50,7 @@ struct Actions {
     appearance: Option<(BlendMode, f32, bool)>,
     rename: Option<(Uuid, String)>,
     edit_adjustment: Option<Uuid>,
+    edit_effects: Option<Uuid>,
     edit_text: Option<Uuid>,
     edit_raw: Option<Uuid>,
 }
@@ -203,6 +206,9 @@ impl EditorApp {
                     if changed {
                         actions.appearance = Some((blend, opacity, locked));
                     }
+                    if widgets::button(ui, "Layer Effects…").clicked() {
+                        actions.edit_effects = active.map(|layer| layer.id);
+                    }
                 });
             });
     }
@@ -343,6 +349,14 @@ impl EditorApp {
             }
             if layer.adjustment.is_some() && ui.button("Edit adjustment…").clicked() {
                 actions.edit_adjustment = Some(layer.id);
+                ui.close();
+            }
+            if layer.pixels.is_some()
+                && ui
+                    .add_enabled(!layer.locked, egui::Button::new("Layer Effects…"))
+                    .clicked()
+            {
+                actions.edit_effects = Some(layer.id);
                 ui.close();
             }
             if ui.button("Rename…").clicked() {
@@ -486,6 +500,7 @@ impl EditorApp {
                 texture,
                 canvas: [document.width, document.height],
                 transform: layer.transform,
+                effects: layer.effects,
                 pixels: layer.pixels.as_ref().map(Arc::downgrade),
                 mask: layer.mask.as_ref().map(|mask| Arc::downgrade(&mask.pixels)),
             }
@@ -636,6 +651,9 @@ impl EditorApp {
         }
         if let Some(id) = actions.edit_adjustment {
             self.edit_adjustment_layer(id);
+        }
+        if let Some(id) = actions.edit_effects {
+            self.edit_layer_effects(id);
         }
         if let Some(id) = actions.edit_text {
             self.start_text(Some(id), mectov::document::Point::default());

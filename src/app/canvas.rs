@@ -23,6 +23,59 @@ const HANDLES: [Point; 8] = [
     Point::new(0.0, 0.5),
 ];
 
+const MAX_SMOOTHING_HISTORY: usize = 8;
+
+fn constrain_shape_point(start: Point, point: Point, kind: mectov::paint::ShapeKind) -> Point {
+    if kind == mectov::paint::ShapeKind::Line {
+        let dx = point.x - start.x;
+        let dy = point.y - start.y;
+        let length = dx.hypot(dy);
+        if length <= f32::EPSILON {
+            return point;
+        }
+        let angle =
+            (dy.atan2(dx) / (std::f32::consts::PI / 4.0)).round() * (std::f32::consts::PI / 4.0);
+        return Point::new(
+            start.x + angle.cos() * length,
+            start.y + angle.sin() * length,
+        );
+    }
+    let dx = point.x - start.x;
+    let dy = point.y - start.y;
+    let size = dx.abs().max(dy.abs());
+    Point::new(start.x + size * dx.signum(), start.y + size * dy.signum())
+}
+
+fn constrain_crop_point(start: Point, point: Point, ratio: f32) -> Point {
+    if !ratio.is_finite() || ratio <= 0.0 {
+        return point;
+    }
+    let dx = point.x - start.x;
+    let dy = point.y - start.y;
+    if dx == 0.0 && dy == 0.0 {
+        return point;
+    }
+    let sign_x = if dx < 0.0 { -1.0 } else { 1.0 };
+    let sign_y = if dy < 0.0 { -1.0 } else { 1.0 };
+    let (width, height) = if dx.abs() >= dy.abs() {
+        (dx.abs(), dx.abs() / ratio)
+    } else {
+        (dy.abs() * ratio, dy.abs())
+    };
+    Point::new(start.x + sign_x * width, start.y + sign_y * height)
+}
+
+fn record_smoothing_point(points: &mut Vec<Point>, point: Point) {
+    if points.last().copied() == Some(point) {
+        return;
+    }
+    if points.len() >= MAX_SMOOTHING_HISTORY {
+        let excess = points.len() - MAX_SMOOTHING_HISTORY + 1;
+        points.drain(..excess);
+    }
+    points.push(point);
+}
+
 fn drag_transform(
     old: mectov::document::Transform,
     start: Point,
@@ -365,7 +418,16 @@ impl EditorApp {
                     if matches!(self.tool, Tool::Marquee | Tool::Shape)
                         && !matches!(gesture.kind, TransformDrag::Selection)
                     {
-                        if (self.tool == Tool::Marquee && self.ellipse)
+                        if self.tool == Tool::Shape
+                            && self.shape_kind == mectov::paint::ShapeKind::Line
+                        {
+                            painter.add(egui::Shape::line(
+                                vec![map(gesture.start), map(gesture.last)],
+                                Stroke::new((self.line_width * zoom).max(1.0), Color32::WHITE),
+                            ));
+                            painter.circle_filled(map(gesture.start), 3.0, Color32::WHITE);
+                            painter.circle_filled(map(gesture.last), 3.0, Color32::WHITE);
+                        } else if (self.tool == Tool::Marquee && self.ellipse)
                             || (self.tool == Tool::Shape
                                 && self.shape_kind == mectov::paint::ShapeKind::Ellipse)
                         {
@@ -719,7 +781,7 @@ impl EditorApp {
 
     fn begin_gesture(
         &mut self,
-        point: Point,
+        mut point: Point,
         screen: Pos2,
         panning: bool,
         mut handle: Option<TransformDrag>,
@@ -757,6 +819,14 @@ impl EditorApp {
         if self.tool == Tool::Clone && self.clone_source.is_none() {
             self.status = "Alt-click on the canvas to set a clone source".into();
             return;
+        }
+        if self.tool == Tool::Crop
+            && let Some(selection) = self
+                .session()
+                .and_then(|session| session.document.selection.as_ref())
+            && let Some((left, top, _, _)) = selection::bounds(selection)
+        {
+            point = Point::new(left as f32, top as f32);
         }
         if self.tool == Tool::Move && self.show_controls {
             // The press location determines the handle, even if the pointer has moved since.
@@ -863,7 +933,11 @@ impl EditorApp {
             last: point,
             screen_start: screen,
             pan_start: session.pan,
-            points: vec![point],
+            points: if matches!(self.tool, Tool::Brush | Tool::Erase) {
+                Vec::new()
+            } else {
+                vec![point]
+            },
             original: session.document.clone(),
             kind,
             panning: false,
@@ -882,7 +956,7 @@ impl EditorApp {
             self.gesture = Some(gesture);
             return;
         }
-        if modifiers.shift && matches!(self.tool, Tool::Shape | Tool::Marquee | Tool::Crop) {
+        if modifiers.shift && matches!(self.tool, Tool::Marquee | Tool::Crop) {
             let dx = point.x - gesture.start.x;
             let dy = point.y - gesture.start.y;
             let size = dx.abs().max(dy.abs());
@@ -890,6 +964,14 @@ impl EditorApp {
                 gesture.start.x + size * dx.signum(),
                 gesture.start.y + size * dy.signum(),
             );
+        }
+        if modifiers.shift && self.tool == Tool::Shape {
+            point = constrain_shape_point(gesture.start, point, self.shape_kind);
+        }
+        if self.tool == Tool::Crop
+            && let Some(ratio) = self.crop_ratio
+        {
+            point = constrain_crop_point(gesture.start, point, ratio);
         }
         let session = &mut self.sessions[self.current];
         let result = if matches!(gesture.kind, TransformDrag::Selection) && self.tool.is_selection()
@@ -909,7 +991,7 @@ impl EditorApp {
                     Ok(())
                 }
                 tool if tool.is_brush() => {
-                    let mode = match self.tool {
+                    let mode = match tool {
                         Tool::Erase => PaintMode::Erase,
                         Tool::Clone => PaintMode::Clone,
                         Tool::Heal => PaintMode::Heal,
@@ -921,18 +1003,61 @@ impl EditorApp {
                     } else {
                         gesture.clone_offset
                     };
-                    paint::stroke(
-                        &mut session.document,
-                        gesture.last,
-                        point,
-                        &self.brush,
-                        paint::StrokeOptions {
-                            mode,
-                            mask_target: self.mask_target,
-                            source: gesture.source.as_deref(),
-                            clone_offset: offset,
-                        },
-                    )
+                    let smoothing =
+                        matches!(tool, Tool::Brush | Tool::Erase) && self.brush.smoothing > 0.0;
+                    if smoothing {
+                        (|| -> anyhow::Result<()> {
+                            if gesture.points.is_empty() && gesture.last == gesture.start {
+                                paint::stroke(
+                                    &mut session.document,
+                                    gesture.start,
+                                    gesture.start,
+                                    &self.brush,
+                                    paint::StrokeOptions {
+                                        mode,
+                                        mask_target: self.mask_target,
+                                        source: gesture.source.as_deref(),
+                                        clone_offset: offset,
+                                    },
+                                )?;
+                            }
+                            record_smoothing_point(&mut gesture.points, point);
+                            if let Some(painted) = paint::smooth_stroke_point(
+                                gesture.last,
+                                point,
+                                self.brush.smoothing,
+                                session.zoom,
+                            ) {
+                                paint::stroke(
+                                    &mut session.document,
+                                    gesture.last,
+                                    painted,
+                                    &self.brush,
+                                    paint::StrokeOptions {
+                                        mode,
+                                        mask_target: self.mask_target,
+                                        source: gesture.source.as_deref(),
+                                        clone_offset: offset,
+                                    },
+                                )?;
+                                gesture.last = painted;
+                            }
+                            Ok(())
+                        })()
+                    } else {
+                        paint::stroke(
+                            &mut session.document,
+                            gesture.last,
+                            point,
+                            &self.brush,
+                            paint::StrokeOptions {
+                                mode,
+                                mask_target: self.mask_target,
+                                source: gesture.source.as_deref(),
+                                clone_offset: offset,
+                            },
+                        )
+                    }
                 }
                 _ if self.tool == Tool::Move || matches!(gesture.kind, TransformDrag::Pixels) => {
                     let mut dx = point.x - gesture.start.x;
@@ -1101,7 +1226,37 @@ impl EditorApp {
         let mode = self.selection_mode(modifiers);
         let session = &mut self.sessions[self.current];
         let start = gesture.start;
-        let end = gesture.last;
+        let end = if matches!(self.tool, Tool::Brush | Tool::Erase) && self.brush.smoothing > 0.0 {
+            let pointer = gesture.points.last().copied().unwrap_or(gesture.last);
+            if pointer != gesture.last {
+                let mode = if self.tool == Tool::Erase {
+                    PaintMode::Erase
+                } else {
+                    PaintMode::Paint
+                };
+                if let Err(error) = paint::stroke(
+                    &mut session.document,
+                    gesture.last,
+                    pointer,
+                    &self.brush,
+                    paint::StrokeOptions {
+                        mode,
+                        mask_target: self.mask_target,
+                        source: None,
+                        clone_offset: Point::default(),
+                    },
+                ) {
+                    session.history.cancel(&mut session.document);
+                    self.error = Some(error.to_string());
+                    session.invalidate();
+                    self.guides.clear();
+                    return;
+                }
+            }
+            pointer
+        } else {
+            gesture.last
+        };
         let changes_composition = gesture.changes_composition(self.tool);
         let result = if matches!(
             gesture.kind,
@@ -1161,6 +1316,7 @@ impl EditorApp {
                         self.shape_kind,
                         self.brush.color,
                         self.corner_radius,
+                        self.line_width,
                     )
                     .map(|layer| session.document.insert(layer))
                 }
@@ -1193,5 +1349,35 @@ impl EditorApp {
         if self.tool.is_brush() {
             self.last_brush = Some(end);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crop_ratio_constrains_both_drag_directions() {
+        let start = Point::new(10.0, 20.0);
+        let horizontal = constrain_crop_point(start, Point::new(30.0, 25.0), 16.0 / 9.0);
+        assert!((horizontal.x - 30.0).abs() < 0.0001);
+        assert!((horizontal.y - 31.25).abs() < 0.0001);
+        let vertical = constrain_crop_point(start, Point::new(15.0, 50.0), 3.0 / 4.0);
+        assert!((vertical.x - 32.5).abs() < 0.0001);
+        assert!((vertical.y - 50.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn smoothing_history_is_bounded_and_ignores_duplicate_samples() {
+        let mut points = Vec::new();
+        for x in 0..(MAX_SMOOTHING_HISTORY + 10) {
+            record_smoothing_point(&mut points, Point::new(x as f32, 0.0));
+        }
+        record_smoothing_point(
+            &mut points,
+            Point::new((MAX_SMOOTHING_HISTORY + 9) as f32, 0.0),
+        );
+        assert_eq!(points.len(), MAX_SMOOTHING_HISTORY);
+        assert_eq!(points.first(), Some(&Point::new(10.0, 0.0)));
     }
 }

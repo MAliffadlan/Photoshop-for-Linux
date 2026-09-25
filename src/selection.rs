@@ -181,6 +181,99 @@ pub fn translate(mask: &GrayImage, dx: i32, dy: i32) -> GrayImage {
     translated
 }
 
+fn relax_distance(distance: &mut [u32], index: usize, neighbor: usize) {
+    distance[index] = distance[index].min(distance[neighbor].saturating_add(1));
+}
+
+fn distance_transform(mask: &GrayImage, selected: bool) -> Vec<u32> {
+    let width = mask.width() as usize;
+    let height = mask.height() as usize;
+    let mut distance = vec![u32::MAX; mask.as_raw().len()];
+    for (index, &value) in mask.as_raw().iter().enumerate() {
+        if (value > 0) == selected {
+            distance[index] = 0;
+        }
+    }
+    if !selected && width > 0 && height > 0 {
+        for x in 0..width {
+            for y in [0, height - 1] {
+                let index = y * width + x;
+                if distance[index] != 0 {
+                    distance[index] = 1;
+                }
+            }
+        }
+        for y in 0..height {
+            for x in [0, width - 1] {
+                let index = y * width + x;
+                if distance[index] != 0 {
+                    distance[index] = 1;
+                }
+            }
+        }
+    }
+    for y in 0..height {
+        for x in 0..width {
+            let index = y * width + x;
+            if x > 0 {
+                relax_distance(&mut distance, index, index - 1);
+            }
+            if y > 0 {
+                relax_distance(&mut distance, index, index - width);
+                if x > 0 {
+                    relax_distance(&mut distance, index, index - width - 1);
+                }
+                if x + 1 < width {
+                    relax_distance(&mut distance, index, index - width + 1);
+                }
+            }
+        }
+    }
+    for y in (0..height).rev() {
+        for x in (0..width).rev() {
+            let index = y * width + x;
+            if x + 1 < width {
+                relax_distance(&mut distance, index, index + 1);
+            }
+            if y + 1 < height {
+                relax_distance(&mut distance, index, index + width);
+                if x > 0 {
+                    relax_distance(&mut distance, index, index + width - 1);
+                }
+                if x + 1 < width {
+                    relax_distance(&mut distance, index, index + width + 1);
+                }
+            }
+        }
+    }
+    distance
+}
+
+pub fn expand_contract(mask: &GrayImage, amount: i32) -> GrayImage {
+    let (width, height) = mask.dimensions();
+    if amount == 0 || width == 0 || height == 0 {
+        return mask.clone();
+    }
+    let radius = amount.unsigned_abs().min(width.max(height));
+    let expand = amount > 0;
+    let distance = distance_transform(mask, expand);
+    let mut output = GrayImage::new(width, height);
+    if expand {
+        for (pixel, &value) in output.as_mut().iter_mut().zip(&distance) {
+            if value <= radius {
+                *pixel = 255;
+            }
+        }
+    } else {
+        for (pixel, &value) in output.as_mut().iter_mut().zip(&distance) {
+            if value > radius {
+                *pixel = 255;
+            }
+        }
+    }
+    output
+}
+
 pub fn bounds(mask: &GrayImage) -> Option<(u32, u32, u32, u32)> {
     let mut min_x = mask.width();
     let mut min_y = mask.height();
@@ -291,6 +384,51 @@ mod tests {
             });
             assert_eq!(translate(&mask, dx, dy), expected);
         }
+    }
+
+    #[test]
+    fn expand_contract_uses_square_morphology() {
+        let center =
+            GrayImage::from_fn(5, 5, |x, y| Luma([if x == 2 && y == 2 { 255 } else { 0 }]));
+        let expected = GrayImage::from_fn(5, 5, |x, y| {
+            Luma([if (1..=3).contains(&x) && (1..=3).contains(&y) {
+                255
+            } else {
+                0
+            }])
+        });
+        assert_eq!(expand_contract(&center, 1), expected);
+
+        let block = GrayImage::from_fn(5, 5, |x, y| {
+            Luma([if (1..=3).contains(&x) && (1..=3).contains(&y) {
+                255
+            } else {
+                0
+            }])
+        });
+        let expected =
+            GrayImage::from_fn(5, 5, |x, y| Luma([if x == 2 && y == 2 { 255 } else { 0 }]));
+        assert_eq!(expand_contract(&block, -1), expected);
+    }
+
+    #[test]
+    fn expand_contract_handles_noop_clipping_and_large_radius() {
+        let mask = GrayImage::from_fn(4, 4, |_, _| Luma([17]));
+        assert_eq!(expand_contract(&mask, 0), mask);
+
+        let corner = GrayImage::from_fn(4, 4, |x, y| Luma([if x == 0 && y == 0 { 64 } else { 0 }]));
+        assert!(
+            expand_contract(&corner, i32::MAX)
+                .as_raw()
+                .iter()
+                .all(|&value| value == 255)
+        );
+        assert!(
+            expand_contract(&mask, i32::MIN)
+                .as_raw()
+                .iter()
+                .all(|&value| value == 0)
+        );
     }
 
     #[test]

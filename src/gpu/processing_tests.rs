@@ -93,6 +93,32 @@ fn processing_filters_and_resampling_match_cpu() {
         });
         compare(&actual, &crate::effects::filtered(&source, &filter), 1);
     }
+    for filter in [
+        crate::effects::Filter::Vignette {
+            amount: 73.0,
+            color: [0.8, 0.2, 0.1],
+            midpoint: 42.0,
+            roundness: 35.0,
+            feather: 48.0,
+            highlights: 31.0,
+        },
+        crate::effects::Filter::BloomGlow {
+            amount: 68.0,
+            radius: 7.0,
+        },
+        crate::effects::Filter::TonalContrast {
+            amount: 64.0,
+            radius: 5.0,
+            shadows: -20.0,
+            midtones: 80.0,
+            highlights: 15.0,
+        },
+    ] {
+        let actual = scope(Some(gpu.clone()), || {
+            super::filter(&source, &filter).unwrap()
+        });
+        compare(&actual, &crate::effects::filtered(&source, &filter), 3);
+    }
 }
 
 #[test]
@@ -416,7 +442,11 @@ fn processing_paint_masks_shapes_and_selection_match_cpu() {
             }
         }
     }
-    for kind in [ShapeKind::Ellipse, ShapeKind::RoundedRectangle] {
+    for (kind, line_width) in [
+        (ShapeKind::Ellipse, 0.0),
+        (ShapeKind::RoundedRectangle, 0.0),
+        (ShapeKind::Line, 7.5),
+    ] {
         let make = || {
             paint::shape(
                 Point::default(),
@@ -424,6 +454,7 @@ fn processing_paint_masks_shapes_and_selection_match_cpu() {
                 kind,
                 [23, 67, 183, 211],
                 17.5,
+                line_width,
             )
             .unwrap()
         };
@@ -491,6 +522,7 @@ fn processing_brushes_coverage_and_analysis_match_cpu() {
         hardness: 0.6,
         opacity: 0.7,
         color: [137, 59, 213, 191],
+        ..Brush::default()
     };
     for mask in [false, true] {
         for mode in [

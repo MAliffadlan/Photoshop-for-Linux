@@ -72,6 +72,14 @@ fn shape_pixels(@builtin(global_invocation_id) id: vec3<u32>) {
             } else if (config[1].x == 2.0) {
                 let center = clamp(p, vec2(config[1].y), config[0].xy - config[1].y);
                 inside = length(p - center) <= config[1].y;
+            } else if (config[1].x == 3.0) {
+                let delta = config[3].zw - config[3].xy;
+                let length_sq = dot(delta, delta);
+                var t = 0.0;
+                if (length_sq >= 0.0001) {
+                    t = clamp(dot(p - config[3].xy, delta) / length_sq, 0.0, 1.0);
+                }
+                inside = length(p - config[3].xy - t * delta) <= config[4].x * 0.5;
             }
             if (inside) {
                 coverage += 0.25;

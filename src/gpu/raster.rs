@@ -33,6 +33,92 @@ pub fn filter(image: &RgbaImage, filter: &crate::effects::Filter) -> Option<Rgba
                 ],
                 size,
             )?,
+            Filter::Vignette {
+                amount,
+                color,
+                midpoint,
+                roundness,
+                feather,
+                highlights,
+            } => gpu.simple(
+                "vignette",
+                RASTER,
+                image.as_raw(),
+                &[],
+                &[
+                    [size[0] as f32, size[1] as f32, 0.0, 0.0],
+                    [*amount, *midpoint, *roundness, *feather],
+                    [*highlights, color[0], color[1], color[2]],
+                    [size[0] as f32, size[1] as f32, 0.0, 0.0],
+                ],
+                size,
+            )?,
+            Filter::BloomGlow { amount, radius } => {
+                let highlights = RgbaImage::from_raw(
+                    size[0],
+                    size[1],
+                    gpu.simple(
+                        "bloom_source",
+                        RASTER,
+                        image.as_raw(),
+                        &[],
+                        &[
+                            [size[0] as f32, size[1] as f32, 0.0, 0.0],
+                            [0.5, 0.0, 0.0, 0.0],
+                            [0.0; 4],
+                            [0.0; 4],
+                        ],
+                        size,
+                    )?,
+                )
+                .unwrap();
+                let blurred = RgbaImage::from_raw(
+                    size[0],
+                    size[1],
+                    gpu.separable(highlights.as_raw(), size, size, 0, Some(radius.max(0.01)))?,
+                )
+                .unwrap();
+                gpu.simple(
+                    "bloom_final",
+                    RASTER,
+                    image.as_raw(),
+                    blurred.as_raw(),
+                    &[
+                        [size[0] as f32, size[1] as f32, 0.0, 0.0],
+                        [amount / 50.0, 0.0, 0.0, 0.0],
+                        [0.0; 4],
+                        [0.0; 4],
+                    ],
+                    size,
+                )?
+            }
+            Filter::TonalContrast {
+                amount,
+                radius,
+                shadows,
+                midtones,
+                highlights,
+            } => {
+                let blurred = RgbaImage::from_raw(
+                    size[0],
+                    size[1],
+                    gpu.separable(image.as_raw(), size, size, 0, Some(radius.max(0.01)))?,
+                )
+                .unwrap();
+                gpu.simple(
+                    "tonal_contrast",
+                    RASTER,
+                    image.as_raw(),
+                    blurred.as_raw(),
+                    &[
+                        [size[0] as f32, size[1] as f32, 0.0, 0.0],
+                        [*amount, *shadows, *midtones, *highlights],
+                        [0.0; 4],
+                        [0.0; 4],
+                    ],
+                    size,
+                )?
+            }
             Filter::Noise { amount, monochrome } => {
                 return gpu.adjustment(
                     image,

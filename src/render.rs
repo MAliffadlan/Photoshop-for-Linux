@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use image::{GrayImage, Rgba, RgbaImage};
 use rayon::prelude::*;
 
@@ -182,11 +184,52 @@ pub fn render(document: &Document) -> RgbaImage {
     render_scaled(document, document.width, document.height)
 }
 
+pub fn bake_layer_effects(document: &Document) -> Cow<'_, Document> {
+    if !document.layers.iter().any(|layer| {
+        layer.pixels.is_some()
+            && layer
+                .effects
+                .as_ref()
+                .is_some_and(|effects| effects.renders())
+    }) {
+        return Cow::Borrowed(document);
+    }
+    let mut baked = document.clone();
+    for layer in &mut baked.layers {
+        let Some(effects) = layer.effects.take() else {
+            continue;
+        };
+        if !effects.renders() {
+            layer.effects = Some(effects);
+            continue;
+        }
+        let pixels = layer.pixels.clone();
+        let Some(pixels) = pixels.as_ref() else {
+            layer.effects = Some(effects);
+            continue;
+        };
+        if let Some((image, transform)) = crate::effects::bake_layer_effects(
+            pixels,
+            layer.transform,
+            layer.mask.as_ref(),
+            effects,
+        ) {
+            layer.pixels = Some(std::sync::Arc::new(image));
+            layer.transform = transform;
+            layer.mask = None;
+        } else {
+            layer.effects = Some(effects);
+        }
+    }
+    Cow::Owned(baked)
+}
+
 pub fn render_scaled(document: &Document, width: u32, height: u32) -> RgbaImage {
     if let Some(result) = crate::gpu::compose(document, width, height) {
         return result;
     }
-    let mut filtered = document.clone();
+    let baked = bake_layer_effects(document);
+    let mut filtered = baked.into_owned();
     for layer in &mut filtered.layers {
         if let Some(pixels) = &layer.pixels {
             let [w, h] = source_size(document, layer, [width, height]);
@@ -201,8 +244,9 @@ pub fn render_scaled(document: &Document, width: u32, height: u32) -> RgbaImage 
 /// Small UI thumbnails must not resize every full-resolution source on each edit.
 /// Supersample the thumbnail itself; exports still use the filtered renderer above.
 pub fn render_thumbnail(document: &Document, width: u32, height: u32) -> RgbaImage {
+    let baked = bake_layer_effects(document);
     resize_quality(
-        &render_pixels(document, width * 2, height * 2),
+        &render_pixels(baked.as_ref(), width * 2, height * 2),
         width,
         height,
     )
@@ -348,6 +392,8 @@ fn render_pixels(document: &Document, width: u32, height: u32) -> RgbaImage {
 }
 
 pub fn pixel_at(document: &Document, point: Point) -> [f32; 4] {
+    let baked = bake_layer_effects(document);
+    let document = baked.as_ref();
     let half = blur_margin(document).ceil();
     if half <= 0.0 {
         let layers = paint_order(document);
@@ -426,8 +472,42 @@ pub fn flatten_white(image: &RgbaImage) -> image::RgbImage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::document::{Adjustment, Mask};
+    use crate::document::{Adjustment, ColorOverlayEffect, Mask, ShadowEffect, StrokeEffect};
     use std::sync::Arc;
+
+    #[test]
+    fn layer_effects_render_outside_source_and_survive_thumbnail() {
+        let mut document = Document::new(32, 32).unwrap();
+        let mut layer = Layer::image(
+            "Effect",
+            RgbaImage::from_pixel(4, 4, Rgba([255, 0, 0, 255])),
+        );
+        layer.transform.x = 14.0;
+        layer.transform.y = 14.0;
+        layer.effects = Some(crate::document::LayerEffects {
+            stroke: Some(StrokeEffect {
+                size: 2.0,
+                ..StrokeEffect::default()
+            }),
+            shadow: Some(ShadowEffect {
+                distance: 3.0,
+                blur: 1.0,
+                ..ShadowEffect::default()
+            }),
+            color_overlay: Some(ColorOverlayEffect {
+                color: [0.0, 0.0, 1.0],
+                ..ColorOverlayEffect::default()
+            }),
+            ..Default::default()
+        });
+        document.layers = vec![layer];
+        let rendered = render(&document);
+        assert_eq!(rendered.get_pixel(15, 15).0, [0, 0, 255, 255]);
+        assert!(rendered.get_pixel(13, 15)[3] > 0);
+        assert!(pixel_at(&document, Point::new(13.5, 15.5))[3] > 0.0);
+        let thumbnail = render_thumbnail(&document, 32, 32);
+        assert!(thumbnail.get_pixel(13, 15)[3] > 0);
+    }
 
     #[test]
     fn bounds_hit_testing_follows_rotation_flips_and_perspective() {

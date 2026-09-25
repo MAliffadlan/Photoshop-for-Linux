@@ -24,6 +24,7 @@ pub struct Brush {
     pub diameter: f32,
     pub hardness: f32,
     pub opacity: f32,
+    pub smoothing: f32,
     pub color: [u8; 4],
 }
 
@@ -33,9 +34,47 @@ impl Default for Brush {
             diameter: 40.0,
             hardness: 0.8,
             opacity: 1.0,
+            smoothing: 0.0,
             color: [0, 0, 0, 255],
         }
     }
+}
+
+pub fn smooth_stroke_point(
+    anchor: Point,
+    pointer: Point,
+    smoothing: f32,
+    zoom: f32,
+) -> Option<Point> {
+    let smoothing = if smoothing.is_finite() {
+        smoothing.clamp(0.0, 100.0)
+    } else {
+        0.0
+    };
+    if smoothing == 0.0 {
+        return Some(pointer);
+    }
+    if !anchor.x.is_finite()
+        || !anchor.y.is_finite()
+        || !pointer.x.is_finite()
+        || !pointer.y.is_finite()
+    {
+        return Some(pointer);
+    }
+    let zoom = if zoom.is_finite() {
+        zoom.max(0.01)
+    } else {
+        0.01
+    };
+    let radius = smoothing / zoom;
+    let dx = pointer.x - anchor.x;
+    let dy = pointer.y - anchor.y;
+    let distance = dx.hypot(dy);
+    if distance <= radius {
+        return None;
+    }
+    let scale = (distance - radius) / distance;
+    Some(Point::new(anchor.x + dx * scale, anchor.y + dy * scale))
 }
 
 pub fn ensure_pixels(layer: &mut Layer) -> Result<()> {
@@ -478,39 +517,84 @@ pub fn gradient(
 pub enum ShapeKind {
     Rectangle,
     Ellipse,
+    Line,
     RoundedRectangle,
 }
 
-pub fn shape(
-    start: Point,
-    end: Point,
-    kind: ShapeKind,
-    color: [u8; 4],
-    corner_radius: f32,
-) -> Result<Layer> {
-    let width = (end.x - start.x).abs().round().max(1.0) as u32;
-    let height = (end.y - start.y).abs().round().max(1.0) as u32;
-    validate_size(width, height)?;
-    let radius = corner_radius.min(width.min(height) as f32 * 0.5);
-    let image = crate::gpu::shape([width, height], kind, color, radius).unwrap_or_else(|| {
-        RgbaImage::from_fn(width, height, |x, y| {
-            // Four subpixel samples produce antialiased shape edges.
+pub(crate) fn line_geometry(
+    size: [u32; 2],
+    style: &crate::document::ShapeStyle,
+) -> Result<(Point, Point, f32)> {
+    ensure!(
+        style.line_width.is_none_or(|width| {
+            width.is_finite() && (0.0..=crate::document::MAX_SHAPE_SIZE).contains(&width)
+        }),
+        "Invalid line width"
+    );
+    let line_width = style.line_width.unwrap_or(1.0).max(1.0);
+    let inset_x = line_width.min(size[0] as f32) * 0.5;
+    let inset_y = line_width.min(size[1] as f32) * 0.5;
+    let start = style.start.map_or(Point::new(inset_x, inset_y), |point| {
+        Point::new(point.x * size[0] as f32, point.y * size[1] as f32)
+    });
+    let end = style.end.map_or(
+        Point::new(size[0] as f32 - inset_x, size[1] as f32 - inset_y),
+        |point| Point::new(point.x * size[0] as f32, point.y * size[1] as f32),
+    );
+    let valid = |point: Point| {
+        point.x.is_finite()
+            && point.y.is_finite()
+            && (0.0..=size[0] as f32).contains(&point.x)
+            && (0.0..=size[1] as f32).contains(&point.y)
+    };
+    ensure!(valid(start) && valid(end), "Invalid line endpoints");
+    Ok((start, end, line_width))
+}
+
+fn rasterize_shape(size: [u32; 2], style: &crate::document::ShapeStyle) -> Result<RgbaImage> {
+    validate_size(size[0], size[1])?;
+    ensure!(
+        style.corner_radius.is_finite() && style.corner_radius >= 0.0,
+        "Invalid shape radius"
+    );
+    let (line_start, line_end, line_width) = if style.kind == ShapeKind::Line {
+        line_geometry(size, style)?
+    } else {
+        (Point::default(), Point::default(), 1.0)
+    };
+    let radius = style.corner_radius.min(size[0].min(size[1]) as f32 * 0.5);
+    let image = crate::gpu::shape(size, style).unwrap_or_else(|| {
+        RgbaImage::from_fn(size[0], size[1], |x, y| {
             let mut coverage = 0.0;
             for oy in [0.25, 0.75] {
                 for ox in [0.25, 0.75] {
                     let px = x as f32 + ox;
                     let py = y as f32 + oy;
-                    let inside = match kind {
+                    let inside = match style.kind {
                         ShapeKind::Rectangle => true,
                         ShapeKind::Ellipse => {
-                            ((px / width as f32 - 0.5) * 2.0).powi(2)
-                                + ((py / height as f32 - 0.5) * 2.0).powi(2)
+                            ((px / size[0] as f32 - 0.5) * 2.0).powi(2)
+                                + ((py / size[1] as f32 - 0.5) * 2.0).powi(2)
                                 <= 1.0
                         }
                         ShapeKind::RoundedRectangle => {
-                            let cx = px.clamp(radius, width as f32 - radius);
-                            let cy = py.clamp(radius, height as f32 - radius);
+                            let cx = px.clamp(radius, size[0] as f32 - radius);
+                            let cy = py.clamp(radius, size[1] as f32 - radius);
                             (px - cx).hypot(py - cy) <= radius
+                        }
+                        ShapeKind::Line => {
+                            let dx = line_end.x - line_start.x;
+                            let dy = line_end.y - line_start.y;
+                            let length_sq = dx * dx + dy * dy;
+                            let t = if length_sq < 0.0001 {
+                                0.0
+                            } else {
+                                (((px - line_start.x) * dx + (py - line_start.y) * dy) / length_sq)
+                                    .clamp(0.0, 1.0)
+                            };
+                            Point::new(px, py)
+                                .distance(Point::new(line_start.x + t * dx, line_start.y + t * dy))
+                                <= line_width * 0.5
                         }
                     };
                     if inside {
@@ -519,28 +603,88 @@ pub fn shape(
                 }
             }
             Rgba([
-                color[0],
-                color[1],
-                color[2],
-                (color[3] as f32 * coverage).round() as u8,
+                style.color[0],
+                style.color[1],
+                style.color[2],
+                (style.color[3] as f32 * coverage).round() as u8,
             ])
         })
     });
+    Ok(image)
+}
+
+pub fn shape(
+    start: Point,
+    end: Point,
+    kind: ShapeKind,
+    color: [u8; 4],
+    corner_radius: f32,
+    line_width: f32,
+) -> Result<Layer> {
+    ensure!(
+        [start.x, start.y, end.x, end.y, corner_radius, line_width]
+            .iter()
+            .all(|value| value.is_finite()),
+        "Invalid shape geometry"
+    );
+    let line_width = if kind == ShapeKind::Line {
+        ensure!(
+            (0.0..=crate::document::MAX_SHAPE_SIZE).contains(&line_width),
+            "Invalid line width"
+        );
+        line_width.max(1.0)
+    } else {
+        0.0
+    };
+    let (left, top, width, height) = if kind == ShapeKind::Line {
+        (
+            start.x.min(end.x) - line_width * 0.5,
+            start.y.min(end.y) - line_width * 0.5,
+            ((end.x - start.x).abs() + line_width).round().max(1.0) as u32,
+            ((end.y - start.y).abs() + line_width).round().max(1.0) as u32,
+        )
+    } else {
+        (
+            start.x.min(end.x),
+            start.y.min(end.y),
+            (end.x - start.x).abs().round().max(1.0) as u32,
+            (end.y - start.y).abs().round().max(1.0) as u32,
+        )
+    };
+    validate_size(width, height)?;
+    let transform_width = width as f32;
+    let transform_height = height as f32;
+    let style = crate::document::ShapeStyle {
+        kind,
+        color,
+        corner_radius,
+        line_width: (kind == ShapeKind::Line).then_some(line_width),
+        start: (kind == ShapeKind::Line).then(|| {
+            Point::new(
+                (start.x - left) / transform_width,
+                (start.y - top) / transform_height,
+            )
+        }),
+        end: (kind == ShapeKind::Line).then(|| {
+            Point::new(
+                (end.x - left) / transform_width,
+                (end.y - top) / transform_height,
+            )
+        }),
+    };
+    let image = rasterize_shape([width, height], &style)?;
     let mut layer = Layer::image(
         match kind {
             ShapeKind::Rectangle => "Rectangle",
             ShapeKind::Ellipse => "Ellipse",
+            ShapeKind::Line => "Line",
             ShapeKind::RoundedRectangle => "Rounded rectangle",
         },
         image,
     );
-    layer.shape = Some(crate::document::ShapeStyle {
-        kind,
-        color,
-        corner_radius,
-    });
-    layer.transform.x = start.x.min(end.x);
-    layer.transform.y = start.y.min(end.y);
+    layer.shape = Some(style);
+    layer.transform.x = left;
+    layer.transform.y = top;
     Ok(layer)
 }
 
@@ -557,15 +701,7 @@ pub fn refresh_shapes(document: &mut Document) -> Result<()> {
         {
             continue;
         }
-        validate_size(width, height)?;
-        let redrawn = shape(
-            Point::default(),
-            Point::new(width as f32, height as f32),
-            style.kind,
-            style.color,
-            style.corner_radius,
-        )?;
-        layer.pixels = redrawn.pixels;
+        layer.pixels = Some(Arc::new(rasterize_shape([width, height], style)?));
     }
     Ok(())
 }
@@ -601,6 +737,7 @@ mod tests {
             Point::new(4.0, 2.0),
             ShapeKind::Rectangle,
             [50, 100, 150, 255],
+            0.0,
             0.0,
         )
         .unwrap();
@@ -730,6 +867,7 @@ mod tests {
             ShapeKind::RoundedRectangle,
             [255, 0, 0, 255],
             5.0,
+            0.0,
         )
         .unwrap();
         doc.insert(layer);
@@ -740,6 +878,75 @@ mod tests {
         assert_eq!(layer.pixels.as_ref().unwrap().get_pixel(6, 0)[3], 255);
         fill(&mut doc, [0, 0, 255, 255], false, false).unwrap();
         assert!(doc.active().unwrap().shape.is_none());
+    }
+
+    #[test]
+    fn line_shape_rasterizes_with_its_own_width_and_endpoints() {
+        let layer = shape(
+            Point::new(4.0, 12.0),
+            Point::new(20.0, 12.0),
+            ShapeKind::Line,
+            [255, 0, 0, 255],
+            0.0,
+            4.0,
+        )
+        .unwrap();
+        let style = layer.shape.as_ref().unwrap();
+        assert_eq!(style.line_width, Some(4.0));
+        assert!((style.start.unwrap().x - 0.1).abs() < 0.00001);
+        assert!((style.start.unwrap().y - 0.5).abs() < 0.00001);
+        assert!((style.end.unwrap().x - 0.9).abs() < 0.00001);
+        assert_eq!(style.end.unwrap().y, 0.5);
+        let pixels = layer.pixels.as_ref().unwrap();
+        assert_eq!(pixels.dimensions(), (20, 4));
+        assert_eq!(pixels.get_pixel(10, 1).0, [255, 0, 0, 255]);
+        assert_eq!(pixels.get_pixel(10, 2).0, [255, 0, 0, 255]);
+        assert!(pixels.get_pixel(0, 0)[3] < 255);
+    }
+
+    #[test]
+    fn live_line_refreshes_at_a_new_size_without_scaling_its_width() {
+        let mut doc = Document::new(64, 32).unwrap();
+        doc.insert(
+            shape(
+                Point::new(4.0, 8.0),
+                Point::new(20.0, 8.0),
+                ShapeKind::Line,
+                [255, 0, 0, 255],
+                0.0,
+                3.0,
+            )
+            .unwrap(),
+        );
+        let original_style = doc.active().unwrap().shape.clone().unwrap();
+        let layer = doc.active_mut().unwrap();
+        layer.transform.width *= 2.0;
+        layer.transform.height *= 2.0;
+        refresh_shapes(&mut doc).unwrap();
+        let layer = doc.active().unwrap();
+        assert_eq!(layer.pixels.as_ref().unwrap().dimensions(), (38, 6));
+        assert_eq!(layer.shape.as_ref().unwrap(), &original_style);
+        let pixels = layer.pixels.as_ref().unwrap();
+        assert_eq!(pixels.get_pixel(19, 2).0, [255, 0, 0, 255]);
+        assert_eq!(pixels.get_pixel(19, 0)[3], 0);
+        assert_eq!(render::render(&doc).get_pixel(21, 9).0, [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn stroke_smoothing_uses_a_screen_space_string_and_ignores_slack() {
+        let anchor = Point::new(10.0, 20.0);
+        let pointer = Point::new(13.0, 24.0);
+        assert_eq!(smooth_stroke_point(anchor, pointer, 5.0, 1.0), None);
+        let painted = smooth_stroke_point(anchor, pointer, 2.0, 1.0).unwrap();
+        assert!((painted.x - 11.8).abs() < 0.00001);
+        assert!((painted.y - 22.4).abs() < 0.00001);
+        let zoomed = smooth_stroke_point(anchor, pointer, 2.0, 2.0).unwrap();
+        assert!((zoomed.x - 12.4).abs() < 0.00001);
+        assert!((zoomed.y - 23.2).abs() < 0.00001);
+        assert_eq!(
+            smooth_stroke_point(anchor, pointer, 0.0, 2.0),
+            Some(pointer)
+        );
     }
 
     #[test]

@@ -5,11 +5,14 @@ use image::RgbaImage;
 use mectov::{document::validate_size, io};
 use url::Url;
 
-use super::{EditorApp, Layer, Point};
+use super::{EditorApp, Layer, LayerClipboard, Point};
+
+const LAYER_CLIPBOARD_SENTINEL: &str = "mectov://layers";
 
 pub(super) enum ClipboardContent {
     Image(RgbaImage),
     Files(Vec<PathBuf>),
+    Layers,
     Empty,
     Unavailable,
 }
@@ -62,6 +65,9 @@ fn read_clipboard(
     clipboard: Option<&mut arboard::Clipboard>,
     text: Option<&str>,
 ) -> Result<ClipboardContent> {
+    if text == Some(LAYER_CLIPBOARD_SENTINEL) {
+        return Ok(ClipboardContent::Layers);
+    }
     if let Some(paths) = text.and_then(file_paths) {
         return Ok(ClipboardContent::Files(paths));
     }
@@ -73,6 +79,12 @@ fn read_clipboard(
         });
     };
 
+    if clipboard
+        .get_text()
+        .is_ok_and(|value| value == LAYER_CLIPBOARD_SENTINEL)
+    {
+        return Ok(ClipboardContent::Layers);
+    }
     // Prefer original files over any preview image offered by a file manager.
     if let Ok(paths) = clipboard.get().file_list()
         && !paths.is_empty()
@@ -91,10 +103,13 @@ fn read_clipboard(
         Err(arboard::Error::ContentNotAvailable) => {}
         Err(error) => return Err(error).context("Could not read the clipboard image"),
     }
-    if let Ok(text) = clipboard.get_text()
-        && let Some(paths) = file_paths(&text)
-    {
-        return Ok(ClipboardContent::Files(paths));
+    if let Ok(text) = clipboard.get_text() {
+        if text == LAYER_CLIPBOARD_SENTINEL {
+            return Ok(ClipboardContent::Layers);
+        }
+        if let Some(paths) = file_paths(&text) {
+            return Ok(ClipboardContent::Files(paths));
+        }
     }
     Ok(ClipboardContent::Empty)
 }
@@ -118,9 +133,87 @@ impl EditorApp {
         }
     }
 
+    pub(super) fn copy_selected_layers(&mut self, cut: bool) -> bool {
+        let Some(document) = self.session().map(|session| session.document.clone()) else {
+            return false;
+        };
+        if document.selection.is_some() || document.active.is_none() {
+            return false;
+        }
+        let mut roots = Vec::new();
+        for layer in document
+            .layers
+            .iter()
+            .filter(|layer| document.selected.contains(&layer.id))
+        {
+            if !roots
+                .iter()
+                .any(|root| document.descendants(*root).contains(&layer.id))
+            {
+                roots.push(layer.id);
+            }
+        }
+        if roots.is_empty() {
+            return false;
+        }
+        self.layer_clipboard = Some(LayerClipboard {
+            source: document,
+            roots,
+        });
+        self.clipboard = None;
+        self.connect_clipboard();
+        if let Some(clipboard) = &mut self.system_clipboard {
+            let _ = clipboard.set_text(LAYER_CLIPBOARD_SENTINEL);
+        }
+        if cut {
+            self.edit("Cut Layers", |document| {
+                document.delete_selected();
+                Ok(())
+            });
+        } else {
+            self.status = "Copied layers".into();
+        }
+        true
+    }
+
+    fn paste_layer_clipboard(&mut self) {
+        let Some(clipboard) = self.layer_clipboard.clone() else {
+            self.status = "The layer clipboard is empty".into();
+            return;
+        };
+        let Some(session) = self.session() else {
+            return;
+        };
+        let source_anchor = clipboard
+            .source
+            .layers
+            .iter()
+            .find(|layer| Some(layer.id) == clipboard.roots.first().copied())
+            .map(|layer| layer.transform.center())
+            .unwrap_or_default();
+        let offset = if clipboard.source.width == session.document.width
+            && clipboard.source.height == session.document.height
+        {
+            Point::default()
+        } else {
+            Point::new(
+                session.document.width as f32 * 0.5 - source_anchor.x,
+                session.document.height as f32 * 0.5 - source_anchor.y,
+            )
+        };
+        self.edit("Paste Layers", |document| {
+            mectov::operations::paste_layers(&clipboard.source, document, &clipboard.roots, offset)
+        });
+    }
+
     pub(super) fn paste_content(&mut self, content: ClipboardContent) {
         let images = match content {
+            ClipboardContent::Layers => {
+                self.paste_layer_clipboard();
+                return;
+            }
             ClipboardContent::Image(pixels) => {
+                self.layer_clipboard = None;
                 let point = self
                     .clipboard
                     .as_ref()
@@ -132,8 +225,12 @@ impl EditorApp {
                 vec![("Pasted image".to_owned(), pixels, point)]
             }
             ClipboardContent::Files(paths) => {
+                self.layer_clipboard = None;
                 self.clipboard = None;
-                if paths.iter().any(|p| mectov::raw::is_raw(p)) {
+                if paths
+                    .iter()
+                    .any(|path| mectov::raw::is_raw(path) || mectov::psd::is_document(path))
+                {
                     for path in paths {
                         self.open_path(&path, true);
                     }
@@ -160,6 +257,10 @@ impl EditorApp {
                     }
                 }
             }
+            ClipboardContent::Unavailable if self.layer_clipboard.is_some() => {
+                self.paste_layer_clipboard();
+                return;
+            }
             ClipboardContent::Unavailable => match self.clipboard.clone() {
                 Some((pixels, point)) => vec![("Pasted image".into(), pixels, Some(point))],
                 None => {
@@ -168,6 +269,7 @@ impl EditorApp {
                 }
             },
             ClipboardContent::Empty => {
+                self.layer_clipboard = None;
                 self.clipboard = None;
                 self.status = "The clipboard does not contain an image or image file".into();
                 return;

@@ -4,6 +4,7 @@ mectov's own source code is MIT licensed. Dependency licenses remain applicable 
 
 - **Origin of this codebase**: mectov's history begins from the MIT-licensed Rust image editor **Xuan** by Silver Ling. Its MIT terms and copyright notice remain in effect for the code inherited from it, so that copyright holder is recorded here even though mectov no longer carries that project's name. This notice ships with every binary package, which is how the required attribution is retained.
 - **Rawler 0.7.2** provides camera RAW decoding, camera calibration data, and PPG demosaicing. Copyright Daniel Vogelbacher, Pedro Côrte-Real, and the Rawler contributors. Licensed under the GNU LGPL 2.1; see [the license](licenses/rawler-LGPL-2.1.txt) and [upstream source](https://crates.io/crates/rawler/0.7.2).
+- **resvg 0.48.1** and **tiny-skia 0.12.0** provide SVG parsing and rasterization. resvg is licensed under Apache-2.0 OR MIT; tiny-skia is licensed under BSD-3-Clause.
 - **Inter Variable**: [SIL Open Font License](assets/fonts/Inter-LICENSE.txt).
 - **egui-winit**: [MIT](vendor/egui-winit/LICENSE-MIT) / [Apache 2.0](vendor/egui-winit/LICENSE-APACHE), with local patches retained in the accompanying source archive.
 - **sRGB ICC profile**: generated with Little CMS through Pillow's `ImageCms.createProfile("sRGB")`. The profile is embedded in Develop's 16-bit TIFF exports; generating it is not a build or runtime requirement.

@@ -1,6 +1,9 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
+use std::{
+    collections::VecDeque,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use anyhow::{Result, ensure};
@@ -8,7 +11,7 @@ use image::{Rgba, RgbaImage};
 use rayon::prelude::*;
 
 use crate::{
-    document::{Adjustment, Document, Point},
+    document::{Adjustment, Document, LayerEffects, Mask, Point, Transform},
     paint::ensure_pixels,
     render, selection,
 };
@@ -450,10 +453,40 @@ pub fn apply_adjustment(
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Filter {
-    GaussianBlur { radius: f32 },
-    MotionBlur { distance: f32, angle: f32 },
-    Noise { amount: f32, monochrome: bool },
-    LensCorrection { distortion: f32, vignette: f32 },
+    GaussianBlur {
+        radius: f32,
+    },
+    MotionBlur {
+        distance: f32,
+        angle: f32,
+    },
+    Noise {
+        amount: f32,
+        monochrome: bool,
+    },
+    Vignette {
+        amount: f32,
+        color: [f32; 3],
+        midpoint: f32,
+        roundness: f32,
+        feather: f32,
+        highlights: f32,
+    },
+    BloomGlow {
+        amount: f32,
+        radius: f32,
+    },
+    TonalContrast {
+        amount: f32,
+        radius: f32,
+        shadows: f32,
+        midtones: f32,
+        highlights: f32,
+    },
+    LensCorrection {
+        distortion: f32,
+        vignette: f32,
+    },
 }
 
 impl Filter {
@@ -462,6 +495,9 @@ impl Filter {
             Self::GaussianBlur { .. } => "Gaussian Blur",
             Self::MotionBlur { .. } => "Motion Blur",
             Self::Noise { .. } => "Add Noise",
+            Self::Vignette { .. } => "Vignette",
+            Self::BloomGlow { .. } => "Bloom / Glow",
+            Self::TonalContrast { .. } => "Tonal Contrast",
             Self::LensCorrection { .. } => "Lens Correction",
         }
     }
@@ -474,29 +510,262 @@ pub fn filtered(image: &RgbaImage, filter: &Filter) -> RgbaImage {
     if crate::gpu::cancelled() {
         return image.clone();
     }
-    let (w, h) = image.dimensions();
-    match filter {
-        Filter::GaussianBlur { radius } => {
-            // Blur premultiplied pixels to prevent dark fringes at transparent edges.
-            let premul = RgbaImage::from_fn(w, h, |x, y| {
-                let p = image.get_pixel(x, y).0;
-                Rgba([
-                    ((p[0] as u16 * p[3] as u16) / 255) as u8,
-                    ((p[1] as u16 * p[3] as u16) / 255) as u8,
-                    ((p[2] as u16 * p[3] as u16) / 255) as u8,
-                    p[3],
-                ])
-            });
-            let mut result = image::imageops::blur(&premul, radius.max(0.01));
-            for pixel in result.pixels_mut() {
-                if pixel[3] > 0 {
-                    for i in 0..3 {
-                        pixel[i] = ((pixel[i] as u32 * 255) / pixel[3] as u32).min(255) as u8;
-                    }
-                }
+    filtered_cpu(image, filter, false)
+}
+
+fn premultiplied_blur(image: &RgbaImage, radius: f32) -> RgbaImage {
+    let (width, height) = image.dimensions();
+    if width == 0 || height == 0 {
+        return image.clone();
+    }
+    let premultiplied = RgbaImage::from_fn(width, height, |x, y| {
+        let p = image.get_pixel(x, y).0;
+        Rgba([
+            ((p[0] as u16 * p[3] as u16) / 255) as u8,
+            ((p[1] as u16 * p[3] as u16) / 255) as u8,
+            ((p[2] as u16 * p[3] as u16) / 255) as u8,
+            p[3],
+        ])
+    });
+    let mut result = image::imageops::blur(&premultiplied, radius.max(0.01));
+    for pixel in result.pixels_mut() {
+        if pixel[3] > 0 {
+            for i in 0..3 {
+                pixel[i] = ((pixel[i] as u32 * 255) / pixel[3] as u32).min(255) as u8;
             }
-            result
         }
+    }
+    result
+}
+
+fn vignette_mask_at(
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    midpoint: f32,
+    roundness: f32,
+    feather: f32,
+) -> f32 {
+    let nx = x / width * 2.0 - 1.0;
+    let ny = y / height * 2.0 - 1.0;
+    let square = nx.abs().max(ny.abs());
+    let circle = (nx * nx + ny * ny).sqrt() / 2.0_f32.sqrt();
+    let shape = (1.0 - roundness / 100.0) * 0.5;
+    let distance = circle + (square - circle) * shape;
+    let start = midpoint / 100.0 * 0.85;
+    let softness = (feather / 100.0).max(0.05);
+    let t = ((distance - start) / softness).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+fn vignette(image: &RgbaImage, filter: &Filter, fill_empty: bool) -> RgbaImage {
+    let Filter::Vignette {
+        amount,
+        color,
+        midpoint,
+        roundness,
+        feather,
+        highlights,
+    } = filter
+    else {
+        return image.clone();
+    };
+    let amount = *amount;
+    let color = *color;
+    let midpoint = *midpoint;
+    let roundness = *roundness;
+    let feather = *feather;
+    let highlights = *highlights;
+    let (width, height) = image.dimensions();
+    if amount <= 0.0 || width == 0 || height == 0 {
+        return image.clone();
+    }
+    let color = color.map(|value| value.clamp(0.0, 1.0));
+    let strength = (amount / 100.0).clamp(0.0, 1.0);
+    RgbaImage::from_fn(width, height, |x, y| {
+        let pixel = *image.get_pixel(x, y);
+        let alpha = pixel[3] as f32 / 255.0;
+        if alpha <= 0.0 && !fill_empty {
+            return pixel;
+        }
+        let mask = vignette_mask_at(
+            x as f32 + 0.5,
+            y as f32 + 0.5,
+            width as f32,
+            height as f32,
+            midpoint,
+            roundness,
+            feather,
+        );
+        if mask <= 0.0 {
+            return pixel;
+        }
+        let rgb = if alpha > 0.0 {
+            [
+                (pixel[0] as f32 / 255.0).min(1.0),
+                (pixel[1] as f32 / 255.0).min(1.0),
+                (pixel[2] as f32 / 255.0).min(1.0),
+            ]
+        } else {
+            [0.0; 3]
+        };
+        let luminance = rgb[0] * 0.2126 + rgb[1] * 0.7152 + rgb[2] * 0.0722;
+        let bright = ((luminance - 0.45) / 0.55).clamp(0.0, 1.0);
+        let effect = strength * mask * (1.0 - highlights / 100.0 * bright);
+        let (out_rgb, out_alpha) = if fill_empty {
+            let out_alpha = (alpha + effect * (1.0 - alpha)).clamp(0.0, 1.0);
+            let out = if out_alpha > 0.0 {
+                [
+                    (color[0] * effect + rgb[0] * alpha * (1.0 - effect)) / out_alpha,
+                    (color[1] * effect + rgb[1] * alpha * (1.0 - effect)) / out_alpha,
+                    (color[2] * effect + rgb[2] * alpha * (1.0 - effect)) / out_alpha,
+                ]
+            } else {
+                [0.0; 3]
+            };
+            (out, out_alpha)
+        } else {
+            (
+                [
+                    rgb[0] + (color[0] - rgb[0]) * effect,
+                    rgb[1] + (color[1] - rgb[1]) * effect,
+                    rgb[2] + (color[2] - rgb[2]) * effect,
+                ],
+                alpha,
+            )
+        };
+        Rgba([
+            (out_rgb[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+            (out_rgb[1].clamp(0.0, 1.0) * 255.0).round() as u8,
+            (out_rgb[2].clamp(0.0, 1.0) * 255.0).round() as u8,
+            (out_alpha * 255.0).round() as u8,
+        ])
+    })
+}
+
+fn bloom(image: &RgbaImage, amount: f32, radius: f32) -> RgbaImage {
+    if amount <= 0.0 || image.width() == 0 || image.height() == 0 {
+        return image.clone();
+    }
+    let (width, height) = image.dimensions();
+    let highlights = RgbaImage::from_fn(width, height, |x, y| {
+        let pixel = *image.get_pixel(x, y);
+        let alpha = pixel[3] as f32 / 255.0;
+        if alpha <= 0.0 {
+            return Rgba([0; 4]);
+        }
+        let rgb = [
+            (pixel[0] as f32 / 255.0).min(1.0),
+            (pixel[1] as f32 / 255.0).min(1.0),
+            (pixel[2] as f32 / 255.0).min(1.0),
+        ];
+        let luminance = rgb[0] * 0.2126 + rgb[1] * 0.7152 + rgb[2] * 0.0722;
+        let highlight = ((luminance - 0.5) / 0.5).clamp(0.0, 1.0);
+        Rgba([
+            (rgb[0] * highlight * 255.0).round() as u8,
+            (rgb[1] * highlight * 255.0).round() as u8,
+            (rgb[2] * highlight * 255.0).round() as u8,
+            (alpha * highlight * 255.0).round() as u8,
+        ])
+    });
+    let blurred = premultiplied_blur(&highlights, radius);
+    let intensity = amount / 50.0;
+    RgbaImage::from_fn(width, height, |x, y| {
+        let source = *image.get_pixel(x, y);
+        let glow = *blurred.get_pixel(x, y);
+        let source_alpha = source[3] as f32 / 255.0;
+        let glow_alpha = glow[3] as f32 / 255.0 * intensity;
+        let glow_rgb = [
+            glow[0] as f32 / 255.0,
+            glow[1] as f32 / 255.0,
+            glow[2] as f32 / 255.0,
+        ];
+        let out_alpha = (source_alpha + glow_alpha).clamp(0.0, 1.0);
+        if out_alpha <= 0.0 {
+            return source;
+        }
+        let out_rgb = [
+            (source[0] as f32 / 255.0 * source_alpha + glow_rgb[0] * glow_alpha) / out_alpha,
+            (source[1] as f32 / 255.0 * source_alpha + glow_rgb[1] * glow_alpha) / out_alpha,
+            (source[2] as f32 / 255.0 * source_alpha + glow_rgb[2] * glow_alpha) / out_alpha,
+        ];
+        Rgba([
+            (out_rgb[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+            (out_rgb[1].clamp(0.0, 1.0) * 255.0).round() as u8,
+            (out_rgb[2].clamp(0.0, 1.0) * 255.0).round() as u8,
+            (out_alpha * 255.0).round() as u8,
+        ])
+    })
+}
+
+fn tonal_contrast(
+    image: &RgbaImage,
+    amount: f32,
+    radius: f32,
+    shadows: f32,
+    midtones: f32,
+    highlights: f32,
+) -> RgbaImage {
+    if amount <= 0.0
+        || (shadows == 0.0 && midtones == 0.0 && highlights == 0.0)
+        || image.width() == 0
+        || image.height() == 0
+    {
+        return image.clone();
+    }
+    let base = premultiplied_blur(image, radius);
+    let strength = amount / 50.0;
+    let smooth = |low: f32, high: f32, value: f32| {
+        let t = ((value - low) / (high - low)).clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    };
+    let (width, height) = image.dimensions();
+    RgbaImage::from_fn(width, height, |x, y| {
+        let pixel = *image.get_pixel(x, y);
+        let alpha = pixel[3] as f32 / 255.0;
+        let base_pixel = *base.get_pixel(x, y);
+        let base_alpha = base_pixel[3] as f32 / 255.0;
+        if alpha <= 0.0 || base_alpha <= 0.0 {
+            return pixel;
+        }
+        let rgb = [
+            (pixel[0] as f32 / 255.0).min(1.0),
+            (pixel[1] as f32 / 255.0).min(1.0),
+            (pixel[2] as f32 / 255.0).min(1.0),
+        ];
+        let base_rgb = [
+            base_pixel[0] as f32 / 255.0,
+            base_pixel[1] as f32 / 255.0,
+            base_pixel[2] as f32 / 255.0,
+        ];
+        let luminance = rgb[0] * 0.2126 + rgb[1] * 0.7152 + rgb[2] * 0.0722;
+        let base_luminance = base_rgb[0] * 0.2126 + base_rgb[1] * 0.7152 + base_rgb[2] * 0.0722;
+        let shadow_weight = 1.0 - smooth(0.15, 0.5, base_luminance);
+        let highlight_weight = smooth(0.5, 0.85, base_luminance);
+        let midtone_weight = 1.0 - shadow_weight - highlight_weight;
+        let weight =
+            (shadows * shadow_weight + midtones * midtone_weight + highlights * highlight_weight)
+                / 100.0;
+        let detail = luminance - base_luminance;
+        let delta = 0.18
+            * (detail * 6.0).tanh()
+            * weight
+            * strength
+            * (4.0 * luminance * (1.0 - luminance));
+        Rgba([
+            ((rgb[0] + delta).clamp(0.0, 1.0) * 255.0).round() as u8,
+            ((rgb[1] + delta).clamp(0.0, 1.0) * 255.0).round() as u8,
+            ((rgb[2] + delta).clamp(0.0, 1.0) * 255.0).round() as u8,
+            pixel[3],
+        ])
+    })
+}
+
+fn filtered_cpu(image: &RgbaImage, filter: &Filter, fill_empty_vignette: bool) -> RgbaImage {
+    let (w, h) = image.dimensions();
+    let result = match filter {
+        Filter::GaussianBlur { radius } => premultiplied_blur(image, *radius),
         Filter::MotionBlur { distance, angle } => {
             motion_blur(image, *distance, *angle, &AtomicBool::new(false))
                 .expect("Motion blur was not cancelled")
@@ -515,6 +784,15 @@ pub fn filtered(image: &RgbaImage, filter: &Filter) -> RgbaImage {
                 .map(|v| (v * 255.0).round() as u8),
             )
         }),
+        Filter::Vignette { .. } => vignette(image, filter, fill_empty_vignette),
+        Filter::BloomGlow { amount, radius } => bloom(image, *amount, *radius),
+        Filter::TonalContrast {
+            amount,
+            radius,
+            shadows,
+            midtones,
+            highlights,
+        } => tonal_contrast(image, *amount, *radius, *shadows, *midtones, *highlights),
         Filter::LensCorrection {
             distortion,
             vignette,
@@ -529,6 +807,11 @@ pub fn filtered(image: &RgbaImage, filter: &Filter) -> RgbaImage {
             }
             Rgba(p.map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8))
         }),
+    };
+    if crate::gpu::cancelled() {
+        image.clone()
+    } else {
+        result
     }
 }
 
@@ -654,6 +937,7 @@ fn apply_filter_impl(
     let layer = document
         .active_mut()
         .ok_or_else(|| anyhow::anyhow!("Select a layer first"))?;
+    let empty_layer = layer.pixels.is_none();
     if mask_target {
         crate::paint::prepare_mask(layer)?;
         let mask = layer.mask.as_mut().unwrap();
@@ -704,6 +988,7 @@ fn apply_filter_impl(
     let padding = match filter {
         Filter::GaussianBlur { radius } => (radius * 3.0).ceil() as u32,
         Filter::MotionBlur { distance, .. } => (distance * 0.5).ceil() as u32 + 1,
+        Filter::BloomGlow { radius, .. } => (radius * 3.0).ceil() as u32 + 2,
         _ => 0,
     };
     let (w, h) = (
@@ -751,6 +1036,7 @@ fn apply_filter_impl(
             Filter::MotionBlur { distance, angle } => {
                 motion_blur(&expanded, *distance, *angle, cancel)?
             }
+            Filter::Vignette { .. } if empty_layer => filtered_cpu(&expanded, filter, true),
             _ => filtered(&expanded, filter),
         }
     };
@@ -979,9 +1265,602 @@ pub fn validate_adjustment(adjustment: &Adjustment) -> Result<()> {
     Ok(())
 }
 
+fn effect_margin(effects: &LayerEffects) -> u32 {
+    let mut reach = 0.0_f32;
+    if let Some(effect) = effects
+        .stroke
+        .as_ref()
+        .filter(|effect| effect.enabled && effect.size > 0.0 && effect.opacity > 0.0)
+    {
+        reach = reach.max(effect.size);
+    }
+    if let Some(effect) = effects
+        .shadow
+        .as_ref()
+        .filter(|effect| effect.enabled && effect.opacity > 0.0)
+    {
+        reach = reach.max(effect.distance + effect.blur * 3.0);
+    }
+    if let Some(effect) = effects
+        .outer_glow
+        .as_ref()
+        .filter(|effect| effect.enabled && effect.size > 0.0 && effect.opacity > 0.0)
+    {
+        reach = reach.max(effect.size * 3.0);
+    }
+    2 + reach.ceil().max(0.0) as u32
+}
+
+fn alpha_sample(alpha: &[f32], width: usize, height: usize, x: f32, y: f32) -> f32 {
+    if width == 0 || height == 0 {
+        return 0.0;
+    }
+    let x0 = x.floor() as isize;
+    let y0 = y.floor() as isize;
+    let fx = x - x0 as f32;
+    let fy = y - y0 as f32;
+    let mut result = 0.0;
+    for (iy, wy) in [(0, 1.0 - fy), (1, fy)] {
+        for (ix, wx) in [(0, 1.0 - fx), (1, fx)] {
+            let px = x0 + ix;
+            let py = y0 + iy;
+            if px < 0 || py < 0 || px >= width as isize || py >= height as isize {
+                continue;
+            }
+            result += alpha[py as usize * width + px as usize] * wx * wy;
+        }
+    }
+    result
+}
+
+fn shift_alpha(alpha: &[f32], width: usize, height: usize, dx: f32, dy: f32) -> Vec<f32> {
+    let mut shifted = vec![0.0; alpha.len()];
+    for y in 0..height {
+        for x in 0..width {
+            shifted[y * width + x] =
+                alpha_sample(alpha, width, height, x as f32 - dx, y as f32 - dy);
+        }
+    }
+    shifted
+}
+
+fn gaussian_alpha(alpha: &[f32], width: usize, height: usize, blur: f32) -> Vec<f32> {
+    let sigma = blur * 0.5;
+    if sigma <= 0.01 || width == 0 || height == 0 {
+        return alpha.to_vec();
+    }
+    let radius = (blur * 1.5).round().max(1.0) as isize;
+    let raw_weights: Vec<f32> = (-radius..=radius)
+        .map(|offset| {
+            let offset = offset as f32;
+            (-(offset * offset) / (2.0 * sigma * sigma)).exp()
+        })
+        .collect();
+    let weight_sum: f32 = raw_weights.iter().sum();
+    let weights: Vec<f32> = raw_weights
+        .into_iter()
+        .map(|weight| weight / weight_sum)
+        .collect();
+    let mut horizontal = vec![0.0; alpha.len()];
+    for y in 0..height {
+        for x in 0..width {
+            let mut sum = 0.0;
+            for (index, weight) in weights.iter().enumerate() {
+                let offset = index as isize - radius;
+                let px = (x as isize + offset).clamp(0, width as isize - 1) as usize;
+                sum += alpha[y * width + px] * weight;
+            }
+            horizontal[y * width + x] = sum;
+        }
+    }
+    let mut result = vec![0.0; alpha.len()];
+    for y in 0..height {
+        for x in 0..width {
+            let mut sum = 0.0;
+            for (index, weight) in weights.iter().enumerate() {
+                let offset = index as isize - radius;
+                let py = (y as isize + offset).clamp(0, height as isize - 1) as usize;
+                sum += horizontal[py * width + x] * weight;
+            }
+            result[y * width + x] = sum;
+        }
+    }
+    result
+}
+
+fn morphology(
+    alpha: &[f32],
+    width: usize,
+    height: usize,
+    radius: usize,
+    maximum: bool,
+) -> Vec<f32> {
+    if radius == 0 || width == 0 || height == 0 {
+        return alpha.to_vec();
+    }
+    let radius = radius.min(width.max(height));
+    let mut horizontal = vec![0.0; alpha.len()];
+    for y in 0..height {
+        morphology_line(alpha, &mut horizontal, y * width, 1, width, radius, maximum);
+    }
+    let mut result = vec![0.0; alpha.len()];
+    for x in 0..width {
+        morphology_line(&horizontal, &mut result, x, width, height, radius, maximum);
+    }
+    result
+}
+
+fn morphology_line(
+    input: &[f32],
+    output: &mut [f32],
+    base: usize,
+    stride: usize,
+    length: usize,
+    radius: usize,
+    maximum: bool,
+) {
+    let value_at = |position: usize| {
+        if position >= radius && position < radius + length {
+            input[base + (position - radius) * stride]
+        } else {
+            0.0
+        }
+    };
+    let mut queue = VecDeque::<usize>::with_capacity(radius * 2 + 1);
+    for position in 0..length + radius * 2 {
+        let value = value_at(position);
+        while queue.back().is_some_and(|&back| {
+            let old = value_at(back);
+            if maximum { value >= old } else { value <= old }
+        }) {
+            queue.pop_back();
+        }
+        queue.push_back(position);
+        while queue
+            .front()
+            .is_some_and(|&front| front + radius * 2 < position)
+        {
+            queue.pop_front();
+        }
+        if position >= radius * 2 {
+            output[base + (position - radius * 2) * stride] =
+                value_at(queue.front().copied().unwrap_or(position));
+        }
+    }
+}
+
+fn composite_color(target: &mut [f32; 4], color: [f32; 3], coverage: f32) {
+    let coverage = coverage.clamp(0.0, 1.0);
+    if coverage <= 0.0 {
+        return;
+    }
+    for channel in 0..3 {
+        target[channel] = color[channel] * coverage + target[channel] * (1.0 - coverage);
+    }
+    target[3] = coverage + target[3] * (1.0 - coverage);
+}
+
+fn composite_premultiplied(target: &mut [f32; 4], source: [f32; 4]) {
+    let alpha = source[3].clamp(0.0, 1.0);
+    for channel in 0..3 {
+        target[channel] = source[channel] + target[channel] * (1.0 - alpha);
+    }
+    target[3] = alpha + target[3] * (1.0 - alpha);
+}
+
+pub fn bake_layer_effects(
+    pixels: &RgbaImage,
+    transform: Transform,
+    mask: Option<&Mask>,
+    effects: LayerEffects,
+) -> Option<(RgbaImage, Transform)> {
+    if !effects.renders() || pixels.width() == 0 || pixels.height() == 0 {
+        return None;
+    }
+    let margin = effect_margin(&effects);
+    let width = pixels.width().checked_add(margin * 2)?;
+    let height = pixels.height().checked_add(margin * 2)?;
+    let total = width as usize * height as usize;
+    let source_width = pixels.width();
+    let source_height = pixels.height();
+    let mut alpha = vec![0.0; total];
+    let mut source = vec![[0.0; 4]; total];
+    for y in 0..source_height {
+        for x in 0..source_width {
+            let pixel = pixels.get_pixel(x, y).0;
+            let mask_value = mask.filter(|mask| mask.enabled).map_or(1.0, |mask| {
+                render::mask_sample(
+                    &mask.pixels,
+                    mask.placement.unwrap_or(transform).inverse(Point::new(
+                        (x as f32 + 0.5) / source_width as f32,
+                        (y as f32 + 0.5) / source_height as f32,
+                    )),
+                )
+            });
+            let coverage = pixel[3] as f32 / 255.0 * mask_value;
+            let index = (y + margin) as usize * width as usize + (x + margin) as usize;
+            alpha[index] = coverage;
+            source[index][3] = coverage;
+            for channel in 0..3 {
+                source[index][channel] = pixel[channel] as f32 / 255.0 * coverage;
+            }
+        }
+    }
+    let mut output = vec![[0.0; 4]; total];
+    if let Some(effect) = effects
+        .shadow
+        .as_ref()
+        .filter(|effect| effect.enabled && effect.opacity > 0.0)
+    {
+        let (sin, cos) = effect.angle.to_radians().sin_cos();
+        let shifted = shift_alpha(
+            &alpha,
+            width as usize,
+            height as usize,
+            -effect.distance * cos,
+            effect.distance * sin,
+        );
+        let blurred = gaussian_alpha(&shifted, width as usize, height as usize, effect.blur);
+        for (target, coverage) in output.iter_mut().zip(blurred) {
+            composite_color(target, effect.color, coverage * effect.opacity);
+        }
+    }
+    if let Some(effect) = effects
+        .outer_glow
+        .as_ref()
+        .filter(|effect| effect.enabled && effect.size > 0.0 && effect.opacity > 0.0)
+    {
+        let blurred = gaussian_alpha(&alpha, width as usize, height as usize, effect.size);
+        for (index, (target, &source_alpha)) in output.iter_mut().zip(alpha.iter()).enumerate() {
+            composite_color(
+                target,
+                effect.color,
+                blurred[index] * (1.0 - source_alpha) * effect.opacity,
+            );
+        }
+    }
+    if let Some(effect) = effects.stroke.as_ref().filter(|effect| {
+        effect.enabled && effect.size > 0.0 && effect.opacity > 0.0 && !effect.inside
+    }) {
+        let dilated = morphology(
+            &alpha,
+            width as usize,
+            height as usize,
+            effect.size.round().max(1.0) as usize,
+            true,
+        );
+        for (index, (target, &source_alpha)) in output.iter_mut().zip(alpha.iter()).enumerate() {
+            composite_color(
+                target,
+                effect.color,
+                (dilated[index] - source_alpha).max(0.0) * effect.opacity,
+            );
+        }
+    }
+    for (target, source_pixel) in output.iter_mut().zip(source) {
+        composite_premultiplied(target, source_pixel);
+    }
+    if let Some(effect) = effects
+        .color_overlay
+        .as_ref()
+        .filter(|effect| effect.enabled && effect.opacity > 0.0)
+    {
+        for (target, &coverage) in output.iter_mut().zip(alpha.iter()) {
+            composite_color(target, effect.color, coverage * effect.opacity);
+        }
+    }
+    if let Some(effect) = effects
+        .inner_glow
+        .as_ref()
+        .filter(|effect| effect.enabled && effect.size > 0.0 && effect.opacity > 0.0)
+    {
+        let blurred = gaussian_alpha(&alpha, width as usize, height as usize, effect.size);
+        for (target, (&coverage, &blurred_alpha)) in
+            output.iter_mut().zip(alpha.iter().zip(blurred.iter()))
+        {
+            composite_color(
+                target,
+                effect.color,
+                coverage * (1.0 - blurred_alpha) * effect.opacity,
+            );
+        }
+    }
+    if let Some(effect) = effects
+        .inner_shadow
+        .as_ref()
+        .filter(|effect| effect.enabled && effect.opacity > 0.0)
+    {
+        let (sin, cos) = effect.angle.to_radians().sin_cos();
+        let shifted = shift_alpha(
+            &alpha,
+            width as usize,
+            height as usize,
+            -effect.distance * cos,
+            effect.distance * sin,
+        );
+        let blurred = gaussian_alpha(&shifted, width as usize, height as usize, effect.blur);
+        for (index, (target, &coverage)) in output.iter_mut().zip(alpha.iter()).enumerate() {
+            composite_color(
+                target,
+                effect.color,
+                coverage * (1.0 - blurred[index]) * effect.opacity,
+            );
+        }
+    }
+    if let Some(effect) = effects.stroke.as_ref().filter(|effect| {
+        effect.enabled && effect.size > 0.0 && effect.opacity > 0.0 && effect.inside
+    }) {
+        let eroded = morphology(
+            &alpha,
+            width as usize,
+            height as usize,
+            effect.size.round().max(1.0) as usize,
+            false,
+        );
+        for (index, (target, &source_alpha)) in output.iter_mut().zip(alpha.iter()).enumerate() {
+            composite_color(
+                target,
+                effect.color,
+                (source_alpha - eroded[index]).max(0.0) * effect.opacity,
+            );
+        }
+    }
+    let image = RgbaImage::from_fn(width, height, |x, y| {
+        let pixel = output[y as usize * width as usize + x as usize];
+        let alpha = pixel[3].clamp(0.0, 1.0);
+        let color = if alpha > 0.000001 {
+            [
+                (pixel[0] / alpha).clamp(0.0, 1.0),
+                (pixel[1] / alpha).clamp(0.0, 1.0),
+                (pixel[2] / alpha).clamp(0.0, 1.0),
+            ]
+        } else {
+            [0.0; 3]
+        };
+        Rgba([
+            (color[0] * 255.0).round() as u8,
+            (color[1] * 255.0).round() as u8,
+            (color[2] * 255.0).round() as u8,
+            (alpha * 255.0).round() as u8,
+        ])
+    });
+    let expanded = transform.expanded(
+        -(margin as f32) / source_width as f32,
+        -(margin as f32) / source_height as f32,
+        1.0 + margin as f32 / source_width as f32,
+        1.0 + margin as f32 / source_height as f32,
+    );
+    Some((image, expanded))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::document::{
+        ColorOverlayEffect, InnerGlowEffect, InnerShadowEffect, OuterGlowEffect, ShadowEffect,
+        StrokeEffect,
+    };
+
+    #[test]
+    fn morphology_uses_square_dilation_and_zero_padded_erosion() {
+        let mut alpha = vec![0.0; 25];
+        alpha[12] = 1.0;
+        let dilated = morphology(&alpha, 5, 5, 1, true);
+        assert!(dilated.iter().enumerate().all(|(index, value)| {
+            let inside = (1..=3).contains(&(index % 5)) && (1..=3).contains(&(index / 5));
+            *value == if inside { 1.0 } else { 0.0 }
+        }));
+        let eroded = morphology(&alpha, 5, 5, 1, false);
+        assert!(eroded.iter().all(|value| *value == 0.0));
+    }
+
+    #[test]
+    fn color_overlay_uses_source_coverage_and_keeps_placement() {
+        let effects = LayerEffects {
+            color_overlay: Some(ColorOverlayEffect {
+                color: [1.0, 0.0, 0.0],
+                opacity: 0.5,
+                ..ColorOverlayEffect::default()
+            }),
+            ..LayerEffects::default()
+        };
+        let source = RgbaImage::from_pixel(1, 1, Rgba([255, 255, 255, 255]));
+        let mut transform = Transform::new(1, 1);
+        transform.x = 12.0;
+        transform.y = 9.0;
+        let (image, expanded) = bake_layer_effects(&source, transform, None, effects).unwrap();
+        let margin = effect_margin(&effects);
+        let pixel = image.get_pixel(margin, margin).0;
+        assert_eq!(pixel, [255, 128, 128, 255]);
+        assert_eq!(
+            expanded.point(Point::new(0.5, 0.5)),
+            transform.point(Point::new(0.5, 0.5))
+        );
+    }
+
+    #[test]
+    fn outer_effects_remain_behind_the_source() {
+        let effects = LayerEffects {
+            shadow: Some(ShadowEffect {
+                distance: 2.0,
+                blur: 1.0,
+                ..ShadowEffect::default()
+            }),
+            outer_glow: Some(OuterGlowEffect {
+                size: 2.0,
+                ..OuterGlowEffect::default()
+            }),
+            stroke: Some(StrokeEffect {
+                size: 1.0,
+                ..StrokeEffect::default()
+            }),
+            ..LayerEffects::default()
+        };
+        let source = RgbaImage::from_pixel(3, 3, Rgba([255, 0, 0, 255]));
+        let (image, _) = bake_layer_effects(&source, Transform::new(3, 3), None, effects).unwrap();
+        let margin = effect_margin(&effects);
+        assert!(image.get_pixel(margin, margin + 2)[3] > 0);
+        assert_eq!(image.get_pixel(margin + 1, margin + 1).0, [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn all_effects_bake_and_disabled_effects_do_not_change_pixels() {
+        let effects = LayerEffects {
+            stroke: Some(StrokeEffect::default()),
+            shadow: Some(ShadowEffect::default()),
+            color_overlay: Some(ColorOverlayEffect::default()),
+            inner_shadow: Some(InnerShadowEffect::default()),
+            outer_glow: Some(OuterGlowEffect::default()),
+            inner_glow: Some(InnerGlowEffect::default()),
+        };
+        let source = RgbaImage::from_pixel(2, 2, Rgba([20, 80, 140, 180]));
+        let (image, transform) =
+            bake_layer_effects(&source, Transform::new(2, 2), None, effects).unwrap();
+        assert!(image.width() > source.width());
+        assert!(transform.valid());
+        let disabled = LayerEffects::default();
+        assert!(!disabled.renders());
+        assert!(bake_layer_effects(&source, Transform::new(2, 2), None, disabled).is_none());
+    }
+
+    #[test]
+    fn vignette_uses_selected_color_and_preserves_alpha() {
+        let source = RgbaImage::from_pixel(41, 41, Rgba([128, 128, 128, 128]));
+        let result = filtered(
+            &source,
+            &Filter::Vignette {
+                amount: 100.0,
+                color: [1.0, 0.0, 0.0],
+                midpoint: 50.0,
+                roundness: 0.0,
+                feather: 60.0,
+                highlights: 0.0,
+            },
+        );
+        let center = result.get_pixel(20, 20).0;
+        let corner = result.get_pixel(0, 0).0;
+        assert_eq!(center[3], 128);
+        assert!(center[0].abs_diff(center[1]) <= 2);
+        assert!(corner[0] > corner[1] + 50);
+    }
+
+    #[test]
+    fn vignette_fills_an_empty_layer_and_keeps_effects() {
+        let mut document = Document::new(24, 24).unwrap();
+        let effects = LayerEffects {
+            color_overlay: Some(ColorOverlayEffect::default()),
+            ..LayerEffects::default()
+        };
+        document.active_mut().unwrap().effects = Some(effects);
+        apply_filter(
+            &mut document,
+            &Filter::Vignette {
+                amount: 100.0,
+                color: [1.0, 0.0, 0.0],
+                midpoint: 50.0,
+                roundness: 100.0,
+                feather: 60.0,
+                highlights: 0.0,
+            },
+            false,
+        )
+        .unwrap();
+        let layer = document.active().unwrap();
+        let pixels = layer.pixels.as_ref().unwrap();
+        assert!(pixels.get_pixel(0, 0)[3] > 0);
+        assert_eq!(pixels.get_pixel(12, 12)[3], 0);
+        assert_eq!(layer.effects, Some(effects));
+    }
+
+    #[test]
+    fn bloom_spreads_highlights_through_transparency() {
+        let mut source = RgbaImage::from_pixel(65, 65, Rgba([0, 0, 0, 255]));
+        for y in 30..35 {
+            for x in 30..35 {
+                source.put_pixel(x, y, Rgba([255, 255, 255, 255]));
+            }
+        }
+        let result = filtered(
+            &source,
+            &Filter::BloomGlow {
+                amount: 100.0,
+                radius: 12.0,
+            },
+        );
+        assert!(result.get_pixel(40, 32)[0] > result.get_pixel(2, 2)[0]);
+        assert!(result.get_pixel(40, 32)[0] > 0);
+
+        let mut transparent = RgbaImage::new(65, 65);
+        for y in 30..35 {
+            for x in 30..35 {
+                transparent.put_pixel(x, y, Rgba([255, 255, 255, 255]));
+            }
+        }
+        let spread = filtered(
+            &transparent,
+            &Filter::BloomGlow {
+                amount: 100.0,
+                radius: 12.0,
+            },
+        );
+        assert!(spread.get_pixel(40, 32)[3] > 0);
+    }
+
+    #[test]
+    fn tonal_contrast_expands_midtone_detail_without_changing_alpha() {
+        let source = RgbaImage::from_fn(64, 16, |x, _| {
+            let value = if (x / 8) % 2 == 0 { 102 } else { 153 };
+            Rgba([value, value, value, 255])
+        });
+        let result = filtered(
+            &source,
+            &Filter::TonalContrast {
+                amount: 100.0,
+                radius: 6.0,
+                shadows: 0.0,
+                midtones: 100.0,
+                highlights: 0.0,
+            },
+        );
+        assert!(result.get_pixel(5, 8)[0] < source.get_pixel(5, 8)[0]);
+        assert!(result.get_pixel(13, 8)[0] > source.get_pixel(13, 8)[0]);
+        assert_eq!(result.get_pixel(5, 8)[3], 255);
+    }
+
+    #[test]
+    fn cancelled_finishing_filter_leaves_document_untouched() {
+        let mut document = Document::new(16, 16).unwrap();
+        document.active_mut().unwrap().pixels = Some(Arc::new(RgbaImage::from_pixel(
+            16,
+            16,
+            Rgba([120, 80, 40, 255]),
+        )));
+        let original = document.clone();
+        let cancel = AtomicBool::new(true);
+        assert!(
+            apply_filter_cancellable(
+                &mut document,
+                &Filter::TonalContrast {
+                    amount: 100.0,
+                    radius: 6.0,
+                    shadows: 0.0,
+                    midtones: 100.0,
+                    highlights: 0.0,
+                },
+                false,
+                &cancel,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            document.active().unwrap().pixels,
+            original.active().unwrap().pixels
+        );
+        assert_eq!(
+            document.active().unwrap().transform,
+            original.active().unwrap().transform
+        );
+    }
 
     // The original implementation is an independent reference for sampling and alpha.
     fn reference_motion_blur(image: &RgbaImage, distance: f32, angle: f32) -> RgbaImage {

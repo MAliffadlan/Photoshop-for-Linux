@@ -25,6 +25,7 @@ use crate::{
 
 const MAX_MANIFEST: u64 = 4 * 1024 * 1024;
 const MAX_ASSET: u64 = 512 * 1024 * 1024;
+const MAX_SVG_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Format identifier written into `manifest.json`.
 const FORMAT_ID: &str = "me.silverl.mectov";
@@ -71,6 +72,53 @@ fn decode_image(bytes: Vec<u8>, used: &mut u64) -> Result<DynamicImage> {
     Ok(image)
 }
 
+fn decode_svg(data: &[u8]) -> Result<RgbaImage> {
+    ensure!(data.len() as u64 <= MAX_SVG_BYTES, "SVG exceeds 64 MiB");
+    let decompressed = if data.starts_with(&[0x1f, 0x8b]) {
+        let decoder = flate2::read::GzDecoder::new(data);
+        let mut decoded = Vec::new();
+        decoder
+            .take(MAX_SVG_BYTES + 1)
+            .read_to_end(&mut decoded)
+            .map_err(|_| anyhow::anyhow!("Invalid SVGZ"))?;
+        ensure!(decoded.len() as u64 <= MAX_SVG_BYTES, "SVGZ exceeds 64 MiB");
+        Some(decoded)
+    } else {
+        None
+    };
+    let data = decompressed.as_deref().unwrap_or(data);
+    let options = resvg::usvg::Options {
+        resources_dir: None,
+        image_href_resolver: resvg::usvg::ImageHrefResolver {
+            resolve_data: resvg::usvg::ImageHrefResolver::default_data_resolver(),
+            resolve_string: Box::new(|_, _| None),
+        },
+        ..Default::default()
+    };
+    let tree = resvg::usvg::Tree::from_data(data, &options)
+        .map_err(|error| anyhow::anyhow!("Invalid SVG: {error}"))?;
+    let size = tree.size();
+    ensure!(
+        size.width().is_finite()
+            && size.height().is_finite()
+            && size.width() > 0.0
+            && size.height() > 0.0,
+        "SVG has invalid dimensions"
+    );
+    let width = size.width().ceil() as u32;
+    let height = size.height().ceil() as u32;
+    validate_size(width, height)?;
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height)
+        .context("SVG dimensions exceed the rasterizer limits")?;
+    resvg::render(
+        &tree,
+        resvg::tiny_skia::Transform::identity(),
+        &mut pixmap.as_mut(),
+    );
+    RgbaImage::from_raw(width, height, pixmap.take_demultiplied())
+        .context("SVG rasterizer returned an invalid image")
+}
+
 pub fn import_image(path: &Path) -> Result<RgbaImage> {
     let metadata = fs::metadata(path).with_context(|| format!("Cannot read {}", path.display()))?;
     ensure!(metadata.len() <= MAX_ASSET, "Image exceeds 512 MiB");
@@ -79,6 +127,10 @@ pub fn import_image(path: &Path) -> Result<RgbaImage> {
         .and_then(|s| s.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
+    if matches!(extension.as_str(), "svg" | "svgz") {
+        ensure!(metadata.len() <= MAX_SVG_BYTES, "SVG exceeds 64 MiB");
+        return decode_svg(&fs::read(path)?);
+    }
     if matches!(extension.as_str(), "heic" | "heif" | "hif") {
         let temporary = tempfile::tempdir()?;
         let output = temporary.path().join("image.png");
@@ -123,6 +175,13 @@ pub fn save(document: &Document, path: &Path) -> Result<()> {
         // Guides, layer effects and the 1.2.3 blur and noise adjustment layers all raise the version,
         // because an older reader must refuse the file rather than silently drop what it cannot draw.
         let version = if document.layers.iter().any(|layer| {
+            layer
+                .shape
+                .as_ref()
+                .is_some_and(|shape| shape.kind == crate::paint::ShapeKind::Line)
+        }) {
+            5
+        } else if document.layers.iter().any(|layer| {
             layer.adjustment.as_ref().is_some_and(|adjustment| {
                 matches!(
                     adjustment,
@@ -212,7 +271,7 @@ pub fn load(path: &Path) -> Result<Document> {
     let mut manifest: Manifest =
         serde_json::from_slice(&zip_read(&mut archive, "manifest.json", MAX_MANIFEST)?)?;
     ensure!(
-        READ_FORMATS.contains(&manifest.format.as_str()) && (1..=4).contains(&manifest.version),
+        READ_FORMATS.contains(&manifest.format.as_str()) && (1..=5).contains(&manifest.version),
         "Unsupported mectov project version"
     );
     let mut used_pixels = 0;
@@ -315,6 +374,31 @@ fn comp_transform(value: &Value) -> Result<Transform> {
     };
     ensure!(t.valid(), "Invalid Compositor layer transform");
     Ok(t)
+}
+
+fn comp_point(value: &Value, key: &str) -> Result<Option<Point>> {
+    let value = &value[key];
+    if value.is_null() {
+        return Ok(None);
+    }
+    let (x, y) = if let Some(values) = value.as_array() {
+        ensure!(values.len() == 2, "Invalid line endpoint");
+        (values[0].as_f64(), values[1].as_f64())
+    } else {
+        (value["x"].as_f64(), value["y"].as_f64())
+    };
+    let point = Point::new(
+        x.context("Missing line endpoint")? as f32,
+        y.context("Missing line endpoint")? as f32,
+    );
+    ensure!(
+        point.x.is_finite()
+            && point.y.is_finite()
+            && (0.0..=1.0).contains(&point.x)
+            && (0.0..=1.0).contains(&point.y),
+        "Invalid line endpoint"
+    );
+    Ok(Some(point))
 }
 
 // Swift dictionaries with enum keys are encoded as alternating key/value arrays.
@@ -691,30 +775,44 @@ pub fn load_compositor(path: &Path) -> Result<Document> {
                 },
             });
         }
-        // A line shape's pixels live in the layer asset. mectov has no live line shape yet, so the layer stays
-        // plain pixels rather than redrawing as a rectangle.
-        if let Some(shape) = record["shape"]
-            .as_object()
-            .filter(|_| record["shape"]["kind"].as_str() != Some("Line"))
-        {
-            let radius = shape
-                .get("cornerRadius")
-                .and_then(Value::as_f64)
-                .unwrap_or(0.0) as f32;
+        if record["shape"].is_object() {
+            let shape = &record["shape"];
+            let radius = number(shape, "cornerRadius", 0.0);
             ensure!(radius.is_finite() && radius >= 0.0, "Invalid shape radius");
-            let kind = if record["shape"]["kind"] == "Ellipse" {
+            let kind = if shape["kind"] == "Ellipse" {
                 crate::paint::ShapeKind::Ellipse
+            } else if shape["kind"] == "Line" {
+                crate::paint::ShapeKind::Line
             } else if radius > 0.0 {
                 crate::paint::ShapeKind::RoundedRectangle
             } else {
                 crate::paint::ShapeKind::Rectangle
             };
-            let color =
-                |key| (number(&record["shape"], key, 0.0).clamp(0.0, 1.0) * 255.0).round() as u8;
+            let color = |key| (number(shape, key, 0.0).clamp(0.0, 1.0) * 255.0).round() as u8;
+            let line_width =
+                (kind == crate::paint::ShapeKind::Line).then(|| number(shape, "lineWidth", 1.0));
+            if let Some(line_width) = line_width {
+                ensure!(
+                    line_width.is_finite()
+                        && (0.0..=crate::document::MAX_SHAPE_SIZE).contains(&line_width),
+                    "Invalid line width"
+                );
+            }
             layer.shape = Some(crate::document::ShapeStyle {
                 kind,
                 color: [color("red"), color("green"), color("blue"), 255],
                 corner_radius: radius,
+                line_width,
+                start: if kind == crate::paint::ShapeKind::Line {
+                    comp_point(shape, "start")?
+                } else {
+                    None
+                },
+                end: if kind == crate::paint::ShapeKind::Line {
+                    comp_point(shape, "end")?
+                } else {
+                    None
+                },
             });
         }
         if !record["adjustment"].is_null() {
@@ -802,6 +900,38 @@ pub fn export(document: &Document, path: &Path, quality: u8) -> Result<()> {
 mod tests {
     use super::*;
     use image::{GrayImage, Luma, Rgba};
+
+    #[test]
+    fn imports_svg_with_intrinsic_dimensions_and_blocks_external_images() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("shape.svg");
+        fs::write(
+            &path,
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="3"><rect width="4" height="3" fill="#ff0000"/><image href="outside.png" x="0" y="0" width="4" height="3"/></svg>"##,
+        )
+        .unwrap();
+        let image = import_image(&path).unwrap();
+        assert_eq!(image.dimensions(), (4, 3));
+        assert_eq!(image.get_pixel(2, 1).0, [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn imports_svgz_data() {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder
+            .write_all(br##"<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2"><rect width="2" height="2" fill="#00ff00"/></svg>"##)
+            .unwrap();
+        let compressed = encoder.finish().unwrap();
+        let image = decode_svg(&compressed).unwrap();
+        assert_eq!(image.dimensions(), (2, 2));
+        assert_eq!(image.get_pixel(0, 0).0, [0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn rejects_invalid_svg_before_rasterizing() {
+        assert!(decode_svg(b"<svg><rect/>").is_err());
+        assert!(decode_svg(b"not an svg").is_err());
+    }
 
     #[test]
     fn exports_all_formats_and_png_print_resolution() {
@@ -1317,7 +1447,7 @@ mod tests {
     }
 
     #[test]
-    fn line_shapes_import_as_pixels_and_ordinary_shapes_stay_live() {
+    fn line_shapes_import_as_live_geometry_and_ordinary_shapes_stay_live() {
         let directory = tempfile::tempdir().unwrap();
         fs::create_dir(directory.path().join("images")).unwrap();
         let id = Uuid::new_v4();
@@ -1337,7 +1467,11 @@ mod tests {
         )
         .unwrap();
         let document = load_compositor(directory.path()).unwrap();
-        assert!(document.layers[0].shape.is_none());
+        let shape = document.layers[0].shape.as_ref().unwrap();
+        assert_eq!(shape.kind, crate::paint::ShapeKind::Line);
+        assert_eq!(shape.line_width, Some(3.0));
+        assert_eq!(shape.start, Some(Point::new(0.0, 0.0)));
+        assert_eq!(shape.end, Some(Point::new(1.0, 1.0)));
         assert!(document.layers[0].pixels.is_some());
         manifest["layers"][0]["shape"] =
             serde_json::json!({"kind":"Ellipse","red":0,"green":0,"blue":0,"cornerRadius":0});
@@ -1351,5 +1485,46 @@ mod tests {
             document.layers[0].shape.as_ref().map(|shape| shape.kind),
             Some(crate::paint::ShapeKind::Ellipse)
         );
+    }
+
+    #[test]
+    fn live_line_metadata_round_trips_in_the_current_project_format() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("line.mectov");
+        let mut document = Document::new(32, 24).unwrap();
+        document.insert(
+            crate::paint::shape(
+                Point::new(4.0, 6.0),
+                Point::new(24.0, 16.0),
+                crate::paint::ShapeKind::Line,
+                [25, 75, 225, 255],
+                0.0,
+                5.0,
+            )
+            .unwrap(),
+        );
+        save(&document, &path).unwrap();
+        let mut archive = ZipArchive::new(File::open(&path).unwrap()).unwrap();
+        let stored: Value =
+            serde_json::from_slice(&zip_read(&mut archive, "manifest.json", MAX_MANIFEST).unwrap())
+                .unwrap();
+        assert_eq!(stored["version"], 5);
+        let loaded = load(&path).unwrap();
+        let line = loaded.layers.len() - 1;
+        assert_eq!(loaded.layers[line].shape, document.layers[line].shape);
+    }
+
+    #[test]
+    fn existing_shape_metadata_without_line_fields_still_deserializes() {
+        let style: crate::document::ShapeStyle = serde_json::from_value(serde_json::json!({
+            "kind": "RoundedRectangle",
+            "color": [10, 20, 30, 255],
+            "corner_radius": 8.0
+        }))
+        .unwrap();
+        assert_eq!(style.kind, crate::paint::ShapeKind::RoundedRectangle);
+        assert_eq!(style.line_width, None);
+        assert_eq!(style.start, None);
+        assert_eq!(style.end, None);
     }
 }

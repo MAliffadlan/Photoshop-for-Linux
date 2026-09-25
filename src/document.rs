@@ -11,6 +11,7 @@ pub const MAX_SIDE: u32 = 30_000;
 pub const MAX_PIXELS: u64 = 100_000_000;
 pub const MAX_LAYERS: usize = 10_000;
 pub const MAX_GUIDES: usize = 1_024;
+pub const MAX_SHAPE_SIZE: f32 = 5_000.0;
 /// Longest stroke width, shadow blur and glow size Compositor accepts, in document pixels.
 pub const MAX_EFFECT_SIZE: f32 = 500.0;
 /// Longest shadow distance Compositor accepts, in document pixels.
@@ -342,11 +343,17 @@ impl Adjustment {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ShapeStyle {
     pub kind: crate::paint::ShapeKind,
     pub color: [u8; 4],
     pub corner_radius: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_width: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start: Option<Point>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end: Option<Point>,
 }
 
 /// A user-placed alignment line. Horizontal guides sit at a document Y; vertical ones at a document X.
@@ -542,6 +549,32 @@ impl LayerEffects {
             && self.inner_shadow.is_none()
             && self.outer_glow.is_none()
             && self.inner_glow.is_none()
+    }
+
+    pub fn renders(&self) -> bool {
+        self.stroke
+            .as_ref()
+            .is_some_and(|effect| effect.enabled && effect.size > 0.0 && effect.opacity > 0.0)
+            || self
+                .shadow
+                .as_ref()
+                .is_some_and(|effect| effect.enabled && effect.opacity > 0.0)
+            || self
+                .color_overlay
+                .as_ref()
+                .is_some_and(|effect| effect.enabled && effect.opacity > 0.0)
+            || self
+                .inner_shadow
+                .as_ref()
+                .is_some_and(|effect| effect.enabled && effect.opacity > 0.0)
+            || self
+                .outer_glow
+                .as_ref()
+                .is_some_and(|effect| effect.enabled && effect.size > 0.0 && effect.opacity > 0.0)
+            || self
+                .inner_glow
+                .as_ref()
+                .is_some_and(|effect| effect.enabled && effect.size > 0.0 && effect.opacity > 0.0)
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -835,9 +868,24 @@ impl Document {
                 );
             }
             if let Some(shape) = &layer.shape {
+                let point_in_range = |point: &Point| {
+                    point.x.is_finite()
+                        && point.y.is_finite()
+                        && (0.0..=1.0).contains(&point.x)
+                        && (0.0..=1.0).contains(&point.y)
+                };
+                let line_geometry = if shape.kind == crate::paint::ShapeKind::Line {
+                    shape.line_width.is_none_or(|width| {
+                        width.is_finite() && (0.0..=MAX_SHAPE_SIZE).contains(&width)
+                    }) && shape.start.as_ref().is_none_or(point_in_range)
+                        && shape.end.as_ref().is_none_or(point_in_range)
+                } else {
+                    shape.line_width.is_none() && shape.start.is_none() && shape.end.is_none()
+                };
                 ensure!(
                     shape.corner_radius.is_finite()
                         && shape.corner_radius >= 0.0
+                        && line_geometry
                         && layer.pixels.is_some(),
                     "Invalid live shape"
                 );

@@ -3,6 +3,120 @@ use super::*;
 // Tests that publish images share the desktop's system clipboard.
 static CLIPBOARD_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+fn psd_u16(bytes: &mut Vec<u8>, value: u16) {
+    bytes.extend_from_slice(&value.to_be_bytes());
+}
+
+fn psd_i16(bytes: &mut Vec<u8>, value: i16) {
+    bytes.extend_from_slice(&value.to_be_bytes());
+}
+
+fn psd_u32(bytes: &mut Vec<u8>, value: u32) {
+    bytes.extend_from_slice(&value.to_be_bytes());
+}
+
+fn psd_i32(bytes: &mut Vec<u8>, value: i32) {
+    bytes.extend_from_slice(&value.to_be_bytes());
+}
+
+fn minimal_psd_bytes() -> Vec<u8> {
+    let mut extra = Vec::new();
+    psd_u32(&mut extra, 0);
+    psd_u32(&mut extra, 0);
+    extra.push(1);
+    extra.push(b'A');
+    extra.extend([0; 2]);
+    let mut record = Vec::new();
+    for value in [0, 0, 2, 2] {
+        psd_i32(&mut record, value);
+    }
+    psd_u16(&mut record, 4);
+    for id in [0i16, 1, 2, -1] {
+        psd_i16(&mut record, id);
+        psd_u32(&mut record, 6);
+    }
+    record.extend_from_slice(b"8BIMnorm");
+    record.extend([255, 0, 0, 0]);
+    psd_u32(&mut record, extra.len() as u32);
+    record.extend(extra);
+    let mut layer_info = Vec::new();
+    psd_i16(&mut layer_info, 1);
+    layer_info.extend(record);
+    for values in [
+        [255u8, 0, 0, 255],
+        [0, 255, 0, 255],
+        [0, 0, 255, 255],
+        [255, 255, 255, 255],
+    ] {
+        layer_info.extend([0, 0]);
+        layer_info.extend(values);
+    }
+    let mut layer_mask = Vec::new();
+    psd_u32(&mut layer_mask, layer_info.len() as u32);
+    layer_mask.extend(layer_info);
+    psd_u32(&mut layer_mask, 0);
+    let mut result = Vec::new();
+    result.extend_from_slice(b"8BPS");
+    psd_u16(&mut result, 1);
+    result.extend([0; 6]);
+    psd_u16(&mut result, 4);
+    psd_u32(&mut result, 2);
+    psd_u32(&mut result, 2);
+    psd_u16(&mut result, 8);
+    psd_u16(&mut result, 3);
+    psd_u32(&mut result, 0);
+    psd_u32(&mut result, 0);
+    psd_u32(&mut result, layer_mask.len() as u32);
+    result.extend(layer_mask);
+    result.extend([0; 18]);
+    result
+}
+
+#[test]
+fn opens_svg_as_layer() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("vector.svg");
+    std::fs::write(
+        &path,
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="3"><rect width="4" height="3" fill="#0000ff"/></svg>"##,
+    )
+    .unwrap();
+    let (_context, mut app) = app();
+    app.dimensions = [8, 6];
+    app.new_document();
+    app.open_path(&path, true);
+    assert!(app.error.is_none(), "{:?}", app.error);
+    let document = &app.session().unwrap().document;
+    assert_eq!(document.layers.len(), 2);
+    let layer = document.active().unwrap();
+    assert_eq!(layer.transform.x, 2.0);
+    assert_eq!(layer.transform.y, 1.5);
+    assert_eq!(
+        layer.pixels.as_ref().unwrap().get_pixel(0, 0).0,
+        [0, 0, 255, 255]
+    );
+}
+
+#[test]
+fn opens_psd_as_a_new_project() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("sample.psd");
+    std::fs::write(&path, minimal_psd_bytes()).unwrap();
+    let (_context, mut app) = app();
+    app.open_path(&path, true);
+    assert!(app.error.is_none(), "{:?}", app.error);
+    assert_eq!(app.sessions.len(), 1);
+    assert_eq!(app.session().unwrap().title, "sample");
+    assert!(app.session().unwrap().path.is_none());
+    assert_eq!(app.session().unwrap().document.layers.len(), 1);
+
+    let invalid = directory.path().join("invalid.psd");
+    std::fs::write(&invalid, b"not a psd").unwrap();
+    app.open_path(&invalid, false);
+    assert_eq!(app.sessions.len(), 1);
+    assert!(app.error.is_some());
+}
+
 #[test]
 fn text_tool_creates_edits_and_undoes_one_transaction() {
     let (context, mut app) = app();
@@ -962,6 +1076,91 @@ fn keyboard_frame(
 }
 
 #[test]
+fn layer_effect_dialog_previews_and_commits_one_undoable_edit() {
+    let (context, mut app) = app();
+    app.dimensions = [32, 24];
+    app.new_document();
+    app.command("fill_fg");
+    let id = app.session().unwrap().document.active.unwrap();
+    app.edit_layer_effects(id);
+    assert!(app.dialog == Some(Dialog::Effect));
+    frame(&context, &mut app);
+    let edit = app.effect.as_mut().unwrap();
+    edit.layer_effects.as_mut().unwrap().stroke = Some(mectov::document::StrokeEffect {
+        size: 2.0,
+        ..mectov::document::StrokeEffect::default()
+    });
+    edit.refresh = true;
+    frame(&context, &mut app);
+    let rendered = render::render(&app.session().unwrap().document);
+    assert!(rendered.get_pixel(1, 12)[3] > 0);
+    let apply = layer_label(&context, &mut app, "Apply") + Vec2::splat(5.0);
+    pointer_frame(&context, &mut app, apply, Some(true), egui::Modifiers::NONE);
+    pointer_frame(
+        &context,
+        &mut app,
+        apply,
+        Some(false),
+        egui::Modifiers::NONE,
+    );
+    assert!(app.dialog.is_none());
+    assert!(app.effect.is_none());
+    assert_eq!(
+        app.session().unwrap().history.undo_name(),
+        Some("Layer Effects")
+    );
+    app.command("undo");
+    assert!(
+        app.session()
+            .unwrap()
+            .document
+            .active()
+            .unwrap()
+            .effects
+            .is_none()
+    );
+}
+
+#[test]
+fn whole_layer_clipboard_preserves_effects_and_is_undoable() {
+    let (context, mut app) = app();
+    let mut document = Document::new(24, 18).unwrap();
+    document.layers.clear();
+    let mut layer = Layer::image(
+        "Structured",
+        RgbaImage::from_pixel(6, 5, image::Rgba([30, 120, 240, 255])),
+    );
+    layer.transform.x = 7.0;
+    layer.transform.y = 4.0;
+    layer.effects = Some(mectov::document::LayerEffects {
+        outer_glow: Some(mectov::document::OuterGlowEffect::default()),
+        ..Default::default()
+    });
+    document.insert(layer);
+    let id = document.active.unwrap();
+    app.sessions
+        .push(Session::new(document, "Layers".into(), None));
+    assert!(app.copy_selected_layers(false));
+    app.paste_content(super::clipboard::ClipboardContent::Layers);
+    frame(&context, &mut app);
+    let session = app.session().unwrap();
+    assert_eq!(session.document.layers.len(), 2);
+    let pasted = session
+        .document
+        .layers
+        .iter()
+        .find(|layer| layer.id != id)
+        .unwrap();
+    assert_eq!(
+        pasted.effects.as_ref().unwrap().outer_glow,
+        Some(mectov::document::OuterGlowEffect::default())
+    );
+    assert_eq!(pasted.transform.x, 7.0);
+    app.command("undo");
+    assert_eq!(app.session().unwrap().document.layers.len(), 1);
+}
+
+#[test]
 fn native_clipboard_shortcuts_copy_cut_and_paste_selected_pixels() {
     let _clipboard_guard = CLIPBOARD_TEST_LOCK.lock().unwrap();
     let (context, mut app) = app();
@@ -1282,6 +1481,23 @@ fn clipboard_file_paste_imports_multiple_images_in_one_undo_step() {
     assert_eq!(app.session().unwrap().document.layers.len(), 1);
     app.command("redo");
     assert_eq!(app.session().unwrap().document.layers.len(), 3);
+}
+
+#[test]
+fn clipboard_psd_file_opens_a_new_session() {
+    use super::clipboard::ClipboardContent;
+
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("clipboard.psd");
+    std::fs::write(&path, minimal_psd_bytes()).unwrap();
+    let (_, mut app) = app();
+    app.dimensions = [20, 16];
+    app.new_document();
+    app.paste_content(ClipboardContent::Files(vec![path]));
+    assert!(app.error.is_none(), "{:?}", app.error);
+    assert_eq!(app.sessions.len(), 2);
+    assert_eq!(app.session().unwrap().document.width, 2);
+    assert!(app.session().unwrap().path.is_none());
 }
 
 #[test]
@@ -2245,6 +2461,46 @@ fn pointer_brush_selection_and_pixel_move_are_undoable() {
     assert_eq!(
         render::render(&app.session().unwrap().document)
             .get_pixel(20, 20)
+            .0,
+        [255, 0, 0, 255]
+    );
+}
+
+#[test]
+fn smoothed_brush_stays_contiguous_and_is_one_undo_step() {
+    let (context, mut app) = app();
+    app.dimensions = [64, 32];
+    app.new_document();
+    app.brush.diameter = 3.0;
+    app.brush.hardness = 1.0;
+    app.brush.smoothing = 6.0;
+    app.brush.color = [255, 0, 0, 255];
+    app.set_tool(Tool::Brush);
+
+    drag(
+        &context,
+        &mut app,
+        Point::new(8.0, 16.0),
+        Point::new(52.0, 16.0),
+        egui::Modifiers::NONE,
+    );
+
+    assert!(app.error.is_none(), "{:?}", app.error);
+    let painted = render::render(&app.session().unwrap().document);
+    for x in 9..52 {
+        assert_eq!(painted.get_pixel(x, 16)[3], 255, "gap at {x}");
+    }
+    assert_eq!(app.session().unwrap().history.undo_name(), Some("Brush"));
+
+    app.command("undo");
+    assert_eq!(
+        render::render(&app.session().unwrap().document).get_pixel(30, 16)[3],
+        0
+    );
+    app.command("redo");
+    assert_eq!(
+        render::render(&app.session().unwrap().document)
+            .get_pixel(30, 16)
             .0,
         [255, 0, 0, 255]
     );

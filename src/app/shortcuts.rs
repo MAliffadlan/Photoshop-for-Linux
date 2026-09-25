@@ -154,11 +154,17 @@ impl EditorApp {
                     self.polygonal = !self.polygonal;
                 }
                 if modifiers.shift && tool == Tool::Shape {
-                    self.shape_kind = if self.shape_kind == mectov::paint::ShapeKind::Ellipse {
-                        mectov::paint::ShapeKind::Rectangle
-                    } else {
-                        mectov::paint::ShapeKind::Ellipse
-                    };
+                    let kinds = [
+                        mectov::paint::ShapeKind::Rectangle,
+                        mectov::paint::ShapeKind::RoundedRectangle,
+                        mectov::paint::ShapeKind::Ellipse,
+                        mectov::paint::ShapeKind::Line,
+                    ];
+                    let index = kinds
+                        .iter()
+                        .position(|kind| *kind == self.shape_kind)
+                        .unwrap_or(0);
+                    self.shape_kind = kinds[(index + 1) % kinds.len()];
                 }
                 self.set_tool(tool);
             }

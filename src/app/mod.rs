@@ -31,13 +31,13 @@ use egui::{Pos2, TextureHandle, Vec2};
 use image::{GrayImage, RgbaImage};
 use mectov::{
     blend::BlendMode,
-    document::{Adjustment, Document, Layer, Mask, Point, Transform},
+    document::{Adjustment, Document, Layer, LayerEffects, Mask, Point, Transform},
     effects::Filter,
     history::History,
     io, operations,
     paint::{self, Brush, PaintMode, ShapeKind},
     render,
-    selection::SelectionMode,
+    selection::{self, SelectionMode},
 };
 use serde::{Deserialize, Serialize};
 
@@ -296,12 +296,19 @@ enum Dialog {
     About,
 }
 
+#[derive(Clone)]
+struct LayerClipboard {
+    source: Document,
+    roots: Vec<Uuid>,
+}
+
 struct EffectEdit {
     original: Document,
     // The histogram uses the immutable original, independent of live preview edits.
     levels_source: Option<RgbaImage>,
     adjustment: Option<Adjustment>,
     filter: Option<Filter>,
+    layer_effects: Option<LayerEffects>,
     filter_preview: filter_preview::FilterPreview,
     as_layer: bool,
     preview: bool,
@@ -381,6 +388,7 @@ pub struct EditorApp {
     radial: bool,
     shape_kind: ShapeKind,
     corner_radius: f32,
+    line_width: f32,
     text_style: mectov::text::TextStyle,
     text_renderer: Option<mectov::text::TextRenderer>,
     text_edit: Option<text_controls::TextEdit>,
@@ -397,6 +405,7 @@ pub struct EditorApp {
     last_brush: Option<Point>,
     gesture: Option<Gesture>,
     crop_rect: Option<(Point, Point)>,
+    crop_ratio: Option<f32>,
     guides: Vec<(bool, f32)>,
     dialog: Option<Dialog>,
     dimensions: [u32; 2],
@@ -410,6 +419,7 @@ pub struct EditorApp {
     close_app: bool,
     allow_close: bool,
     clipboard: Option<(RgbaImage, Point)>,
+    layer_clipboard: Option<LayerClipboard>,
     system_clipboard: Option<arboard::Clipboard>,
     jpeg_quality: u8,
     export_format: String,
@@ -507,6 +517,7 @@ impl EditorApp {
             radial: false,
             shape_kind: ShapeKind::Rectangle,
             corner_radius: 16.0,
+            line_width: 4.0,
             text_style: mectov::text::TextStyle::default(),
             text_renderer: None,
             text_edit: None,
@@ -523,6 +534,7 @@ impl EditorApp {
             last_brush: None,
             gesture: None,
             crop_rect: None,
+            crop_ratio: None,
             guides: Vec::new(),
             dialog: None,
             dimensions: [1920, 1080],
@@ -536,6 +548,7 @@ impl EditorApp {
             close_app: false,
             allow_close: false,
             clipboard: None,
+            layer_clipboard: None,
             system_clipboard: None,
             jpeg_quality: 90,
             export_format: "png".into(),
@@ -652,8 +665,11 @@ impl EditorApp {
             self.queue_raw(path, as_layer);
             return;
         }
+        let photoshop = mectov::psd::is_document(path);
         let project = path.is_dir() || io::is_project_path(path);
-        let result = if project {
+        let result = if photoshop {
+            mectov::psd::load(path)
+        } else if project {
             io::load(path)
         } else {
             io::import_image(path)
@@ -686,25 +702,27 @@ impl EditorApp {
         };
         match result {
             Ok(document) => {
-                if !project && as_layer && !self.sessions.is_empty() {
+                if !project && !photoshop && as_layer && !self.sessions.is_empty() {
                     return;
                 }
-                let path = if io::is_project_path(path) {
+                let session_path = if project {
                     Some(path.to_path_buf())
                 } else {
                     None
                 };
-                let title = path
-                    .as_ref()
-                    .and_then(|p| p.file_stem())
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_else(|| {
-                        document
-                            .layers
-                            .first()
-                            .map_or("Untitled".into(), |l| l.name.clone())
-                    });
-                self.sessions.push(Session::new(document, title, path));
+                let title = if project || photoshop {
+                    path.file_stem()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned()
+                } else {
+                    document
+                        .layers
+                        .first()
+                        .map_or("Untitled".into(), |layer| layer.name.clone())
+                };
+                self.sessions
+                    .push(Session::new(document, title, session_path));
                 self.current = self.sessions.len() - 1;
                 self.mask_target = false;
                 self.dialog = None;
@@ -742,10 +760,10 @@ impl EditorApp {
     fn open_dialog(&mut self, as_layer: bool) {
         if let Some(paths) = rfd::FileDialog::new()
             .add_filter(
-                "Images and mectov projects",
+                "Images, Photoshop, and mectov projects",
                 &[
                     "mectov", "png", "jpg", "jpeg", "tif", "tiff", "webp", "bmp", "gif", "heic",
-                    "heif",
+                    "heif", "svg", "svgz", "psd", "psb",
                 ]
                 .into_iter()
                 .chain(mectov::raw::RAW_EXTENSIONS)
@@ -825,6 +843,7 @@ impl EditorApp {
             levels_source: None,
             adjustment: Some(adjustment),
             filter: None,
+            layer_effects: None,
             filter_preview: filter_preview::FilterPreview::default(),
             as_layer,
             preview: true,
@@ -845,6 +864,7 @@ impl EditorApp {
             levels_source: None,
             adjustment: None,
             filter: Some(filter),
+            layer_effects: None,
             filter_preview: filter_preview::FilterPreview::default(),
             as_layer: false,
             preview: true,
@@ -868,6 +888,37 @@ impl EditorApp {
         }
     }
 
+    fn edit_layer_effects(&mut self, id: Uuid) {
+        let Some(document) = self.session().map(|session| session.document.clone()) else {
+            return;
+        };
+        let Some(layer) = document.layers.iter().find(|layer| layer.id == id) else {
+            return;
+        };
+        if layer.group || layer.pixels.is_none() {
+            return;
+        }
+        let effects = layer.effects.unwrap_or_default();
+        let Some(session) = self.session_mut() else {
+            return;
+        };
+        session.history.begin("Layer Effects", &session.document);
+        self.effect = Some(EffectEdit {
+            original: session.document.clone(),
+            levels_source: None,
+            adjustment: None,
+            filter: None,
+            layer_effects: Some(effects),
+            filter_preview: filter_preview::FilterPreview::default(),
+            as_layer: false,
+            preview: true,
+            refresh: true,
+            channel: 0,
+            target: Some(id),
+        });
+        self.dialog = Some(Dialog::Effect);
+    }
+
     fn add_demo(&mut self) {
         let mut document = Document::new(1200, 900).unwrap();
         document.layers.clear();
@@ -888,6 +939,7 @@ impl EditorApp {
                 Point::new(944.0, 328.0),
                 ShapeKind::Ellipse,
                 [248, 222, 162, 255],
+                0.0,
                 0.0,
             )
             .unwrap(),
@@ -914,6 +966,15 @@ impl EditorApp {
 
     fn command(&mut self, command: &str) {
         if self.job.is_some() || self.develop.is_some() {
+            return;
+        }
+        if matches!(command, "copy" | "cut")
+            && self.session().is_some_and(|session| {
+                session.document.selection.is_none()
+                    && session.document.active().is_some_and(|layer| !layer.locked)
+            })
+            && self.copy_selected_layers(command == "cut")
+        {
             return;
         }
         match command {
@@ -1123,6 +1184,16 @@ impl EditorApp {
                     doc.selection = Some(Arc::new(mectov::gpu::blur_gray(selection, 3.0)));
                 }
             }),
+            "expand_selection" => self.edit_selection("Expand Selection", |doc| {
+                if let Some(selection) = &doc.selection {
+                    doc.selection = Some(Arc::new(selection::expand_contract(selection, 3)));
+                }
+            }),
+            "contract_selection" => self.edit_selection("Contract Selection", |doc| {
+                if let Some(selection) = &doc.selection {
+                    doc.selection = Some(Arc::new(selection::expand_contract(selection, -3)));
+                }
+            }),
             "fill_fg" | "fill_bg" | "clear" => {
                 let color = if command == "fill_bg" {
                     self.background
@@ -1140,6 +1211,7 @@ impl EditorApp {
                 );
             }
             "copy" | "copy_merged" | "cut" => {
+                self.layer_clipboard = None;
                 let Some(session) = self.session() else {
                     return;
                 };
@@ -1197,6 +1269,7 @@ impl EditorApp {
                 operations::flip_canvas(doc, command == "flip_canvas_h");
                 Ok(())
             }),
+            "trim" => self.edit("Trim", operations::trim),
             "canvas_size" | "image_size" => {
                 if let Some(session) = self.session() {
                     let dimensions = [session.document.width, session.document.height];
