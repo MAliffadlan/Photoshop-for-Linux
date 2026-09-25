@@ -420,7 +420,7 @@ fn read_unicode_name(data: &[u8]) -> Result<String> {
         "Truncated PSD Unicode layer name"
     );
     let units = data[4..4 + byte_length]
-        .chunks_exact(2)
+        .chunks(2)
         .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
         .collect::<Vec<_>>();
     let name = String::from_utf16(&units).context("Invalid PSD Unicode layer name")?;
@@ -460,7 +460,7 @@ fn parse_mask(data: &[u8]) -> Result<Option<RawMask>> {
 fn is_default_blending_ranges(data: &[u8]) -> bool {
     !data.is_empty()
         && data.len().is_multiple_of(4)
-        && data.chunks_exact(4).all(|chunk| chunk == [0, 0, 255, 255])
+        && data.chunks(4).all(|chunk| chunk == [0, 0, 255, 255])
 }
 
 fn read_tagged_blocks(
