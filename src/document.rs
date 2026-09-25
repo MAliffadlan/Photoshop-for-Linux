@@ -16,6 +16,12 @@ pub const MAX_SHAPE_SIZE: f32 = 5_000.0;
 pub const MAX_EFFECT_SIZE: f32 = 500.0;
 /// Longest shadow distance Compositor accepts, in document pixels.
 pub const MAX_EFFECT_DISTANCE: f32 = 5_000.0;
+pub const DEFAULT_GRID_SPACING: f32 = 32.0;
+pub const DEFAULT_GRID_SUBDIVISIONS: u32 = 1;
+pub const MIN_GRID_SPACING: f32 = 1.0;
+pub const MAX_GRID_SPACING: f32 = 5_000.0;
+pub const MIN_GRID_SUBDIVISIONS: u32 = 1;
+pub const MAX_GRID_SUBDIVISIONS: u32 = 100;
 
 pub fn validate_size(width: u32, height: u32) -> Result<()> {
     ensure!(
@@ -370,8 +376,50 @@ pub struct Guide {
     pub position: f32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GridSettings {
+    #[serde(default = "default_grid_spacing")]
+    pub spacing: f32,
+    #[serde(default = "default_grid_subdivisions")]
+    pub subdivisions: u32,
+}
+
+impl Default for GridSettings {
+    fn default() -> Self {
+        Self {
+            spacing: DEFAULT_GRID_SPACING,
+            subdivisions: DEFAULT_GRID_SUBDIVISIONS,
+        }
+    }
+}
+
+impl GridSettings {
+    pub fn minor_spacing(self) -> f32 {
+        self.spacing / self.subdivisions as f32
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.spacing.is_finite()
+                && (MIN_GRID_SPACING..=MAX_GRID_SPACING).contains(&self.spacing),
+            "Invalid grid spacing"
+        );
+        ensure!(
+            (MIN_GRID_SUBDIVISIONS..=MAX_GRID_SUBDIVISIONS).contains(&self.subdivisions),
+            "Invalid grid subdivisions"
+        );
+        Ok(())
+    }
+}
+
 fn visible_by_default() -> bool {
     true
+}
+fn default_grid_spacing() -> f32 {
+    DEFAULT_GRID_SPACING
+}
+fn default_grid_subdivisions() -> u32 {
+    DEFAULT_GRID_SUBDIVISIONS
 }
 fn amount_in_range(value: f32, maximum: f32) -> bool {
     value.is_finite() && (0.0..=maximum).contains(&value)
@@ -720,6 +768,8 @@ pub struct Document {
     /// Alignment guides placed in the document, in the order a Compositor project stored them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub guides: Vec<Guide>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grid: Option<GridSettings>,
     #[serde(skip)]
     pub selected: HashSet<Uuid>,
     #[serde(skip)]
@@ -739,6 +789,7 @@ impl Document {
             selected: HashSet::from([layer.id]),
             layers: vec![layer],
             guides: Vec::new(),
+            grid: None,
             selection: None,
         })
     }
@@ -838,6 +889,9 @@ impl Document {
         ensure!(self.guides.len() <= MAX_GUIDES, "Too many guides");
         for guide in &self.guides {
             ensure!(guide.position.is_finite(), "Invalid guide position");
+        }
+        if let Some(grid) = &self.grid {
+            grid.validate()?;
         }
         let ids: HashSet<_> = self.layers.iter().map(|layer| layer.id).collect();
         ensure!(
@@ -959,6 +1013,7 @@ impl Document {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
 
     #[test]
     fn transform_round_trip_with_rotation_and_flips() {
@@ -1045,5 +1100,70 @@ mod tests {
         assert_eq!(doc.layers.len(), 1);
         assert_eq!(doc.layers[0].clip_to, None);
         doc.validate().unwrap();
+    }
+
+    #[test]
+    fn accepts_valid_grids_and_rejects_out_of_range_ones() {
+        let mut doc = Document::new(8, 8).unwrap();
+        assert_eq!(doc.grid, None);
+        doc.grid = Some(GridSettings {
+            spacing: MIN_GRID_SPACING,
+            subdivisions: MAX_GRID_SUBDIVISIONS,
+        });
+        doc.validate().unwrap();
+        assert_eq!(doc.grid.unwrap().minor_spacing(), 0.01);
+        doc.grid = Some(GridSettings {
+            spacing: MAX_GRID_SPACING,
+            subdivisions: MIN_GRID_SUBDIVISIONS,
+        });
+        doc.validate().unwrap();
+
+        for spacing in [
+            0.0,
+            MIN_GRID_SPACING - 0.5,
+            MAX_GRID_SPACING + 0.5,
+            f32::NAN,
+            f32::INFINITY,
+        ] {
+            doc.grid = Some(GridSettings {
+                spacing,
+                subdivisions: 1,
+            });
+            assert!(doc.validate().is_err(), "spacing {spacing}");
+        }
+        for subdivisions in [0, MAX_GRID_SUBDIVISIONS + 1] {
+            doc.grid = Some(GridSettings {
+                spacing: 16.0,
+                subdivisions,
+            });
+            assert!(doc.validate().is_err(), "subdivisions {subdivisions}");
+        }
+        doc.grid = None;
+        doc.validate().unwrap();
+    }
+
+    #[test]
+    fn reads_documents_saved_before_the_grid_existed() {
+        assert_eq!(GridSettings::default().spacing, DEFAULT_GRID_SPACING);
+        assert_eq!(
+            GridSettings::default().subdivisions,
+            DEFAULT_GRID_SUBDIVISIONS
+        );
+        let value = serde_json::json!({
+            "id": Uuid::new_v4(),
+            "width": 2,
+            "height": 2,
+            "resolution": 72.0,
+            "layers": [],
+            "active": Value::Null,
+        });
+        let document: Document = serde_json::from_value(value).unwrap();
+        assert_eq!(document.grid, None);
+        let stored = serde_json::to_value(&document).unwrap();
+        assert!(stored.get("grid").is_none());
+        let grid: GridSettings =
+            serde_json::from_value(serde_json::json!({"spacing": 12.0})).unwrap();
+        assert_eq!(grid.spacing, 12.0);
+        assert_eq!(grid.subdivisions, DEFAULT_GRID_SUBDIVISIONS);
     }
 }

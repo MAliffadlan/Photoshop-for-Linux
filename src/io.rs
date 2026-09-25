@@ -172,9 +172,12 @@ pub fn save(document: &Document, path: &Path) -> Result<()> {
         let mut archive = ZipWriter::new(temporary.as_file_mut());
         let options =
             SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
-        // Guides, layer effects and the 1.2.3 blur and noise adjustment layers all raise the version,
-        // because an older reader must refuse the file rather than silently drop what it cannot draw.
-        let version = if document.layers.iter().any(|layer| {
+        // Guides, layer effects, the 1.2.3 blur and noise adjustment layers and the layout grid all
+        // raise the version, because an older reader must refuse the file rather than silently drop
+        // what it cannot draw.
+        let version = if document.grid.is_some() {
+            6
+        } else if document.layers.iter().any(|layer| {
             layer
                 .shape
                 .as_ref()
@@ -271,7 +274,7 @@ pub fn load(path: &Path) -> Result<Document> {
     let mut manifest: Manifest =
         serde_json::from_slice(&zip_read(&mut archive, "manifest.json", MAX_MANIFEST)?)?;
     ensure!(
-        READ_FORMATS.contains(&manifest.format.as_str()) && (1..=5).contains(&manifest.version),
+        READ_FORMATS.contains(&manifest.format.as_str()) && (1..=6).contains(&manifest.version),
         "Unsupported mectov project version"
     );
     let mut used_pixels = 0;
@@ -899,7 +902,16 @@ pub fn export(document: &Document, path: &Path, quality: u8) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::document::GridSettings;
     use image::{GrayImage, Luma, Rgba};
+
+    fn saved_version(path: &Path) -> u64 {
+        let mut archive = ZipArchive::new(File::open(path).unwrap()).unwrap();
+        let manifest: Value =
+            serde_json::from_slice(&zip_read(&mut archive, "manifest.json", MAX_MANIFEST).unwrap())
+                .unwrap();
+        manifest["version"].as_u64().unwrap()
+    }
 
     #[test]
     fn imports_svg_with_intrinsic_dimensions_and_blocks_external_images() {
@@ -1444,6 +1456,72 @@ mod tests {
         let loaded = load(&path).unwrap();
         assert_eq!(loaded.guides, document.guides);
         assert_eq!(loaded.layers[0].effects, document.layers[0].effects);
+    }
+
+    #[test]
+    fn grid_projects_write_version_six_and_older_features_keep_their_version() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("grid.mectov");
+        let mut document = Document::new(64, 64).unwrap();
+        save(&document, &path).unwrap();
+        assert_eq!(saved_version(&path), 1);
+        document.guides.push(Guide {
+            axis: GuideAxis::Vertical,
+            position: 8.0,
+        });
+        save(&document, &path).unwrap();
+        assert_eq!(saved_version(&path), 3);
+        assert_eq!(load(&path).unwrap().grid, None);
+        document.grid = Some(GridSettings {
+            spacing: 16.0,
+            subdivisions: 4,
+        });
+        save(&document, &path).unwrap();
+        assert_eq!(saved_version(&path), 6);
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.grid, document.grid);
+        assert_eq!(loaded.guides, document.guides);
+    }
+
+    #[test]
+    fn reads_version_six_projects_and_refuses_later_ones() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("six.mectov");
+        let mut document = Document::new(2, 2).unwrap();
+        document.grid = Some(GridSettings {
+            spacing: 8.0,
+            subdivisions: 2,
+        });
+        let write = |manifest: &Value| {
+            let mut archive = ZipWriter::new(File::create(&path).unwrap());
+            archive
+                .start_file("manifest.json", SimpleFileOptions::default())
+                .unwrap();
+            archive
+                .write_all(&serde_json::to_vec(manifest).unwrap())
+                .unwrap();
+            archive.finish().unwrap();
+        };
+        let mut manifest = serde_json::json!({
+            "format": FORMAT_ID,
+            "version": 6,
+            "document": document,
+            "pixel_layers": [],
+        });
+        write(&manifest);
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.grid.unwrap().minor_spacing(), 4.0);
+
+        manifest["document"]["grid"] = serde_json::json!({"spacing": 0.0, "subdivisions": 1});
+        write(&manifest);
+        assert_eq!(load(&path).unwrap_err().to_string(), "Invalid grid spacing");
+
+        manifest["version"] = serde_json::json!(7);
+        write(&manifest);
+        assert_eq!(
+            load(&path).unwrap_err().to_string(),
+            "Unsupported mectov project version"
+        );
     }
 
     #[test]
