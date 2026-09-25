@@ -2646,9 +2646,7 @@ fn levels_reuses_original_histogram_source_until_dialog_closes() {
                 );
             }
 
-            eprintln!("PRE-APPLY grid={:?}", app.session().unwrap().document.grid);
             let apply = layer_label(&context, &mut app, "Apply") + Vec2::splat(5.0);
-            eprintln!("APPLY AT {apply:?}");
             pointer_frame(&context, &mut app, apply, Some(true), egui::Modifiers::NONE);
             pointer_frame(
                 &context,
@@ -4147,4 +4145,141 @@ fn grid_snapping_can_be_disabled_per_target() {
     // The right edge is the closest grid multiple, so the 50 px wide layer
     // settles with its right edge on 72 and its left edge on 22.
     assert!((x + 50.0 - 72.0).abs() < 0.01, "{x}");
+}
+
+fn canvas_lines(output: &egui::FullOutput, color: egui::Color32) -> Vec<[Pos2; 2]> {
+    output
+        .shapes
+        .iter()
+        .filter_map(|shape| match &shape.shape {
+            egui::Shape::LineSegment { points, stroke } if stroke.color == color => Some(*points),
+            _ => None,
+        })
+        .collect()
+}
+
+fn ruler_labels(output: &egui::FullOutput, ruler: egui::Rect) -> Vec<String> {
+    output
+        .shapes
+        .iter()
+        .filter_map(|shape| match &shape.shape {
+            egui::Shape::Text(text)
+                if ruler.contains(text.pos + Vec2::splat(2.0))
+                    && text.galley.text().parse::<f32>().is_ok() =>
+            {
+                Some(text.galley.text().to_string())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn rulers_grid_guides_and_snap_lines_reach_the_canvas() {
+    let (context, mut app) = app();
+    let [bottom, _] = canvas_layers(&mut app);
+    let grid_color = egui::Color32::from_rgba_unmultiplied(128, 128, 128, 46);
+    let guide_color = egui::Color32::from_rgba_unmultiplied(0, 255, 255, 230);
+    let snap_layer_color = egui::Color32::from_rgb(219, 115, 213);
+    let snap_guide_color = egui::Color32::from_rgb(0, 255, 255);
+
+    // Rulers label both edges, and no grid is drawn while the document has none.
+    let output = frame(&context, &mut app);
+    let rects = app.ruler_rects.unwrap();
+    assert!(
+        ruler_labels(&output, rects[0]).len() > 2,
+        "{:?}",
+        ruler_labels(&output, rects[0])
+    );
+    assert!(
+        ruler_labels(&output, rects[1]).len() > 2,
+        "{:?}",
+        ruler_labels(&output, rects[1])
+    );
+    assert!(canvas_lines(&output, grid_color).is_empty());
+
+    app.session_mut().unwrap().document.grid = Some(mectov::document::GridSettings {
+        spacing: 20.0,
+        subdivisions: 2,
+    });
+    app.show_grid = true;
+    let output = frame(&context, &mut app);
+    let lines = canvas_lines(&output, grid_color);
+    let vertical = lines
+        .iter()
+        .filter(|[a, b]| (a.x - b.x).abs() < 0.01)
+        .count();
+    let horizontal = lines.len() - vertical;
+    assert!(vertical > 4 && horizontal > 4, "{lines:?}");
+
+    // Snapping to a guide draws its own line while the layer is being dragged.
+    app.session_mut()
+        .unwrap()
+        .document
+        .guides
+        .push(mectov::document::Guide {
+            axis: GuideAxis::Vertical,
+            position: 22.0,
+        });
+    app.snap = true;
+    app.snap_targets = SnapTargets {
+        canvas: false,
+        layers: false,
+        guides: true,
+        grid: false,
+    };
+    app.session_mut().unwrap().document.select(bottom, false);
+    app.tool = Tool::Move;
+    frame(&context, &mut app);
+    let canvas = app.canvas_rect.unwrap();
+    let zoom = app.session().unwrap().zoom;
+    let from = Pos2::new(canvas.left() + 15.0 * zoom, canvas.top() + 45.0 * zoom);
+    let to = Pos2::new(canvas.left() + 26.6 * zoom, canvas.top() + 45.0 * zoom);
+    pointer_frame(&context, &mut app, from, Some(true), egui::Modifiers::NONE);
+    // The indicator a drag computes is painted on the following frame, the same
+    // way the guide follows the pointer.
+    let _ = pointer_frame(&context, &mut app, to, None, egui::Modifiers::NONE);
+    let output = pointer_frame(&context, &mut app, to, None, egui::Modifiers::NONE);
+    let snapped = canvas_lines(&output, snap_guide_color)
+        .into_iter()
+        .filter(|[a, b]| (a.x - b.x).abs() < 0.01 && b.y - a.y > 100.0)
+        .collect::<Vec<_>>();
+    assert!(
+        !snapped.is_empty(),
+        "a snapped guide draws a full-height line"
+    );
+    assert!(
+        canvas_lines(&output, snap_layer_color).is_empty(),
+        "layers are not a target here"
+    );
+    pointer_frame(&context, &mut app, to, Some(false), egui::Modifiers::NONE);
+    assert!((app.session().unwrap().document.layers[0].transform.x - 22.0).abs() < 0.01);
+
+    // The stored guide draws over the canvas, and a layer target recolors the line.
+    let output = frame(&context, &mut app);
+    let guides = canvas_lines(&output, guide_color);
+    assert!(!guides.is_empty(), "the guide is drawn across the canvas");
+    app.snap_targets = SnapTargets {
+        canvas: true,
+        layers: true,
+        guides: false,
+        grid: false,
+    };
+    // Two tenths short of the top layer's left edge, so the moved layer locks onto it.
+    let from = Pos2::new(canvas.left() + 30.0 * zoom, canvas.top() + 45.0 * zoom);
+    let to = Pos2::new(canvas.left() + 27.8 * zoom, canvas.top() + 45.0 * zoom);
+    pointer_frame(&context, &mut app, from, Some(true), egui::Modifiers::NONE);
+    let _ = pointer_frame(&context, &mut app, to, None, egui::Modifiers::NONE);
+    let output = pointer_frame(&context, &mut app, to, None, egui::Modifiers::NONE);
+    assert!(
+        !canvas_lines(&output, snap_layer_color).is_empty(),
+        "a layer target draws a magenta line"
+    );
+    pointer_frame(&context, &mut app, to, Some(false), egui::Modifiers::NONE);
+    assert!((app.session().unwrap().document.layers[0].transform.x - 20.0).abs() < 0.01);
+
+    // Hiding the grid drops its lines again.
+    app.show_grid = false;
+    let output = frame(&context, &mut app);
+    assert!(canvas_lines(&output, grid_color).is_empty());
 }
