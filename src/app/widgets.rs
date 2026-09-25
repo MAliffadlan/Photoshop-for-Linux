@@ -99,6 +99,7 @@ fn focus_ring(ui: &Ui, response: &Response, radius: f32) {
 pub struct Button {
     label: String,
     primary: bool,
+    selected: bool,
     size: egui::Vec2,
 }
 
@@ -107,11 +108,16 @@ impl Button {
         Self {
             label: label.into(),
             primary: false,
+            selected: false,
             size: vec2(0.0, 22.0),
         }
     }
     pub fn primary(mut self) -> Self {
         self.primary = true;
+        self
+    }
+    pub fn selected(mut self, selected: bool) -> Self {
+        self.selected = selected;
         self
     }
     pub fn min_size(mut self, size: egui::Vec2) -> Self {
@@ -133,7 +139,12 @@ impl Widget for Button {
             egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), &self.label)
         });
         if ui.is_rect_visible(rect) {
-            bezel(ui, &response, theme::BUTTON_RADIUS as f32, self.primary);
+            bezel(
+                ui,
+                &response,
+                theme::BUTTON_RADIUS as f32,
+                self.primary || self.selected,
+            );
             ui.painter()
                 .galley(rect.center() - galley.size() / 2.0, galley, theme::TEXT);
         }

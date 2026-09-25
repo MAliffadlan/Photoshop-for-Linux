@@ -1,8 +1,9 @@
+use anyhow::{Context, Result};
 use egui::RichText;
 use mectov::{
     document::{Layer, Point},
     render,
-    text::{self, TextRenderer, TextStyle},
+    text::{self, TextAlign, TextBox, TextRenderer, TextStyle},
 };
 use uuid::Uuid;
 
@@ -19,6 +20,65 @@ pub(super) struct TextEdit {
 }
 
 impl EditorApp {
+    /// Re-wrap every paragraph box whose layer no longer matches its stored box.
+    ///
+    /// Scaling a text layer with the Move tool rewrites the transform, so the box
+    /// follows the layer instead of the cached raster stretching to fit.
+    pub(super) fn refresh_text_boxes(&mut self) -> Result<()> {
+        let Some(session) = self.session() else {
+            return Ok(());
+        };
+        let mut targets = Vec::new();
+        for (index, layer) in session.document.layers.iter().enumerate() {
+            if layer.locked || layer.pixels.is_none() {
+                continue;
+            }
+            let Some(style) = &layer.text else {
+                continue;
+            };
+            if style.r#box.is_none() {
+                continue;
+            }
+            let width = layer.transform.width.round().max(1.0) as u32;
+            let height = layer.transform.height.round().max(1.0) as u32;
+            // A box the raster budget cannot hold keeps its current pixels rather
+            // than failing the edit that resized the layer.
+            if mectov::document::validate_size(width, height).is_err() {
+                continue;
+            }
+            let settled = layer
+                .pixels
+                .as_ref()
+                .is_some_and(|pixels| pixels.dimensions() == (width, height));
+            if !settled {
+                targets.push((index, width, height));
+            }
+        }
+        if targets.is_empty() {
+            return Ok(());
+        }
+        let EditorApp {
+            sessions,
+            current,
+            text_renderer,
+            ..
+        } = self;
+        let renderer = text_renderer.get_or_insert_with(TextRenderer::default);
+        let session = &mut sessions[*current];
+        for (index, width, height) in targets {
+            let Some(mut style) = session.document.layers[index].text.clone() else {
+                continue;
+            };
+            let text_box = style.r#box.get_or_insert_with(TextBox::default);
+            text_box.width = width as f32;
+            text_box.min_height = height as f32;
+            let pixels = renderer.render(&style)?;
+            text::update_layer(&mut session.document.layers[index], style, pixels)?;
+        }
+        session.invalidate();
+        Ok(())
+    }
+
     pub(super) fn text_options(&mut self, ui: &mut egui::Ui) {
         let active = self
             .session()
@@ -42,6 +102,51 @@ impl EditorApp {
             );
             self.start_text(None, point);
         }
+        // Compositor keeps the box width in the tool header, so a box can be
+        // re-flowed without reopening the text dialog.
+        let box_width = self.session().and_then(|session| {
+            session
+                .document
+                .active()
+                .filter(|layer| !layer.locked)
+                .and_then(|layer| layer.text.as_ref()?.r#box.map(|text_box| text_box.width))
+        });
+        if let Some(width) = box_width {
+            let mut width = width;
+            ui.label("Box width");
+            let response = ui.add(
+                widgets::Number::new(&mut width)
+                    .range(1.0..=30_000.0)
+                    .suffix(" px")
+                    .max_decimals(0),
+            );
+            if response.changed() {
+                let id = self
+                    .session()
+                    .and_then(|session| session.document.active())
+                    .map(|layer| layer.id);
+                if let Some(id) = id {
+                    self.edit_continuous("Text Box Width", |document| {
+                        let Some(layer) = document
+                            .layers
+                            .iter_mut()
+                            .find(|layer| layer.id == id && !layer.locked)
+                        else {
+                            return Ok(());
+                        };
+                        let text_box = layer
+                            .text
+                            .as_mut()
+                            .and_then(|text| text.r#box.as_mut())
+                            .context("The active layer is not a paragraph box")?;
+                        text_box.width = width;
+                        // The transform carries the geometry the box is re-wrapped into.
+                        layer.transform.width = width;
+                        Ok(())
+                    });
+                }
+            }
+        }
         ui.label(RichText::new("Click the canvas to place text").color(theme::MUTED));
     }
 
@@ -64,10 +169,12 @@ impl EditorApp {
                     .find(|layer| layer.id == id && layer.text.is_some())
             })
             .or_else(|| {
-                document.active().filter(|layer| {
+                // A box is clickable across its whole area, not only on the glyphs.
+                document.layers.iter().rev().find(|layer| {
                     let unit = layer.transform.inverse(point);
                     hit.is_none()
                         && layer.visible
+                        && !layer.locked
                         && layer.text.is_some()
                         && (0.0..=1.0).contains(&unit.x)
                         && (0.0..=1.0).contains(&unit.y)
@@ -280,6 +387,68 @@ impl EditorApp {
                     widgets::checkbox(ui, &mut edit.style.underline, "Underline");
                     widgets::checkbox(ui, &mut edit.style.strikethrough, "Strikethrough");
                 });
+                ui.horizontal(|ui| {
+                    let mut boxed = edit.style.r#box.is_some();
+                    if widgets::checkbox(ui, &mut boxed, "Paragraph box").changed() {
+                        edit.style.r#box = boxed.then(TextBox::default);
+                    }
+                    if let Some(text_box) = edit.style.r#box.as_mut() {
+                        ui.label("Width");
+                        ui.add(
+                            widgets::Number::new(&mut text_box.width)
+                                .range(1.0..=30_000.0)
+                                .suffix(" px")
+                                .max_decimals(0),
+                        );
+                    }
+                });
+                if let Some(text_box) = edit.style.r#box.as_mut() {
+                    ui.horizontal(|ui| {
+                        ui.label("Alignment");
+                        for (align, label) in [
+                            (TextAlign::Left, "Left"),
+                            (TextAlign::Center, "Center"),
+                            (TextAlign::Right, "Right"),
+                        ] {
+                            if ui
+                                .add(widgets::Button::new(label).selected(text_box.align == align))
+                                .clicked()
+                            {
+                                text_box.align = align;
+                            }
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Line spacing");
+                        ui.add(
+                            widgets::Number::new(&mut text_box.line_spacing)
+                                .range(0.5..=4.0)
+                                .max_decimals(2),
+                        );
+                        ui.add_space(12.0);
+                        ui.label("Paragraph gap");
+                        ui.add(
+                            widgets::Number::new(&mut text_box.paragraph_spacing)
+                                .range(0.0..=2_000.0)
+                                .suffix(" px")
+                                .max_decimals(0),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Minimum height");
+                        ui.add(
+                            widgets::Number::new(&mut text_box.min_height)
+                                .range(0.0..=30_000.0)
+                                .suffix(" px")
+                                .max_decimals(0),
+                        );
+                    });
+                    ui.label(
+                        RichText::new("Text wraps to the box width and grows the box downward.")
+                            .small()
+                            .color(theme::MUTED),
+                    );
+                }
                 if let Some(error) = &edit.error {
                     ui.colored_label(egui::Color32::LIGHT_RED, error);
                 }

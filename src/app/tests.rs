@@ -4283,3 +4283,204 @@ fn rulers_grid_guides_and_snap_lines_reach_the_canvas() {
     let output = frame(&context, &mut app);
     assert!(canvas_lines(&output, grid_color).is_empty());
 }
+
+fn boxed_text_layer(app: &mut EditorApp, content: &str, width: f32) -> Uuid {
+    app.start_text(None, Point::new(20.0, 30.0));
+    let edit = app.text_edit.as_mut().unwrap();
+    edit.style.content = content.into();
+    edit.style.size = 20.0;
+    edit.style.r#box = Some(mectov::text::TextBox {
+        width,
+        min_height: 0.0,
+        ..Default::default()
+    });
+    app.preview_text();
+    app.finish_text(true);
+    app.session().unwrap().document.active.unwrap()
+}
+
+#[test]
+fn a_paragraph_box_is_created_edited_and_removed_through_the_dialog() {
+    let (context, mut app) = app();
+    app.dimensions = [640, 480];
+    app.new_document();
+    frame(&context, &mut app);
+    let id = boxed_text_layer(
+        &mut app,
+        "A paragraph that needs to wrap inside its box",
+        160.0,
+    );
+    let layer = app.session().unwrap().document.active().unwrap().clone();
+    let text_box = layer.text.as_ref().unwrap().r#box.unwrap();
+    assert_eq!(text_box.width, 160.0);
+    assert_eq!(layer.transform.width, 160.0, "the layer is the box");
+    assert!(layer.transform.height > 20.0, "{:?}", layer.transform);
+    assert!(app.dialog.is_none());
+
+    // The box controls live in the dialog and preview as they change.
+    app.start_text(Some(id), Point::default());
+    assert!(app.dialog == Some(Dialog::Text));
+    let edit = app.text_edit.as_mut().unwrap();
+    assert_eq!(edit.style.r#box.unwrap().width, 160.0);
+    edit.style.r#box.as_mut().unwrap().align = mectov::text::TextAlign::Center;
+    edit.style.r#box.as_mut().unwrap().line_spacing = 2.0;
+    edit.style.r#box.as_mut().unwrap().min_height = 200.0;
+    app.preview_text();
+    let layer = app.session().unwrap().document.active().unwrap().clone();
+    assert_eq!(layer.transform.width, 160.0);
+    assert_eq!(layer.transform.height, 200.0, "the box reserves its height");
+    app.finish_text(true);
+
+    // Turning the box off returns the layer to a tight text raster.
+    app.start_text(Some(id), Point::default());
+    app.text_edit.as_mut().unwrap().style.r#box = None;
+    app.preview_text();
+    app.finish_text(true);
+    let layer = app.session().unwrap().document.active().unwrap();
+    assert!(layer.text.as_ref().unwrap().r#box.is_none());
+    assert!(layer.pixels.as_ref().unwrap().height() < 200);
+    assert!(
+        layer.pixels.as_ref().unwrap().width() > 160,
+        "without a box the raster is the ink, which is wider than the box was"
+    );
+    assert!(layer.transform.height < 200.0);
+}
+
+#[test]
+fn a_paragraph_box_rewraps_when_the_header_width_changes_or_a_handle_moves() {
+    let (context, mut app) = app();
+    app.dimensions = [640, 480];
+    app.new_document();
+    frame(&context, &mut app);
+    let id = boxed_text_layer(
+        &mut app,
+        "Rewrapping happens whenever the paragraph box width changes",
+        150.0,
+    );
+    let wide = app.session().unwrap().document.active().unwrap().clone();
+    let wide_height = wide.pixels.as_ref().unwrap().height();
+
+    // The tool header re-flows the box through one undoable edit.
+    app.tool = Tool::Text;
+    frame(&context, &mut app);
+    let width = field_right_of(&context, &mut app, "Box width");
+    for _ in 0..2 {
+        let _ = context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    Pos2::ZERO,
+                    Vec2::new(1280.0, 860.0),
+                )),
+                events: vec![
+                    egui::Event::PointerMoved(width),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Line,
+                        delta: Vec2::new(0.0, -25.0),
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                time: Some(app.frames as f64 / 60.0),
+                ..Default::default()
+            },
+            |ctx| app.show(ctx),
+        );
+    }
+    frame(&context, &mut app);
+    let narrow = app.session().unwrap().document.active().unwrap().clone();
+    let text_box = narrow.text.as_ref().unwrap().r#box.unwrap();
+    assert_eq!(text_box.width, 100.0, "the header number drives the box");
+    assert_eq!(narrow.transform.width, text_box.width);
+    assert_eq!(narrow.pixels.as_ref().unwrap().width(), 100);
+    assert!(
+        narrow.pixels.as_ref().unwrap().height() > wide_height,
+        "a narrower box wraps onto more lines"
+    );
+    app.session_mut().unwrap().history.commit();
+
+    // Dragging a side handle with the Move tool re-flows the box as it moves.
+    app.tool = Tool::Move;
+    app.show_controls = true;
+    frame(&context, &mut app);
+    let before = app.session().unwrap().document.active().unwrap().clone();
+    let handle = Point::new(
+        before.transform.x + before.transform.width,
+        before.transform.y + before.transform.height * 0.5,
+    );
+    drag(
+        &context,
+        &mut app,
+        handle,
+        Point::new(handle.x - 40.0, handle.y),
+        egui::Modifiers::NONE,
+    );
+    let after = app.session().unwrap().document.active().unwrap().clone();
+    assert!(
+        after.transform.width < before.transform.width,
+        "{:?} -> {:?}",
+        before.transform,
+        after.transform
+    );
+    assert_eq!(
+        after.pixels.as_ref().unwrap().width() as f32,
+        after.transform.width,
+        "the box re-wrapped instead of stretching"
+    );
+    assert_eq!(
+        after.text.as_ref().unwrap().r#box.unwrap().width,
+        after.transform.width
+    );
+    assert!(after.pixels.as_ref().unwrap().height() > wide_height);
+    assert_eq!(app.session().unwrap().document.active.unwrap(), id);
+    app.command("undo");
+    let restored = app.session().unwrap().document.active().unwrap();
+    assert_eq!(restored.transform.width, before.transform.width);
+    assert_eq!(
+        restored.pixels.as_ref().unwrap().width() as f32,
+        before.transform.width
+    );
+}
+
+#[test]
+fn a_paragraph_box_outline_is_drawn_for_the_text_tool() {
+    let (context, mut app) = app();
+    app.dimensions = [640, 480];
+    app.new_document();
+    frame(&context, &mut app);
+    boxed_text_layer(&mut app, "Outline me", 200.0);
+    let accent = theme::ACCENT;
+    let count = |app: &mut EditorApp| {
+        frame(&context, app)
+            .shapes
+            .iter()
+            .filter(|shape| {
+                matches!(&shape.shape, egui::Shape::LineSegment { stroke, .. } if stroke.color == accent)
+            })
+            .count()
+    };
+    app.tool = Tool::Move;
+    let without = count(&mut app);
+    app.tool = Tool::Text;
+    let with = count(&mut app);
+    assert!(with > without, "{with} vs {without}");
+}
+
+/// The centre of the first painted box to the right of a label on the same row.
+fn field_right_of(context: &egui::Context, app: &mut EditorApp, label: &str) -> Pos2 {
+    let label = layer_label(context, app, label);
+    frame(context, app)
+        .shapes
+        .iter()
+        .filter_map(|shape| match &shape.shape {
+            egui::Shape::Rect(rect)
+                if rect.rect.left() > label.x && (rect.rect.center().y - label.y).abs() < 12.0 =>
+            {
+                Some(rect.rect)
+            }
+            _ => None,
+        })
+        .min_by(|a, b| a.left().total_cmp(&b.left()))
+        .map_or_else(
+            || panic!("Missing field next to {label}"),
+            |rect| rect.center(),
+        )
+}

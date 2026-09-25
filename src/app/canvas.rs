@@ -605,6 +605,27 @@ impl EditorApp {
                         hover_handle = Some(TransformDrag::Rotate);
                     }
                 }
+                // A paragraph box has an area of its own, so the Text tool outlines it even
+                // where the text itself is empty.
+                if self.tool == Tool::Text
+                    && let Some(layer) = session.document.active()
+                    && layer.text.as_ref().is_some_and(|text| text.r#box.is_some())
+                    && !layer.locked
+                {
+                    let corners = layer.transform.corners().map(&map);
+                    painter.line_segment(
+                        [corners[0], corners[1]],
+                        Stroke::new(1.0_f32, theme::ACCENT),
+                    );
+                    for corner in corners {
+                        painter.rect_stroke(
+                            Rect::from_center_size(corner, Vec2::splat(5.0)),
+                            0.0,
+                            Stroke::new(1.0_f32, theme::ACCENT),
+                            StrokeKind::Inside,
+                        );
+                    }
+                }
                 // Guides the document carries. They span the canvas rather than the viewport, so one pushed
                 // off the canvas edge stops at it.
                 let guide_painter = painter.with_clip_rect(canvas.intersect(viewport));
@@ -1678,12 +1699,18 @@ impl EditorApp {
             return;
         }
         gesture.last = point;
-        if gesture.changes_composition(self.tool)
-            && !matches!(self.tool, Tool::Gradient | Tool::Shape)
-        {
-            session.invalidate();
-        }
+        let composition = gesture.changes_composition(self.tool)
+            && !matches!(self.tool, Tool::Gradient | Tool::Shape);
         self.gesture = Some(gesture);
+        if composition {
+            // Re-wrap paragraph boxes while the layer is resized, not only on release.
+            if let Err(error) = self.refresh_text_boxes() {
+                self.error = Some(error.to_string());
+            }
+            if let Some(session) = self.session_mut() {
+                session.invalidate();
+            }
+        }
     }
 
     fn end_gesture(&mut self, modifiers: egui::Modifiers) {
@@ -1822,7 +1849,12 @@ impl EditorApp {
                 self.error = Some(error.to_string());
             }
         }
-        session.invalidate();
+        if let Err(error) = self.refresh_text_boxes() {
+            self.error = Some(error.to_string());
+        }
+        if let Some(session) = self.session_mut() {
+            session.invalidate();
+        }
         self.snap_indicators.clear();
         if self.tool.is_brush() {
             self.last_brush = Some(end);

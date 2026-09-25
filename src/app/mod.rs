@@ -688,9 +688,17 @@ impl EditorApp {
             return;
         };
         session.history.begin(name, &session.document);
-        match operation(&mut session.document)
-            .and_then(|()| paint::refresh_shapes(&mut session.document))
-        {
+        let result = operation(&mut session.document)
+            .and_then(|()| paint::refresh_shapes(&mut session.document));
+        // Paragraph boxes are re-wrapped here, once the borrow on the session is done.
+        let result = match result {
+            Ok(()) => self.refresh_text_boxes(),
+            Err(error) => Err(error),
+        };
+        let Some(session) = self.session_mut() else {
+            return;
+        };
+        match result {
             Ok(()) => {
                 session.history.commit();
                 session.invalidate();
@@ -719,8 +727,14 @@ impl EditorApp {
             return;
         };
         session.history.begin(name, &session.document);
-        if let Err(error) = operation(&mut session.document)
-            .and_then(|()| paint::refresh_shapes(&mut session.document))
+        let result = operation(&mut session.document)
+            .and_then(|()| paint::refresh_shapes(&mut session.document));
+        let result = match result {
+            Ok(()) => self.refresh_text_boxes(),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = result
+            && let Some(session) = self.session_mut()
         {
             session.history.cancel(&mut session.document);
             self.error = Some(error.to_string());
@@ -1010,6 +1024,7 @@ impl EditorApp {
     fn add_demo(&mut self) {
         let mut document = Document::new(1200, 900).unwrap();
         document.layers.clear();
+
         let sky = RgbaImage::from_fn(1200, 900, |x, y| {
             let t = y as f32 / 900.0;
             let grain = ((x.wrapping_mul(73) ^ y.wrapping_mul(137)) % 7) as f32 - 3.0;
@@ -1046,6 +1061,7 @@ impl EditorApp {
             });
             document.layers.push(Layer::image(name, pixels));
         }
+
         document.select(document.layers[1].id, false);
         self.sessions
             .push(Session::new(document, "Dune study".into(), None));
