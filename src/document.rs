@@ -774,6 +774,11 @@ pub struct Document {
     pub selected: HashSet<Uuid>,
     #[serde(skip)]
     pub selection: Option<Arc<GrayImage>>,
+    /// What the last import could not carry, in the order it met the problem.
+    /// Never saved, because it describes the file that was read, not the
+    /// project that was made from it.
+    #[serde(skip)]
+    pub import_notes: Vec<String>,
 }
 
 impl Document {
@@ -791,6 +796,7 @@ impl Document {
             guides: Vec::new(),
             grid: None,
             selection: None,
+            import_notes: Vec::new(),
         })
     }
 

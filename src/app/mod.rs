@@ -799,7 +799,7 @@ impl EditorApp {
                 .map(|doc| doc.unwrap_or_else(|| self.session().unwrap().document.clone()))
         };
         match result {
-            Ok(document) => {
+            Ok(mut document) => {
                 if !project && !photoshop && as_layer && !self.sessions.is_empty() {
                     return;
                 }
@@ -819,9 +819,18 @@ impl EditorApp {
                         .first()
                         .map_or("Untitled".into(), |layer| layer.name.clone())
                 };
+                let notes = std::mem::take(&mut document.import_notes);
                 self.sessions
                     .push(Session::new(document, title, session_path));
                 self.current = self.sessions.len() - 1;
+                if !notes.is_empty() {
+                    let count = notes.len();
+                    self.status = format!(
+                        "{count} {} kept as pixels: {}",
+                        if count == 1 { "layer" } else { "layers" },
+                        notes.join("; ")
+                    );
+                }
                 self.mask_target = false;
                 self.dialog = None;
                 self.show_grid = self

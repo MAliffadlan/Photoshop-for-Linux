@@ -240,6 +240,11 @@ struct RawLayer {
     invert: bool,
     locked: bool,
     fill_opacity: u8,
+    text: Option<crate::text::TextStyle>,
+    /// A type layer's justification, applied to its box once the size is known.
+    text_align: Option<crate::text::TextAlign>,
+    /// Why a `TySh` block could not be turned into editable text, if it could not.
+    text_warning: Option<String>,
 }
 
 impl RawLayer {
@@ -553,7 +558,21 @@ fn read_tagged_blocks(
             b"lfx2" | b"lfxs" | b"lmfx" | b"lrFX" => {
                 bail!("PSD layer effects are not supported")
             }
-            b"Txt2" | b"TySh" => bail!("PSD text layers are not supported"),
+            b"TySh" => {
+                // A type layer still arrives with Photoshop's own pixels, so a
+                // block this port cannot read costs the editability, not the layer.
+                match parse_type_layer(data) {
+                    Ok(parsed) => {
+                        layer.text = Some(parsed.style);
+                        layer.text_align = Some(parsed.align);
+                    }
+                    Err(error) => layer.text_warning = Some(error.to_string()),
+                }
+            }
+            // `TySh` carries the text this port can read. `Txt2` holds Adobe's own
+            // duplicate of the same content, and a layer that only has this one
+            // stays a pixel layer.
+            b"Txt2" => {}
             b"SoCo" | b"GdFl" | b"PtFl" | b"SoLd" | b"SoLE" | b"PlLd" | b"PxSc" => {
                 bail!("PSD fill, linked, and smart-object layers are not supported")
             }
@@ -716,6 +735,9 @@ fn read_layer_record(reader: &mut Reader<'_>, variant: Variant) -> Result<RawLay
         invert: false,
         locked: false,
         fill_opacity: 255,
+        text: None,
+        text_align: None,
+        text_warning: None,
     };
     read_tagged_blocks(&mut extra, variant, &mut layer)?;
     Ok(layer)
@@ -1074,6 +1096,187 @@ struct GroupFrame {
     parent: Option<Uuid>,
 }
 
+/// Turn a `TySh` block into editable text.
+///
+/// The block opens with the text's own 2×3 transform, two version numbers, and
+/// then a descriptor. Photoshop keeps the characters in the engine data that
+/// descriptor points at, and the justification in its paragraph runs. A block
+/// this port cannot read is an error, which leaves the layer as pixels.
+struct ParsedTypeLayer {
+    style: crate::text::TextStyle,
+    align: crate::text::TextAlign,
+}
+
+fn parse_type_layer(data: &[u8]) -> Result<ParsedTypeLayer> {
+    let mut header = Reader::new(data);
+    let version = header.read_u32()?;
+    // The shape that matches the version is tried first, and the other one after
+    // it, because a block read with the wrong shape leaves nothing behind that a
+    // descriptor could be recognised in.
+    let shapes: &[TransformShape] = if version >= 2 {
+        &[TransformShape::Doubles, TransformShape::Halves]
+    } else {
+        &[TransformShape::Halves, TransformShape::Doubles]
+    };
+    // The first failure is the one worth reporting: it came from the shape the
+    // version asks for.
+    let mut failure = None;
+    for shape in shapes {
+        match read_type_layer(data, version, *shape) {
+            Ok(parsed) => return Ok(parsed),
+            Err(error) => {
+                failure.get_or_insert(error);
+            }
+        }
+    }
+    Err(failure.unwrap_or_else(|| anyhow::anyhow!("PSD type layer cannot be read")))
+}
+
+/// The transform that opens a `TySh` block. Photoshop has written it in more
+/// than one shape: version 1 stores four 16.16 fixed-point numbers as eight
+/// 16-bit halves, and version 2 stores a 2×3 matrix of doubles.
+#[derive(Clone, Copy)]
+enum TransformShape {
+    /// Four 16.16 fixed-point numbers, each stored as two 16-bit halves.
+    Halves,
+    /// A 2×3 matrix of doubles.
+    Doubles,
+}
+
+impl TransformShape {
+    /// How many bytes the transform takes in the block.
+    fn length(self) -> usize {
+        match self {
+            Self::Halves => 8 * 2,
+            Self::Doubles => 6 * 8,
+        }
+    }
+
+    /// The uniform scale the transform asks for, which is 1 when it asks for
+    /// nothing this port can make sense of.
+    fn scale(self, data: &[u8]) -> f64 {
+        let mut readings = [0.0f64; 2];
+        match self {
+            Self::Doubles => {
+                let mut matrix = [0.0f64; 6];
+                for (slot, bytes) in matrix.iter_mut().zip(data.chunks_exact(8)) {
+                    let mut word = [0u8; 8];
+                    word.copy_from_slice(bytes);
+                    *slot = f64::from_bits(u64::from_be_bytes(word));
+                }
+                readings[0] = (matrix[0] * matrix[3] - matrix[1] * matrix[2]).abs().sqrt();
+            }
+            Self::Halves => {
+                let mut halves = [0u16; 8];
+                for (slot, bytes) in halves.iter_mut().zip(data.chunks_exact(2)) {
+                    let mut word = [0u8; 2];
+                    word.copy_from_slice(bytes);
+                    *slot = u16::from_be_bytes(word);
+                }
+                readings[0] = halves_scale(&halves, false);
+                readings[1] = halves_scale(&halves, true);
+            }
+        }
+        readings
+            .into_iter()
+            .find(|scale| scale.is_finite() && (0.01..=100.0).contains(scale))
+            .unwrap_or(1.0)
+    }
+}
+
+/// The scale of a transform stored as four 16.16 fixed-point numbers, which
+/// Photoshop has written with the two halves of each number in either order, so
+/// both readings are offered and the plausible one is taken.
+fn halves_scale(halves: &[u16; 8], high_first: bool) -> f64 {
+    let pair = |index: usize| {
+        let (first, second) = (halves[index], halves[index + 1]);
+        let (low, high) = if high_first {
+            (second, first)
+        } else {
+            (first, second)
+        };
+        f64::from((u32::from(high) << 16 | u32::from(low)) as i32) / 65536.0
+    };
+    (pair(0) * pair(6) - pair(2) * pair(4)).abs().sqrt()
+}
+
+fn read_type_layer(data: &[u8], version: u32, shape: TransformShape) -> Result<ParsedTypeLayer> {
+    let mut reader = Reader::new(data);
+    ensure!(
+        reader.read_u32()? == version,
+        "PSD type layer version changed"
+    );
+    let transform = reader.take(shape.length())?;
+    let _text_version = reader.read_u32()?;
+    let _descriptor_version = reader.read_u32()?;
+    let descriptor = descriptor::read_descriptor_body(&mut reader, 0)?;
+    let engine = engine::parse(&descriptor)?;
+
+    // mectov has no layer scale, so the transform's scale is folded into the
+    // font size the run asks for.
+    let scale = shape.scale(transform);
+    let (family, size, color) = engine.primary_style().unwrap_or((None, None, None));
+    let size = (size.unwrap_or(48.0).max(0.0) * scale).clamp(1.0, 1024.0) as f32;
+    let family = family
+        .filter(|name| !name.trim().is_empty() && name.len() <= 1024)
+        .map(str::to_owned)
+        .unwrap_or_else(|| crate::text::TextStyle::default().family);
+    let align = paragraph_alignment(&descriptor);
+    let style = crate::text::TextStyle {
+        content: engine.text,
+        family,
+        size,
+        color: color.unwrap_or([0, 0, 0, 255]),
+        ..Default::default()
+    };
+    style.validate()?;
+    Ok(ParsedTypeLayer { style, align })
+}
+
+/// The justification of the first paragraph run, which is where Photoshop keeps
+/// left, centre, and right alignment for point text.
+fn paragraph_alignment(descriptor: &descriptor::Descriptor) -> crate::text::TextAlign {
+    use crate::text::TextAlign;
+    use descriptor::{Descriptor, Value};
+
+    fn walk(descriptor: &Descriptor, depth: usize) -> Option<Value> {
+        if depth > 6 {
+            return None;
+        }
+        for (key, value) in &descriptor.items {
+            if key == "Justification" {
+                return Some(value.clone());
+            }
+        }
+        for (_, value) in &descriptor.items {
+            match value {
+                Value::Dict(child) => {
+                    if let Some(found) = walk(child, depth + 1) {
+                        return Some(found);
+                    }
+                }
+                Value::List(values) => {
+                    for value in values {
+                        if let Value::Dict(child) = value
+                            && let Some(found) = walk(child, depth + 1)
+                        {
+                            return Some(found);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    match walk(descriptor, 0) {
+        Some(Value::Enum { value, .. }) if value.contains("center") => TextAlign::Center,
+        Some(Value::Enum { value, .. }) if value.contains("right") => TextAlign::Right,
+        _ => TextAlign::Left,
+    }
+}
+
 fn make_layer(
     decoded: DecodedLayer,
     document_width: u32,
@@ -1104,6 +1307,23 @@ fn make_layer(
     layer.locked = raw.locked;
     layer.opacity = f32::from(raw.opacity) / 255.0 * f32::from(raw.fill_opacity) / 255.0;
     layer.blend = blend_mode(raw.blend_key, raw.divider_blend, raw.divider)?;
+    // A type layer keeps Photoshop's own pixels and gains the text that produced
+    // them, so it looks identical until it is edited.
+    if let Some(mut text) = raw.text
+        && let Some(pixels) = &layer.pixels
+    {
+        // Alignment only lives on a box, so the box takes the size Photoshop
+        // laid the text out in: the same width, and a height its own raster
+        // already reached, which our font metrics may not match.
+        text.r#box = Some(crate::text::TextBox {
+            width: pixels.width() as f32,
+            min_height: pixels.height() as f32,
+            align: raw.text_align.unwrap_or_default(),
+            ..Default::default()
+        });
+        text.validate()?;
+        layer.text = Some(text);
+    }
     layer.mask = decoded.mask.map(|pixels| Mask {
         pixels: Arc::new(pixels),
         enabled: raw.mask.as_ref().is_none_or(|mask| mask.flags & 2 == 0),
@@ -1116,6 +1336,7 @@ fn make_layer(
 fn into_document(header: &Header, layers: Vec<DecodedLayer>, resolution: f32) -> Result<Document> {
     ensure!(!layers.is_empty(), "PSD document has no layers");
     let mut output = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
     let mut groups: Vec<GroupFrame> = Vec::new();
     let mut bases: HashMap<Option<Uuid>, Option<Uuid>> = HashMap::new();
     for decoded in layers {
@@ -1156,6 +1377,9 @@ fn into_document(header: &Header, layers: Vec<DecodedLayer>, resolution: f32) ->
             output.push(layer);
             continue;
         }
+        if let Some(warning) = &decoded.raw.text_warning {
+            notes.push(format!("{}: {warning}", decoded.raw.name));
+        }
         let (mut layer, clipping) = make_layer(decoded, header.width, header.height)?;
         layer.parent = parent;
         if layer.group {
@@ -1183,6 +1407,7 @@ fn into_document(header: &Header, layers: Vec<DecodedLayer>, resolution: f32) ->
     let mut document = Document::new(header.width, header.height)?;
     document.resolution = resolution;
     document.layers = output;
+    document.import_notes = notes;
     document.active = document.layers.last().map(|layer| layer.id);
     document.selected = document.active.into_iter().collect();
     document.validate()?;
@@ -1247,6 +1472,9 @@ fn composite_layer(image: RgbaImage) -> DecodedLayer {
             invert: false,
             locked: false,
             fill_opacity: 255,
+            text: None,
+            text_align: None,
+            text_warning: None,
         },
         pixels: Some(image),
         mask: None,
@@ -1318,5 +1546,7 @@ fn parse(data: &[u8]) -> Result<Document> {
     into_document(&header, layers, resolution)
 }
 
+mod descriptor;
+mod engine;
 #[cfg(test)]
 mod tests;
