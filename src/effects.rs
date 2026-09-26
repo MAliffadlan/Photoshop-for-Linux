@@ -12,9 +12,45 @@ use rayon::prelude::*;
 
 use crate::{
     document::{Adjustment, Document, LayerEffects, Mask, Point, Transform},
+    memory,
     paint::ensure_pixels,
     render, selection,
 };
+
+/// Bytes of working memory one pixel needs while a layer's effects are baked:
+/// the source in floats, the output in floats, the coverage in floats, and one
+/// shifted copy of the coverage an offset effect needs.
+pub const BAKE_BYTES_PER_PIXEL: u64 = 40;
+/// The share of the machine's memory one bake may take, in quarters. Two,
+/// because the bake is a single layer's work and the rest of the document is
+/// already in memory while it happens.
+const BAKE_MEMORY_SHARE: u64 = 2;
+
+/// Refuse a layer whose effects cannot be baked on this machine, rather than
+/// drawing it without them. Compositor bakes a layer of any size, but the float
+/// buffers this port uses are not free, so the size a bake can reach follows the
+/// machine's memory.
+pub fn ensure_bake_fits(effects: &LayerEffects, pixels: u64) -> Result<()> {
+    if !effects.renders() {
+        return Ok(());
+    }
+    let allowed = bake_pixels_allowed(memory::total_bytes());
+    ensure!(
+        pixels <= allowed,
+        "Layer effects on a {} megapixel layer need {} of memory, and this machine allows {}",
+        pixels / 1_000_000,
+        memory::gibibytes(pixels.saturating_mul(BAKE_BYTES_PER_PIXEL)),
+        memory::gibibytes(allowed.saturating_mul(BAKE_BYTES_PER_PIXEL))
+    );
+    Ok(())
+}
+
+/// The most pixels one bake may cover on a machine with `total` memory, which
+/// takes a machine other than this one so that the limit can be tested without
+/// one.
+pub fn bake_pixels_allowed(total: u64) -> u64 {
+    memory::bytes_for(total, BAKE_MEMORY_SHARE) / BAKE_BYTES_PER_PIXEL
+}
 
 pub fn rgb_to_hsl(c: [f32; 3]) -> [f32; 3] {
     let high = c.into_iter().fold(f32::MIN, f32::max);
@@ -1460,6 +1496,12 @@ pub fn bake_layer_effects(
     let margin = effect_margin(&effects);
     let width = pixels.width().checked_add(margin * 2)?;
     let height = pixels.height().checked_add(margin * 2)?;
+    // A layer that passed validation cannot reach this, because the caller
+    // refuses one that cannot be baked. This is the last line against an
+    // allocation the size check above cannot see.
+    if u64::from(width) * u64::from(height) > bake_pixels_allowed(memory::total_bytes()) {
+        return None;
+    }
     let total = width as usize * height as usize;
     let source_width = pixels.width();
     let source_height = pixels.height();

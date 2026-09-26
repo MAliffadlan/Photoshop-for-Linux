@@ -882,3 +882,49 @@ fn a_transform_scale_this_port_cannot_use_is_left_alone() {
         "a scale of one leaves the size alone"
     );
 }
+
+#[test]
+fn a_layer_beyond_the_image_ceiling_is_refused() {
+    // 20,000 by 20,000 is 400 megapixels, which is past Compositor's own
+    // ceiling on any machine, so the refusal does not depend on the memory this
+    // test runs on. The rect is refused before a single pixel is read.
+    let huge = TestLayer {
+        rect: [0, 0, 20_000, 20_000],
+        channels: Vec::new(),
+        name: "Huge".into(),
+        blend: *b"norm",
+        opacity: 255,
+        clipping: 0,
+        flags: 0,
+        mask: None,
+        divider: None,
+        fill_opacity: None,
+        invert: false,
+        tagged: Vec::new(),
+    };
+    let error = parse(&build_psd(2, 2, Variant::Psd, &[huge])).unwrap_err();
+    let message = error.to_string();
+    assert!(
+        message.contains("megapixels"),
+        "the refusal names the ceiling: {message}"
+    );
+}
+
+#[test]
+fn the_psd_ceilings_follow_the_machine() {
+    let small = 2 * 1024 * 1024 * 1024;
+    // A small machine reads no larger a file than it has memory for, while a
+    // roomy one is held to Compositor's own file ceiling.
+    assert_eq!(max_file_bytes_for(small), 512 * 1024 * 1024);
+    assert_eq!(
+        max_file_bytes_for(64 * 1024 * 1024 * 1024),
+        2 * 1024 * 1024 * 1024
+    );
+    // The decode peak is the smaller of Compositor's 768 MiB and half the
+    // machine, and never falls below a quarter of the smallest machine assumed.
+    assert!(max_decode_bytes_for(small) >= 256 * 1024 * 1024);
+    assert!(max_decode_bytes_for(64 * 1024 * 1024 * 1024) >= 768 * 1024 * 1024);
+    // This machine's own ceilings are inside Compositor's.
+    assert!(max_file_bytes() <= 2 * 1024 * 1024 * 1024);
+    assert!(max_decode_bytes() <= 768 * 1024 * 1024);
+}

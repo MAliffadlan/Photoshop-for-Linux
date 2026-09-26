@@ -6,9 +6,21 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::blend::BlendMode;
+use crate::memory;
 
 pub const MAX_SIDE: u32 = 30_000;
-pub const MAX_PIXELS: u64 = 100_000_000;
+/// Compositor 1.2.8's ceiling for one image: a canvas, a layer's pixels, or a
+/// mask. A machine with less memory than that ceiling asks for stops lower.
+pub const MAX_IMAGE_PIXELS: u64 = 200_000_000;
+/// Compositor 1.2.8's ceiling for a whole document: the canvas, every layer, and
+/// every mask together.
+pub const MAX_DOCUMENT_PIXELS: u64 = 800_000_000;
+/// The share of the machine's memory one image's raster may take, in quarters.
+const IMAGE_MEMORY_SHARE: u64 = 1;
+/// The share of the machine's memory a whole document's rasters may take, in
+/// quarters. Three, because compositing needs the canvas and every layer at
+/// once while a single image only needs its own raster.
+const DOCUMENT_MEMORY_SHARE: u64 = 3;
 pub const MAX_LAYERS: usize = 10_000;
 pub const MAX_GUIDES: usize = 1_024;
 pub const MAX_SHAPE_SIZE: f32 = 5_000.0;
@@ -28,11 +40,60 @@ pub fn validate_size(width: u32, height: u32) -> Result<()> {
         (1..=MAX_SIDE).contains(&width) && (1..=MAX_SIDE).contains(&height),
         "Dimensions must be between 1 and {MAX_SIDE} pixels"
     );
+    let allowed = max_image_pixels();
     ensure!(
-        u64::from(width) * u64::from(height) <= MAX_PIXELS,
-        "Images are limited to 100 megapixels"
+        u64::from(width) * u64::from(height) <= allowed,
+        "{}",
+        limit_message("Images", allowed, MAX_IMAGE_PIXELS)
     );
     Ok(())
+}
+
+/// The most pixels one image may hold on this machine.
+pub fn max_image_pixels() -> u64 {
+    image_pixels_allowed(memory::total_bytes())
+}
+
+/// The most pixels one image may hold on a machine with `total` memory, which
+/// takes a machine other than this one so that the cap can be tested without
+/// one.
+pub fn image_pixels_allowed(total: u64) -> u64 {
+    MAX_IMAGE_PIXELS.min(memory::pixels_for(total, IMAGE_MEMORY_SHARE))
+}
+
+/// The most pixels a whole document may hold on this machine.
+pub fn max_document_pixels() -> u64 {
+    MAX_DOCUMENT_PIXELS.min(memory::pixels_for(
+        memory::total_bytes(),
+        DOCUMENT_MEMORY_SHARE,
+    ))
+}
+
+/// The most pixels a whole document may hold on a machine with `total` memory.
+pub fn document_pixels_allowed(total: u64) -> u64 {
+    MAX_DOCUMENT_PIXELS.min(memory::pixels_for(total, DOCUMENT_MEMORY_SHARE))
+}
+
+/// Whether a document's rasters, the canvas and every layer and mask together,
+/// fit a machine with `total` memory.
+pub fn document_pixels_fit(pixels: u64, total: u64) -> bool {
+    pixels <= document_pixels_allowed(total)
+}
+
+/// A limit message that names the cap in force, and the machine's memory when
+/// memory is what brought the cap below Compositor's own. The subject is plural
+/// because every limit here reads as one.
+pub fn limit_message(subject: &str, allowed: u64, absolute: u64) -> String {
+    let megapixels = allowed / 1_000_000;
+    if allowed >= absolute {
+        format!("{subject} are limited to {megapixels} megapixels")
+    } else {
+        // Memory is sold in decimal gigabytes, so it is reported that way.
+        let gigabytes = memory::total_bytes() / 1_000_000_000;
+        format!(
+            "{subject} are limited to {megapixels} megapixels on this machine's {gigabytes} GB of memory"
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -955,6 +1016,12 @@ impl Document {
             }
             if let Some(effects) = &layer.effects {
                 effects.validate()?;
+                if let Some(image) = &layer.pixels {
+                    crate::effects::ensure_bake_fits(
+                        effects,
+                        u64::from(image.width()) * u64::from(image.height()),
+                    )?;
+                }
             }
             ensure!(
                 !layer.name.trim().is_empty() && layer.name.len() <= 16_384,
@@ -1004,9 +1071,13 @@ impl Document {
                 source = target.and_then(|l| l.clip_to);
             }
         }
+        // The canvas is composited as well as stored, so it counts here too.
+        let total = u64::from(self.width) * u64::from(self.height) + pixels + mask_pixels;
+        let allowed = max_document_pixels();
         ensure!(
-            pixels <= MAX_PIXELS && mask_pixels <= MAX_PIXELS,
-            "Project exceeds the 100 megapixel asset limit"
+            document_pixels_fit(total, memory::total_bytes()),
+            "{}",
+            limit_message("Documents", allowed, MAX_DOCUMENT_PIXELS)
         );
         ensure!(
             raw_bytes <= crate::raw::MAX_RAW_BYTES,
@@ -1047,6 +1118,103 @@ mod tests {
         doc.layers[0].clip_to = None;
         doc.layers[0].parent = Some(Uuid::new_v4());
         assert!(doc.validate().is_err());
+    }
+
+    #[test]
+    fn one_image_is_capped_by_the_machine_and_by_compositor() {
+        // A machine with room for far more than Compositor's own ceiling still
+        // answers with that ceiling.
+        let roomy = 64 * 1024 * 1024 * 1024;
+        assert_eq!(image_pixels_allowed(roomy), MAX_IMAGE_PIXELS);
+        assert_eq!(document_pixels_allowed(roomy), MAX_DOCUMENT_PIXELS);
+        // A small machine asks for less, and the fall of 2 GiB still allows
+        // every image the port accepted before this cap was raised.
+        let small = 2 * 1024 * 1024 * 1024;
+        assert_eq!(image_pixels_allowed(small), 134_217_728);
+        assert_eq!(document_pixels_allowed(small), 402_653_184);
+        assert!(image_pixels_allowed(small) > 100_000_000);
+    }
+
+    #[test]
+    fn this_machine_answers_with_a_cap_it_can_back() {
+        let allowed = max_image_pixels();
+        assert!(allowed <= MAX_IMAGE_PIXELS);
+        // Anything this port accepts fits the budget it derived the cap from.
+        assert!(allowed * crate::memory::BYTES_PER_PIXEL <= crate::memory::share(1));
+        if validate_size(30_000, 30_000).is_ok() {
+            assert!(30_000u64 * 30_000 <= allowed);
+        }
+        assert!(validate_size(0, 8).is_err());
+    }
+
+    #[test]
+    fn a_limit_message_names_the_ceiling_and_the_memory() {
+        assert_eq!(
+            limit_message("Images", MAX_IMAGE_PIXELS, MAX_IMAGE_PIXELS),
+            "Images are limited to 200 megapixels"
+        );
+        // A cap the machine brought down says so, and names the memory it found.
+        let lowered = limit_message("Documents", 134_217_728, MAX_DOCUMENT_PIXELS);
+        assert!(lowered.contains("134 megapixels"), "{lowered}");
+        assert!(lowered.contains("of memory"), "{lowered}");
+    }
+
+    #[test]
+    fn a_document_is_capped_by_its_whole_set_of_rasters() {
+        let roomy = 64 * 1024 * 1024 * 1024;
+        let small = 2 * 1024 * 1024 * 1024;
+        // A document measured against a machine with room is measured against
+        // Compositor's own ceiling, and one pixel more is too many.
+        assert!(document_pixels_fit(MAX_DOCUMENT_PIXELS, roomy));
+        assert!(!document_pixels_fit(MAX_DOCUMENT_PIXELS + 1, roomy));
+        // The same document against a small machine is measured against what
+        // that machine can hold.
+        assert!(document_pixels_fit(document_pixels_allowed(small), small));
+        assert!(!document_pixels_fit(
+            document_pixels_allowed(small) + 1,
+            small
+        ));
+        // An ordinary document is nowhere near either bound.
+        let mut doc = Document::new(64, 64).unwrap();
+        doc.layers.push(Layer::image(
+            "Pixels",
+            RgbaImage::from_pixel(64, 64, image::Rgba([1, 2, 3, 4])),
+        ));
+        doc.validate().unwrap();
+    }
+
+    #[test]
+    fn layer_effects_need_a_bake_the_machine_can_hold() {
+        let effects = LayerEffects {
+            outer_glow: Some(crate::document::OuterGlowEffect::default()),
+            ..Default::default()
+        };
+        // Two gibibytes is the smallest memory this port assumes, and it bakes
+        // a layer of 8 megapixels, up to 26,843,545 pixels.
+        let small = 2 * 1024 * 1024 * 1024;
+        assert_eq!(
+            crate::effects::bake_pixels_allowed(small),
+            26_843_545,
+            "half of two gibibytes at forty bytes a pixel"
+        );
+        assert!(crate::effects::bake_pixels_allowed(small) >= 8_000_000);
+        // A roomy machine bakes far more than the small one does.
+        assert!(
+            crate::effects::bake_pixels_allowed(small)
+                < crate::effects::bake_pixels_allowed(64 * 1024 * 1024 * 1024)
+        );
+        // On this machine, a layer one pixel past the budget is refused rather
+        // than drawn without its effects, and the budget itself is allowed.
+        let allowed = crate::effects::bake_pixels_allowed(crate::memory::total_bytes());
+        assert!(crate::effects::ensure_bake_fits(&effects, allowed).is_ok());
+        let refused = crate::effects::ensure_bake_fits(&effects, allowed + 1);
+        assert!(refused.is_err(), "{}", refused.unwrap_err());
+        assert!(refused.unwrap_err().to_string().contains("need"));
+        // Effects that render nothing are never refused, however large the layer.
+        assert!(crate::effects::ensure_bake_fits(&LayerEffects::default(), allowed + 1).is_ok());
+        let mut doc = Document::new(8, 8).unwrap();
+        doc.layers[0].effects = Some(effects);
+        doc.validate().unwrap();
     }
 
     #[test]

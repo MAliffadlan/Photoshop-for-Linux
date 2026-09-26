@@ -7,6 +7,7 @@ pub mod geometry;
 pub mod gpu;
 pub mod history;
 pub mod io;
+pub mod memory;
 pub mod operations;
 pub mod paint;
 pub mod psd;

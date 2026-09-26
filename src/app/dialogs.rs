@@ -381,6 +381,18 @@ impl EditorApp {
                 } else {
                     ui.label(RichText::new("Transparent canvas · sRGB").color(theme::MUTED));
                 }
+                // The ceiling follows the machine's memory, so it is said here
+                // rather than only in the error a too-large size produces.
+                let image_limit =
+                    mectov::document::image_pixels_allowed(mectov::memory::total_bytes());
+                ui.label(
+                    RichText::new(mectov::document::limit_message(
+                        "Images",
+                        image_limit,
+                        mectov::document::MAX_IMAGE_PIXELS,
+                    ))
+                    .color(theme::MUTED),
+                );
                 ui.add_space(15.0);
                 ui.horizontal(|ui| {
                     cancel = widgets::button(ui, "Cancel").clicked();
@@ -999,11 +1011,18 @@ impl EditorApp {
                                 .iter_mut()
                                 .find(|layer| layer.id == target)
                         {
-                            if let Err(error) = effects.validate() {
-                                Err(error)
-                            } else {
-                                layer.effects = (!effects.is_empty()).then_some(*effects);
-                                Ok(())
+                            let fit = layer.pixels.as_ref().map_or(0, |image| {
+                                u64::from(image.width()) * u64::from(image.height())
+                            });
+                            match effects
+                                .validate()
+                                .and_then(|()| mectov::effects::ensure_bake_fits(effects, fit))
+                            {
+                                Err(error) => Err(error),
+                                Ok(()) => {
+                                    layer.effects = (!effects.is_empty()).then_some(*effects);
+                                    Ok(())
+                                }
                             }
                         } else {
                             Ok(())

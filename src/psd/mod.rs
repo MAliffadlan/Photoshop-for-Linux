@@ -9,15 +9,47 @@ use anyhow::{Context, Result, bail, ensure};
 use image::{GrayImage, Luma, Rgba, RgbaImage};
 use uuid::Uuid;
 
+use crate::memory;
 use crate::{
     blend::BlendMode,
     document::{
-        Adjustment, Document, Layer, MAX_LAYERS, MAX_PIXELS, Mask, Transform, validate_size,
+        Adjustment, Document, Layer, MAX_IMAGE_PIXELS, MAX_LAYERS, Mask, Transform, limit_message,
+        max_image_pixels, validate_size,
     },
 };
 
-const MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
+/// Compositor reads a PSD of up to 2 GB, and mectov will too, as long as the
+/// machine's memory is there to hold the file while it reads it.
+const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// The share of the machine's memory one file read may take, in quarters.
+const FILE_MEMORY_SHARE: u64 = 1;
+/// The peak a single layer's decode is measured against: its colour channels,
+/// its mask, and the copy the decoder works from.
 const MAX_DECODE_BYTES: u64 = 768 * 1024 * 1024;
+/// The share of the machine's memory one decode may take, in quarters.
+const DECODE_MEMORY_SHARE: u64 = 2;
+
+/// The largest PSD this port reads, which is Compositor's own file ceiling or a
+/// quarter of the machine's memory, whichever is smaller.
+pub fn max_file_bytes() -> u64 {
+    max_file_bytes_for(memory::total_bytes())
+}
+
+/// The largest PSD a machine with `total` memory is read with, which takes a
+/// machine other than this one so that the ceiling can be tested without one.
+pub fn max_file_bytes_for(total: u64) -> u64 {
+    MAX_FILE_BYTES.min(memory::bytes_for(total, FILE_MEMORY_SHARE))
+}
+
+/// The peak one layer's decode may reach on this machine.
+pub fn max_decode_bytes() -> u64 {
+    max_decode_bytes_for(memory::total_bytes())
+}
+
+/// The peak one layer's decode may reach on a machine with `total` memory.
+pub fn max_decode_bytes_for(total: u64) -> u64 {
+    MAX_DECODE_BYTES.min(memory::bytes_for(total, DECODE_MEMORY_SHARE))
+}
 const MAX_CHANNELS: usize = 56;
 const MAX_GROUPS: usize = 64;
 const MAX_NAME_BYTES: usize = 16_384;
@@ -276,9 +308,11 @@ impl DecodeBudget {
             .pixels
             .checked_add(pixels)
             .context("PSD pixel budget overflow")?;
+        let allowed = max_image_pixels();
         ensure!(
-            self.pixels <= MAX_PIXELS,
-            "PSD exceeds the 100 megapixel limit"
+            self.pixels <= allowed,
+            "{}",
+            limit_message("The layers of a PSD", allowed, MAX_IMAGE_PIXELS)
         );
         Ok(())
     }
@@ -291,9 +325,11 @@ impl DecodeBudget {
             .mask_pixels
             .checked_add(pixels)
             .context("PSD mask pixel budget overflow")?;
+        let allowed = max_image_pixels();
         ensure!(
-            self.mask_pixels <= MAX_PIXELS,
-            "PSD masks exceed the 100 megapixel limit"
+            self.mask_pixels <= allowed,
+            "{}",
+            limit_message("The masks of a PSD", allowed, MAX_IMAGE_PIXELS)
         );
         Ok(())
     }
@@ -323,9 +359,12 @@ impl DecodeBudget {
         let bytes = color_bytes
             .checked_add(mask_bytes)
             .context("PSD decoded size overflow")?;
+        let allowed = max_decode_bytes();
         ensure!(
-            bytes <= MAX_DECODE_BYTES,
-            "PSD decoded data exceeds the memory limit"
+            bytes <= allowed,
+            "PSD decoded data needs {} of memory, and this machine allows {}",
+            memory::gibibytes(bytes),
+            memory::gibibytes(allowed)
         );
         Ok(())
     }
@@ -365,7 +404,10 @@ fn read_image_resources(data: &[u8]) -> Result<f32> {
             );
         }
         let length = u64::from(reader.read_u32()?);
-        ensure!(length <= MAX_FILE_BYTES, "PSD image resource is too large");
+        ensure!(
+            length <= max_file_bytes(),
+            "PSD image resource is too large"
+        );
         let resource = reader.read_block(length)?;
         if id == 1005 {
             ensure!(resource.data.len() >= 16, "Invalid PSD resolution resource");
@@ -683,7 +725,10 @@ fn read_layer_record(reader: &mut Reader<'_>, variant: Variant) -> Result<RawLay
             "PSD layer contains an unsupported channel"
         );
         let length = reader.read_length(variant.wide_lengths())?;
-        ensure!(length <= MAX_FILE_BYTES, "PSD channel length is too large");
+        ensure!(
+            length <= max_file_bytes(),
+            "PSD channel length is too large"
+        );
         channels.push(ChannelInfo { id, length });
     }
     ensure!(
@@ -1492,11 +1537,19 @@ pub fn is_document(path: &Path) -> bool {
 
 pub fn load(path: &Path) -> Result<Document> {
     let metadata = fs::metadata(path).with_context(|| format!("Cannot read {}", path.display()))?;
-    ensure!(metadata.len() <= MAX_FILE_BYTES, "PSD file exceeds 512 MiB");
+    let allowed = max_file_bytes();
+    ensure!(
+        metadata.len() <= allowed,
+        "PSD file needs {} of memory, and this machine allows {}",
+        memory::gibibytes(metadata.len()),
+        memory::gibibytes(allowed)
+    );
     let data = fs::read(path)?;
     ensure!(
-        data.len() as u64 <= MAX_FILE_BYTES,
-        "PSD file exceeds 512 MiB"
+        data.len() as u64 <= max_file_bytes(),
+        "PSD file needs {} of memory, and this machine allows {}",
+        memory::gibibytes(data.len() as u64),
+        memory::gibibytes(allowed)
     );
     parse(&data)
 }
@@ -1506,13 +1559,13 @@ fn parse(data: &[u8]) -> Result<Document> {
     let header = read_header(&mut reader)?;
     let color_data_length = u64::from(reader.read_u32()?);
     ensure!(
-        color_data_length <= MAX_FILE_BYTES,
+        color_data_length <= max_file_bytes(),
         "PSD color data is too large"
     );
     reader.advance(usize::try_from(color_data_length)?)?;
     let resources_length = u64::from(reader.read_u32()?);
     ensure!(
-        resources_length <= MAX_FILE_BYTES,
+        resources_length <= max_file_bytes(),
         "PSD image resources are too large"
     );
     let resources = reader.read_block(resources_length)?;
@@ -1522,14 +1575,14 @@ fn parse(data: &[u8]) -> Result<Document> {
     let mut layers = Vec::new();
     if layer_mask_length > 0 {
         ensure!(
-            layer_mask_length <= MAX_FILE_BYTES,
+            layer_mask_length <= max_file_bytes(),
             "PSD layer section is too large"
         );
         let mut layer_mask = reader.read_block(layer_mask_length)?;
         let layer_info_length = layer_mask.read_length(header.variant.wide_lengths())?;
         if layer_info_length > 0 {
             ensure!(
-                layer_info_length <= MAX_FILE_BYTES,
+                layer_info_length <= max_file_bytes(),
                 "PSD layer info is too large"
             );
             let mut layer_info = layer_mask.read_block(layer_info_length)?;

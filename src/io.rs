@@ -13,19 +13,39 @@ use serde_json::Value;
 use uuid::Uuid;
 use zip::{ZipArchive, ZipWriter, write::SimpleFileOptions};
 
+use crate::memory;
 use crate::{
     blend::BlendMode,
     document::{
         Adjustment, ColorOverlayEffect, Document, Guide, GuideAxis, InnerGlowEffect,
-        InnerShadowEffect, Layer, LayerEffects, MAX_PIXELS, Mask, OuterGlowEffect, Point,
-        ShadowEffect, StrokeEffect, Transform, validate_size,
+        InnerShadowEffect, Layer, LayerEffects, MAX_DOCUMENT_PIXELS, MAX_SIDE, Mask,
+        OuterGlowEffect, Point, ShadowEffect, StrokeEffect, Transform, limit_message,
+        max_document_pixels, max_image_pixels, validate_size,
     },
     render,
 };
 
 const MAX_MANIFEST: u64 = 4 * 1024 * 1024;
-const MAX_ASSET: u64 = 512 * 1024 * 1024;
+/// The largest single asset a project may hold. One image of 200 megapixels
+/// cannot fit in a 512 MiB file, so this follows the image limit, and is capped
+/// so that a machine which cannot hold a gigabyte spare does not try.
+const MAX_ASSET: u64 = 1024 * 1024 * 1024;
+/// The share of the machine's memory one asset file read may take, in quarters.
+const ASSET_MEMORY_SHARE: u64 = 1;
 const MAX_SVG_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The largest asset file this port reads, which is a quarter of the machine's
+/// memory while that is below the ceiling.
+pub fn max_asset_bytes() -> u64 {
+    max_asset_bytes_for(memory::total_bytes())
+}
+
+/// The largest asset file a machine with `total` memory is read with, which
+/// takes a machine other than this one so that the ceiling can be tested without
+/// one.
+pub fn max_asset_bytes_for(total: u64) -> u64 {
+    MAX_ASSET.min(memory::bytes_for(total, ASSET_MEMORY_SHARE))
+}
 
 /// Format identifier written into `manifest.json`.
 const FORMAT_ID: &str = "me.silverl.mectov";
@@ -50,21 +70,31 @@ fn encode_png(image: &DynamicImage) -> Result<Vec<u8>> {
 }
 
 fn decode_image(bytes: Vec<u8>, used: &mut u64) -> Result<DynamicImage> {
-    ensure!(bytes.len() as u64 <= MAX_ASSET, "Image file is too large");
+    let allowed_asset = max_asset_bytes();
+    ensure!(
+        bytes.len() as u64 <= allowed_asset,
+        "Image file needs {} of memory, and this machine allows {}",
+        memory::gibibytes(bytes.len() as u64),
+        memory::gibibytes(allowed_asset)
+    );
     let mut reader = ImageReader::new(Cursor::new(bytes)).with_guessed_format()?;
     let mut limits = image::Limits::default();
-    limits.max_image_width = Some(30_000);
-    limits.max_image_height = Some(30_000);
-    limits.max_alloc = Some(MAX_PIXELS * 8);
+    limits.max_image_width = Some(MAX_SIDE);
+    limits.max_image_height = Some(MAX_SIDE);
+    // The decoder's own ceiling is measured against the same pixels this port
+    // allows, with room for the copy a decoder works from.
+    limits.max_alloc = Some(max_image_pixels() * 8);
     reader.limits(limits);
     let mut decoder = reader.into_decoder()?;
     use image::ImageDecoder;
     let (width, height) = decoder.dimensions();
     validate_size(width, height)?;
     *used += u64::from(width) * u64::from(height);
+    let allowed = max_document_pixels();
     ensure!(
-        *used <= MAX_PIXELS,
-        "Project exceeds 100 megapixels of source images"
+        *used <= allowed,
+        "{}",
+        limit_message("The images in a project", allowed, MAX_DOCUMENT_PIXELS)
     );
     let orientation = decoder.orientation()?;
     let mut image = DynamicImage::from_decoder(decoder)?;
@@ -121,7 +151,13 @@ fn decode_svg(data: &[u8]) -> Result<RgbaImage> {
 
 pub fn import_image(path: &Path) -> Result<RgbaImage> {
     let metadata = fs::metadata(path).with_context(|| format!("Cannot read {}", path.display()))?;
-    ensure!(metadata.len() <= MAX_ASSET, "Image exceeds 512 MiB");
+    let allowed_asset = max_asset_bytes();
+    ensure!(
+        metadata.len() <= allowed_asset,
+        "Image needs {} of memory, and this machine allows {}",
+        memory::gibibytes(metadata.len()),
+        memory::gibibytes(allowed_asset)
+    );
     let extension = path
         .extension()
         .and_then(|s| s.to_str())
@@ -290,7 +326,11 @@ pub fn load(path: &Path) -> Result<Document> {
     validate_size(manifest.document.width, manifest.document.height)?;
     for layer in &mut manifest.document.layers {
         if let Some(raw) = &mut layer.raw {
-            let bytes = zip_read(&mut archive, &format!("raw/{}.nef", layer.id), MAX_ASSET)?;
+            let bytes = zip_read(
+                &mut archive,
+                &format!("raw/{}.nef", layer.id),
+                max_asset_bytes(),
+            )?;
             used_raw += bytes.len() as u64;
             ensure!(
                 used_raw <= crate::raw::MAX_RAW_BYTES,
@@ -300,14 +340,18 @@ pub fn load(path: &Path) -> Result<Document> {
             raw.validate()?;
         }
         if manifest.pixel_layers.contains(&layer.id) {
-            let bytes = zip_read(&mut archive, &format!("images/{}.png", layer.id), MAX_ASSET)?;
+            let bytes = zip_read(
+                &mut archive,
+                &format!("images/{}.png", layer.id),
+                max_asset_bytes(),
+            )?;
             layer.pixels = Some(Arc::new(decode_image(bytes, &mut used_pixels)?.to_rgba8()));
         }
         if let Some(mask) = &mut layer.mask {
             let bytes = zip_read(
                 &mut archive,
                 &format!("images/{}.mask.png", layer.id),
-                MAX_ASSET,
+                max_asset_bytes(),
             )?;
             mask.pixels = Arc::new(decode_image(bytes, &mut used_masks)?.to_luma8());
         }
@@ -764,7 +808,7 @@ pub fn load_compositor(path: &Path) -> Result<Document> {
                 name.eq_ignore_ascii_case(&format!("{id}.png")),
                 "Unsafe layer asset path"
             );
-            let bytes = package_read(path, &Path::new("images").join(name), MAX_ASSET)?;
+            let bytes = package_read(path, &Path::new("images").join(name), max_asset_bytes())?;
             layer.pixels = Some(Arc::new(decode_image(bytes, &mut image_pixels)?.to_rgba8()));
         }
         if let Some(name) = record["maskFile"].as_str() {
@@ -1704,4 +1748,28 @@ mod tests {
         assert_eq!(style.start, None);
         assert_eq!(style.end, None);
     }
+}
+
+#[test]
+fn asset_and_image_limits_follow_the_machine() {
+    let small = 2 * 1024 * 1024 * 1024;
+    // A small machine reads no larger an asset than it has memory for, while a
+    // roomy one is held to the gibibyte an image of 200 megapixels can need.
+    assert_eq!(max_asset_bytes_for(small), 512 * 1024 * 1024);
+    assert_eq!(
+        max_asset_bytes_for(64 * 1024 * 1024 * 1024),
+        1024 * 1024 * 1024
+    );
+    assert!(max_asset_bytes() <= MAX_ASSET);
+    // Every decoded image passes through validate_size, so an image past this
+    // machine's share of memory is refused there, with the ceiling in the
+    // message rather than as a silent failure.
+    let allowed = crate::document::image_pixels_allowed(memory::total_bytes());
+    let side = (allowed as f64).sqrt() as u32 + 1;
+    let error = crate::document::validate_size(side, side).unwrap_err();
+    assert!(
+        error.to_string().contains("megapixels"),
+        "the refusal names the ceiling: {error}"
+    );
+    assert!(crate::document::validate_size(2, 2).is_ok());
 }
