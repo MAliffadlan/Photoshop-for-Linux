@@ -56,6 +56,100 @@ impl Default for Overlay {
     }
 }
 
+/// One colour grading wheel: a hue and saturation that tint a tonal region, and
+/// a luminance shift laid over it. Compositor 1.2.3's Color Grading, ported with
+/// the same ranges the panel's sliders use.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct GradeWheel {
+    /// The hue the tint is taken from, 0-360 degrees.
+    #[serde(default)]
+    pub hue: f32,
+    /// How much of that hue is mixed in, 0-100.
+    #[serde(default)]
+    pub saturation: f32,
+    /// How far the region's brightness moves, -100-100.
+    #[serde(default)]
+    pub luminance: f32,
+}
+
+impl GradeWheel {
+    /// Whether this wheel asks for any change at all.
+    pub fn adjusts(&self) -> bool {
+        self.saturation > 0.0 || self.luminance != 0.0
+    }
+
+    fn validate(&self) -> Result<()> {
+        range(self.hue, 0.0, 360.0)?;
+        range(self.saturation, 0.0, 100.0)?;
+        range(self.luminance, -100.0, 100.0)
+    }
+}
+
+/// The four grading wheels, plus how far the three tonal ones reach over each
+/// other and which end of the range they favour.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Grading {
+    #[serde(default)]
+    pub shadows: GradeWheel,
+    #[serde(default)]
+    pub midtones: GradeWheel,
+    #[serde(default)]
+    pub highlights: GradeWheel,
+    #[serde(default)]
+    pub global: GradeWheel,
+    /// How much the three tonal wheels overlap, 0-100.
+    #[serde(default = "default_blending")]
+    pub blending: f32,
+    /// Which end the tonal wheels favour, -100-100; positive favours highlights.
+    #[serde(default)]
+    pub balance: f32,
+}
+
+/// The blending that makes the three tonal wheels meet in the middle, which is
+/// not a zero: each tonal wheel has to reach its neighbours to grade the range
+/// it is given.
+const DEFAULT_BLENDING: f32 = 50.0;
+
+fn default_blending() -> f32 {
+    DEFAULT_BLENDING
+}
+
+impl Default for Grading {
+    fn default() -> Self {
+        Self {
+            shadows: GradeWheel::default(),
+            midtones: GradeWheel::default(),
+            highlights: GradeWheel::default(),
+            global: GradeWheel::default(),
+            blending: DEFAULT_BLENDING,
+            balance: 0.0,
+        }
+    }
+}
+
+impl Grading {
+    /// The four wheels in the order the pipeline applies them: the three tonal
+    /// ones first, then the global one.
+    pub fn wheels(&self) -> [GradeWheel; 4] {
+        [self.shadows, self.midtones, self.highlights, self.global]
+    }
+
+    /// Whether any wheel asks for a change, which is what a project format has
+    /// to know: a camera file is developed again when a project is opened, so
+    /// dropping the grading would change the picture.
+    pub fn adjusts(&self) -> bool {
+        self.wheels().iter().any(GradeWheel::adjusts)
+    }
+
+    fn validate(&self) -> Result<()> {
+        for wheel in self.wheels() {
+            wheel.validate()?;
+        }
+        range(self.blending, 0.0, 100.0)?;
+        range(self.balance, -100.0, 100.0)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DevelopSettings {
@@ -85,6 +179,8 @@ pub struct DevelopSettings {
     pub shadow_tone: [f32; 2],
     pub highlight_tone: [f32; 2],
     pub tone_balance: f32,
+    /// The colour grading wheels, applied after the tone curve and the mixer.
+    pub grading: Grading,
     pub luminance_noise: f32,
     pub color_noise: f32,
     pub sharpen: f32,
@@ -128,6 +224,7 @@ impl Default for DevelopSettings {
             shadow_tone: [220.0, 0.0],
             highlight_tone: [45.0, 0.0],
             tone_balance: 0.0,
+            grading: Grading::default(),
             luminance_noise: 0.0,
             color_noise: 20.0,
             sharpen: 25.0,
@@ -231,6 +328,7 @@ impl DevelopSettings {
             range(overlay.saturation, -100.0, 100.0)?;
         }
         ensure!(points <= 8192, "Too many RAW brush points (maximum 8192)");
+        self.grading.validate()?;
         Ok(())
     }
 }

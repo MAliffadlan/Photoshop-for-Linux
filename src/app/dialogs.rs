@@ -1748,6 +1748,14 @@ fn camera_raw_panel(
             }
             settings.highlight_tone[1] = settings.highlight_tone[1].clamp(0.0, 100.0);
             changed |= widget_row(ui, "Balance", &mut settings.tone_balance, -100.0..=100.0);
+            ui.add_space(6.0);
+            // Open by default, as Compositor 1.3.2 has it: the wheels are the
+            // last thing a reader looks for on a page they have developed.
+            egui::CollapsingHeader::new("Color grading")
+                .default_open(true)
+                .show(ui, |ui| {
+                    changed |= super::develop_controls::grading(ui, &mut settings.grading);
+                });
         }
         2 => {
             for (label, value, range) in [

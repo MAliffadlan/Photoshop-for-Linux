@@ -149,7 +149,7 @@ pub(crate) fn crop(s: &DevelopSettings, size: [u32; 2]) -> [u32; 4] {
 
 fn settings(raw: &DecodedRaw, s: &DevelopSettings, wb: [f32; 3], depth: u32) -> Vec<[f32; 4]> {
     let (sin, cos) = s.rotation.to_radians().sin_cos();
-    let mut p = vec![[0.0; 4]; 32];
+    let mut p = vec![[0.0; 4]; 36];
     p[0] = [
         raw.camera.width() as f32,
         raw.camera.height() as f32,
@@ -178,6 +178,12 @@ fn settings(raw: &DecodedRaw, s: &DevelopSettings, wb: [f32; 3], depth: u32) -> 
         s.highlight_tone[0],
         s.highlight_tone[1],
     ];
+    p[15] = [
+        s.grading.blending,
+        s.grading.balance,
+        if s.grading.adjusts() { 1.0 } else { 0.0 },
+        0.0,
+    ];
     p[14][0] = depth as f32;
     for (i, curve) in s.curves.iter().enumerate() {
         p[16 + i * 2].copy_from_slice(&curve[..4]);
@@ -188,6 +194,14 @@ fn settings(raw: &DecodedRaw, s: &DevelopSettings, wb: [f32; 3], depth: u32) -> 
         .enumerate()
     {
         p[24 + i] = [s.hsl[i][0], s.hsl[i][1], s.hsl[i][2], *hue];
+    }
+    for (i, wheel) in s.grading.wheels().into_iter().enumerate() {
+        p[32 + i] = [
+            wheel.hue,
+            wheel.saturation,
+            wheel.luminance,
+            if wheel.adjusts() { 1.0 } else { 0.0 },
+        ];
     }
     p
 }

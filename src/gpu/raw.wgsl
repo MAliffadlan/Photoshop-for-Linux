@@ -169,6 +169,46 @@ fn raw_rgb(hsl: vec3<f32>) -> vec3<f32> {
     return rgb + hsl.z - c * 0.5;
 }
 
+// The colour grading wheels, in Compositor's order: the three tonal wheels
+// weighted by how dark or bright the pixel is, then the global one at full
+// weight. config[15] carries the blending, the balance and whether any wheel
+// asks for a change at all, so a neutral grading costs nothing and leaves the
+// pixels exactly as the tone work left them.
+fn raw_grade(rgb: vec3<f32>) -> vec3<f32> {
+    if (config[15].z == 0.0) {
+        return rgb;
+    }
+    var color = rgb;
+    let tone = raw_luma(color);
+    let split = 0.5 - config[15].y / 100.0 * 0.2;
+    let reach = 0.12 + config[15].x / 100.0 * 0.38;
+    let span = max(reach * 2.0, 0.05);
+    var weights = vec4(clamp((split + reach - tone) / span, 0.0, 1.0),
+                       clamp(1.0 - abs(tone - split) / (0.35 + reach), 0.0, 1.0),
+                       clamp((tone - (split - reach)) / span, 0.0, 1.0), 1.0);
+    let sum = weights.x + weights.y + weights.z;
+    if (sum > 0.0001) {
+        weights = vec4(weights.xyz / sum, 1.0);
+    }
+    for (var wheel_index = 0u; wheel_index < 4u; wheel_index++) {
+        let wheel = config[32u + wheel_index];
+        let weight = weights[wheel_index];
+        if (wheel.w == 0.0 || weight <= 0.0) {
+            continue;
+        }
+        if (wheel.y > 0.0) {
+            let tint = raw_rgb(vec3(wheel.x, 1.0, 0.5));
+            color += (tint - 0.5) * (wheel.y / 100.0 * weight * 0.85);
+        }
+        if (wheel.z != 0.0) {
+            let luma = max(raw_luma(color), 0.00001);
+            let wanted = clamp(luma + wheel.z / 100.0 * 0.25 * weight, 0.0, 1.0);
+            color = clamp(color * (wanted / luma), vec3(0.0), vec3(1.0));
+        }
+    }
+    return clamp(color, vec3(0.0), vec3(1.0));
+}
+
 @compute @workgroup_size(8, 8)
 fn raw_tone(@builtin(global_invocation_id) id: vec3<u32>) {
     let size = vec2<u32>(config[0].xy);
@@ -211,6 +251,7 @@ fn raw_tone(@builtin(global_invocation_id) id: vec3<u32>) {
     let tones = config[12];
     rgb = mix(rgb, raw_rgb(vec3(tones.x, 1.0, 0.5)), tones.y / 100.0 * (1.0 - high) * 0.35);
     rgb = mix(rgb, raw_rgb(vec3(tones.z, 1.0, 0.5)), tones.w / 100.0 * high * 0.35);
+    rgb = raw_grade(rgb);
     store_float(i, vec4(rgb, p.a));
 }
 

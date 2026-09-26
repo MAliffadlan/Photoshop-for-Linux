@@ -4,7 +4,7 @@ use anyhow::{Result, ensure};
 use image::{ImageBuffer, Primitive, Rgb32FImage, Rgba, RgbaImage};
 use rayon::prelude::*;
 
-use super::{DecodedRaw, DevelopSettings, Overlay, OverlayKind, WhiteBalance};
+use super::{DecodedRaw, DevelopSettings, Grading, Overlay, OverlayKind, WhiteBalance};
 use crate::document::Point;
 
 fn luminance(p: [f32; 3]) -> f32 {
@@ -555,5 +555,54 @@ fn tone(mut rgb: [f32; 3], s: &DevelopSettings) -> [f32; 3] {
             rgb[c] = rgb[c] * (1.0 - amount) + color[c] * amount;
         }
     }
-    rgb
+    grade(rgb, &s.grading)
+}
+
+/// The colour grading wheels, in Compositor's order: the three tonal wheels
+/// first, weighted by how dark or bright the pixel is, then the global one at
+/// full weight.
+///
+/// The weights come straight from Compositor's kernel. Balance moves the
+/// crossover between the shadow and highlight wheels — toward highlights it has
+/// to move down, so more of the picture counts as highlight and the shadow
+/// wheel loses its hold, because the other sign strengthened the shadow tint it
+/// was meant to weaken. Blending widens how far each wheel reaches.
+pub(super) fn grade(mut rgb: [f32; 3], grading: &Grading) -> [f32; 3] {
+    if !grading.adjusts() {
+        return rgb;
+    }
+    let tone = luminance(rgb);
+    let split = 0.5 - grading.balance / 100.0 * 0.2;
+    let reach = 0.12 + grading.blending / 100.0 * 0.38;
+    let span = (reach * 2.0).max(0.05);
+    let mut weights = [
+        ((split + reach - tone) / span).clamp(0.0, 1.0),
+        (1.0 - (tone - split).abs() / (0.35 + reach)).clamp(0.0, 1.0),
+        ((tone - (split - reach)) / span).clamp(0.0, 1.0),
+        1.0,
+    ];
+    let sum = weights[..3].iter().sum::<f32>();
+    if sum > 0.0001 {
+        for weight in &mut weights[..3] {
+            *weight /= sum;
+        }
+    }
+    for (wheel, weight) in grading.wheels().into_iter().zip(weights) {
+        if weight <= 0.0 || !wheel.adjusts() {
+            continue;
+        }
+        if wheel.saturation > 0.0 {
+            let tint = from_hsl([wheel.hue, 1.0, 0.5]);
+            let amount = wheel.saturation / 100.0 * weight * 0.85;
+            for (channel, value) in rgb.iter_mut().enumerate() {
+                *value += (tint[channel] - 0.5) * amount;
+            }
+        }
+        if wheel.luminance != 0.0 {
+            let target = (luminance(rgb) + wheel.luminance / 100.0 * 0.25 * weight).clamp(0.0, 1.0);
+            let gain = target / luminance(rgb).max(0.00001);
+            rgb = rgb.map(|value| (value * gain).clamp(0.0, 1.0));
+        }
+    }
+    rgb.map(|value| value.clamp(0.0, 1.0))
 }

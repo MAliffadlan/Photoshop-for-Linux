@@ -268,16 +268,67 @@ fn the_camera_raw_filter_panel_pages_through_and_keeps_its_settings() {
         tint: 0.0,
     });
     assert!(app.dialog == Some(Dialog::Effect));
+    // The Tone page is longer than the panel is tall, so the panel is opened on
+    // a taller screen: a window keeps the place it was given, and its body
+    // scrolls inside a height taken from the screen it was opened on.
+    tall_frame(&context, &mut app);
     // Every page draws, and the page the user is on is kept between frames.
     for page in 0..6 {
         let mut edit = app.effect.take().unwrap();
         edit.camera_raw_page = page;
         edit.refresh = true;
         app.effect = Some(edit);
-        frame(&context, &mut app);
+        tall_frame(&context, &mut app);
         assert!(app.error.is_none(), "page {page}: {:?}", app.error);
         assert_eq!(app.effect.as_ref().unwrap().camera_raw_page, page);
     }
+    // The Tone page carries the grading wheels, at the end of the page beside
+    // the split toning they follow.
+    let mut edit = app.effect.take().unwrap();
+    edit.camera_raw_page = 1;
+    app.effect = Some(edit);
+    let output = tall_frame(&context, &mut app);
+    let texts: Vec<&str> = output
+        .shapes
+        .iter()
+        .filter_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) => Some(text.galley.text()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        texts.contains(&"Color grading"),
+        "the filter panel offers the wheels: {texts:?}"
+    );
+    // The section is open, as Compositor 1.3.2 has it, and picking a tint off a
+    // disc edits the filter's own settings: the same wheels the Develop panel
+    // shows, reached through the panel's own controls.
+    let opened = tall_frame(&context, &mut app);
+    let (center, radius) = opened
+        .shapes
+        .iter()
+        .filter_map(|shape| match &shape.shape {
+            egui::Shape::Circle(circle) if circle.radius >= 20.0 => {
+                Some((circle.center, circle.radius))
+            }
+            _ => None,
+        })
+        .min_by(|a, b| a.0.x.total_cmp(&b.0.x))
+        .expect("the opened section draws a wheel");
+    let top = center + Vec2::new(0.0, -radius + 1.0);
+    tall_pointer(&context, &mut app, top, Some(true), 3.0);
+    tall_pointer(&context, &mut app, top, Some(false), 3.0);
+    tall_frame(&context, &mut app);
+    let edit = app.effect.as_ref().unwrap();
+    let Filter::CameraRaw { settings, .. } = edit.filter.as_ref().unwrap() else {
+        panic!("the filter is still the Camera Raw filter");
+    };
+    assert!(
+        settings.grading.shadows.saturation > 95.0 && settings.grading.shadows.hue < 1.0,
+        "the wheel under the pointer reached the filter: {:?}",
+        settings.grading.shadows
+    );
+
     // The controls reach the filter, and the filter keeps them.
     let mut edit = app.effect.take().unwrap();
     edit.camera_raw_page = 0;
@@ -1864,6 +1915,58 @@ fn frame(context: &egui::Context, app: &mut EditorApp) -> egui::FullOutput {
             screen_rect: Some(egui::Rect::from_min_size(
                 Pos2::ZERO,
                 Vec2::new(1280.0, 860.0),
+            )),
+            ..Default::default()
+        },
+        |ctx| app.show(ctx),
+    );
+    assert!(!output.shapes.is_empty());
+    output
+}
+
+/// A click on the taller screen, at a time of the caller's choosing: egui reads
+/// two clicks inside 300 ms as one double click, so a caller that wants two
+/// separate taps moves the clock on.
+fn tall_pointer(
+    context: &egui::Context,
+    app: &mut EditorApp,
+    pos: Pos2,
+    pressed: Option<bool>,
+    time: f64,
+) -> egui::FullOutput {
+    let mut events = vec![egui::Event::PointerMoved(pos)];
+    if let Some(pressed) = pressed {
+        events.push(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        });
+    }
+    let output = context.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                Pos2::ZERO,
+                Vec2::new(1280.0, 1800.0),
+            )),
+            events,
+            time: Some(time),
+            ..Default::default()
+        },
+        |ctx| app.show(ctx),
+    );
+    assert!(!output.shapes.is_empty());
+    output
+}
+
+/// The same frame on a taller screen, so a panel whose content is longer than
+/// the usual window still draws all of it.
+fn tall_frame(context: &egui::Context, app: &mut EditorApp) -> egui::FullOutput {
+    let output = context.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                Pos2::ZERO,
+                Vec2::new(1280.0, 1800.0),
             )),
             ..Default::default()
         },

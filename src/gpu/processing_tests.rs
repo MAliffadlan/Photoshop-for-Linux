@@ -21,6 +21,34 @@ fn fixture(w: u32, h: u32) -> RgbaImage {
         ])
     })
 }
+/// A small RAW frame with a colour matrix, an as-shot white balance and a
+/// greenish cast, so a develop that only tints can be told apart from one that
+/// does nothing.
+fn raw_fixture() -> crate::raw::DecodedRaw {
+    use crate::raw::{DecodedRaw, RawMetadata};
+    DecodedRaw {
+        camera: image::Rgb32FImage::from_fn(89, 67, |x, y| {
+            image::Rgb([
+                0.03 + (x * x % 231) as f32 / 180.0,
+                0.01 + (x * y % 137) as f32 / 100.0,
+                0.02 + (y * y % 193) as f32 / 190.0,
+            ])
+        }),
+        alpha: None,
+        as_shot: [1.15, 1.0, 0.92],
+        camera_to_rgb: [
+            [1.1, -0.06, -0.04],
+            [-0.07, 1.13, -0.06],
+            [-0.04, -0.06, 1.1],
+        ],
+        xyz_to_camera: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        metadata: RawMetadata {
+            width: 89,
+            height: 67,
+            ..Default::default()
+        },
+    }
+}
 fn compare(a: &RgbaImage, b: &RgbaImage, tolerance: u8) {
     assert_eq!(a.dimensions(), b.dimensions());
     let mut max = 0;
@@ -249,28 +277,7 @@ fn processing_raw_matches_cpu_at_both_depths() {
     use crate::raw::*;
     use std::sync::atomic::AtomicBool;
     let gpu = processor();
-    let raw = DecodedRaw {
-        camera: image::Rgb32FImage::from_fn(89, 67, |x, y| {
-            image::Rgb([
-                0.03 + (x * x % 231) as f32 / 180.0,
-                0.01 + (x * y % 137) as f32 / 100.0,
-                0.02 + (y * y % 193) as f32 / 190.0,
-            ])
-        }),
-        alpha: None,
-        as_shot: [1.15, 1.0, 0.92],
-        camera_to_rgb: [
-            [1.1, -0.06, -0.04],
-            [-0.07, 1.13, -0.06],
-            [-0.04, -0.06, 1.1],
-        ],
-        xyz_to_camera: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
-        metadata: RawMetadata {
-            width: 89,
-            height: 67,
-            ..Default::default()
-        },
-    };
+    let raw = raw_fixture();
     let mut settings = DevelopSettings {
         exposure: -0.3,
         brightness: 12.0,
@@ -344,7 +351,34 @@ fn processing_raw_matches_cpu_at_both_depths() {
         settings.clone(),
         DevelopSettings {
             monochrome: true,
-            ..settings
+            ..settings.clone()
+        },
+        DevelopSettings {
+            grading: Grading {
+                shadows: GradeWheel {
+                    hue: 214.0,
+                    saturation: 47.0,
+                    luminance: -23.0,
+                },
+                midtones: GradeWheel {
+                    hue: 43.0,
+                    saturation: 31.0,
+                    luminance: 17.0,
+                },
+                highlights: GradeWheel {
+                    hue: 96.0,
+                    saturation: 39.0,
+                    luminance: 0.0,
+                },
+                global: GradeWheel {
+                    hue: 318.0,
+                    saturation: 13.0,
+                    luminance: 7.0,
+                },
+                blending: 71.0,
+                balance: -29.0,
+            },
+            ..settings.clone()
         },
     ] {
         let [l, t, r, b] = super::raw_crop(&s, [89, 67]);
@@ -377,6 +411,89 @@ fn processing_raw_matches_cpu_at_both_depths() {
         assert!(
             error <= 8 || (s.sharpen_threshold > 0.0 && error <= 256 && outliers <= 8),
             "16-bit RAW error {error}, outliers {outliers}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires native compute adapter"]
+fn processing_raw_grading_matches_cpu_at_both_depths() {
+    use crate::raw::{GradeWheel, Grading, *};
+    use std::sync::atomic::AtomicBool;
+    let gpu = processor();
+    let raw = raw_fixture();
+    let cancel = AtomicBool::new(false);
+    // The sharpening pass is left out on purpose: its hard cutoff makes a
+    // software adapter disagree with the CPU at a few boundary pixels, which
+    // would hide whether the grading itself agrees.
+    let quiet = DevelopSettings {
+        sharpen: 0.0,
+        color_noise: 0.0,
+        luminance_noise: 0.0,
+        ..Default::default()
+    };
+    let wheel = |hue: f32, saturation: f32, luminance: f32| GradeWheel {
+        hue,
+        saturation,
+        luminance,
+    };
+    for grading in [
+        Grading::default(),
+        Grading {
+            shadows: wheel(214.0, 47.0, -23.0),
+            blending: 50.0,
+            balance: 0.0,
+            ..Grading::default()
+        },
+        Grading {
+            midtones: wheel(43.0, 31.0, 17.0),
+            highlights: wheel(96.0, 39.0, 0.0),
+            global: wheel(318.0, 13.0, 7.0),
+            blending: 71.0,
+            balance: -29.0,
+            ..Grading::default()
+        },
+        Grading {
+            shadows: wheel(0.0, 100.0, -60.0),
+            highlights: wheel(120.0, 100.0, 60.0),
+            blending: 0.0,
+            balance: 100.0,
+            ..Grading::default()
+        },
+    ] {
+        let s = DevelopSettings {
+            grading,
+            ..quiet.clone()
+        };
+        let [l, t, r, b] = super::raw_crop(&s, [89, 67]);
+        let actual = RgbaImage::from_raw(
+            r - l,
+            b - t,
+            gpu.develop(&raw, &s, raw.as_shot, 8, &cancel).unwrap(),
+        )
+        .unwrap();
+        let expected = crate::raw::render(&raw, &s, &cancel).unwrap();
+        compare(&actual, &expected, 1);
+        let actual = gpu.develop(&raw, &s, raw.as_shot, 16, &cancel).unwrap();
+        let expected = crate::raw::render_16(&raw, &s, &cancel).unwrap();
+        let diffs: Vec<u32> = actual
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .zip(expected.as_raw())
+            .map(|(a, &b)| u32::from(u16::from_le_bytes(*a).abs_diff(b)))
+            .collect();
+        // A wheel's luminance shift multiplies the pixel, and a software
+        // adapter's divide lands a few steps away from the CPU's, so a midtone
+        // can end up a little off where the CPU put it: a tenth of a percent of
+        // full scale. Bound the magnitude and the frequency instead of letting
+        // one rounding boundary fail the comparison, which is what would catch
+        // a wrong weight or a wheel the shader skipped.
+        let error = *diffs.iter().max().unwrap();
+        let outliers = diffs.iter().filter(|diff| **diff > 64).count();
+        assert!(
+            error <= 64 && outliers <= 8,
+            "16-bit grading error {error}, outliers {outliers}"
         );
     }
 }

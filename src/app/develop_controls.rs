@@ -1,11 +1,12 @@
 use std::{
+    f32::consts::TAU,
     fs::File,
     io::{Read, Write},
     ops::RangeInclusive,
 };
 
 use egui::{Color32, Sense, Stroke, pos2, vec2};
-use mectov::raw::{self, DevelopSettings, Overlay, OverlayKind, WhiteBalance};
+use mectov::raw::{self, DevelopSettings, GradeWheel, Grading, Overlay, OverlayKind, WhiteBalance};
 
 use super::{develop::Develop, theme, widgets};
 
@@ -282,6 +283,172 @@ fn tones(ui: &mut egui::Ui, d: &mut Develop) {
         0.0..=100.0,
     );
     percent(ui, "Balance", &mut d.settings.tone_balance);
+    // Open by default, as Compositor 1.3.2 has it: the wheels are the last thing
+    // a reader looks for on a page they have developed.
+    egui::CollapsingHeader::new("Color grading")
+        .default_open(true)
+        .show(ui, |ui| {
+            grading(ui, &mut d.settings.grading);
+        });
+}
+
+/// The colour grading wheels, in the order the engine applies them: the three
+/// tonal wheels, then the global one, with the blending and balance that decide
+/// how far each tonal wheel reaches over the others.
+///
+/// The Develop panel and the Camera Raw filter both show this, so it draws with
+/// the app's own slider and the same double-click reset the rest of the panel
+/// uses, and reports whether anything moved so the filter can mark itself
+/// edited.
+pub(super) fn grading(ui: &mut egui::Ui, grading: &mut Grading) -> bool {
+    let mut changed = false;
+    // The four wheels share the width the panel has, so the section fits the
+    // Develop panel and the narrower filter dialog alike.
+    let column =
+        ((ui.available_width() - 3.0 * ui.spacing().item_spacing.x) / 4.0).clamp(48.0, 112.0);
+    ui.horizontal(|ui| {
+        for (name, each) in [
+            ("Shadows", &mut grading.shadows),
+            ("Midtones", &mut grading.midtones),
+            ("Highlights", &mut grading.highlights),
+            ("Global", &mut grading.global),
+        ] {
+            changed |= wheel(ui, name, each, column);
+        }
+    });
+    ui.add_space(4.0);
+    changed |= ui
+        .add(
+            widgets::Slider::new(&mut grading.blending, 0.0..=100.0)
+                .percentage()
+                .text("Blending"),
+        )
+        .changed();
+    changed |= ui
+        .add(
+            widgets::Slider::new(&mut grading.balance, -100.0..=100.0)
+                .percentage()
+                .text("Balance"),
+        )
+        .changed();
+    changed
+}
+
+/// The colour one wheel picks, at the strength the puck sits from the centre.
+fn wheel_color(hue: f32, saturation: f32) -> Color32 {
+    let [r, g, b] = mectov::effects::hsl_to_rgb([hue, saturation, 0.5]);
+    Color32::from_rgb(
+        (r * 255.0).round() as u8,
+        (g * 255.0).round() as u8,
+        (b * 255.0).round() as u8,
+    )
+}
+
+/// One wheel: a disc the puck rides, and the luminance shift that rides with it.
+/// The puck's angle is the hue, its distance from the centre the tint's
+/// strength, and a double click on the disc returns the wheel to neutral, the
+/// same gesture the sliders use.
+fn wheel(ui: &mut egui::Ui, name: &str, wheel: &mut GradeWheel, column: f32) -> bool {
+    ui.vertical(|ui| {
+        // A plain label sizes itself to the name, so a column stays as narrow as
+        // the disc rather than taking the whole row.
+        ui.label(name);
+        let size = (column - ui.spacing().item_spacing.x).clamp(36.0, 104.0);
+        let (rect, response) = ui.allocate_exact_size(vec2(size, size), Sense::click_and_drag());
+        let center = rect.center();
+        let radius = size / 2.0 - 1.0;
+        let painter = ui.painter();
+        // The disc: hue around the rim, strength outward, so the puck can sit
+        // anywhere in it. A neutral disc underneath keeps the middle from
+        // reading as a colour of its own.
+        const RINGS: usize = 4;
+        const SLICES: usize = 24;
+        painter.circle_filled(center, radius, theme::FIELD);
+        for ring in 0..RINGS {
+            let inner = ring as f32 / RINGS as f32;
+            let outer = (ring + 1) as f32 / RINGS as f32;
+            let saturation = outer * 0.9;
+            for slice in 0..SLICES {
+                let start = slice as f32 / SLICES as f32 * TAU;
+                let end = (slice + 1) as f32 / SLICES as f32 * TAU;
+                let middle = (start + end) / 2.0;
+                let point = |angle: f32, reach: f32| {
+                    pos2(
+                        center.x + angle.sin() * radius * reach,
+                        center.y - angle.cos() * radius * reach,
+                    )
+                };
+                let color = wheel_color(middle.to_degrees().rem_euclid(360.0), saturation);
+                let wedge = if ring == 0 {
+                    vec![center, point(end, outer), point(start, outer)]
+                } else {
+                    vec![
+                        point(start, inner),
+                        point(end, inner),
+                        point(end, outer),
+                        point(start, outer),
+                    ]
+                };
+                painter.add(egui::Shape::convex_polygon(wedge, color, Stroke::NONE));
+            }
+        }
+        painter.circle_stroke(center, radius, Stroke::new(0.5_f32, theme::DIVIDER));
+        let mut changed = false;
+        if response.double_clicked() {
+            *wheel = GradeWheel::default();
+            changed = true;
+        } else if (response.dragged() || response.clicked())
+            && let Some(pointer) = response.interact_pointer_pos()
+        {
+            let offset = pointer - center;
+            if offset.length() > 0.0 {
+                // Hue runs clockwise from the top, the way a colour wheel is
+                // read, so red is where a reader expects it.
+                wheel.hue = offset.x.atan2(-offset.y).to_degrees().rem_euclid(360.0);
+            }
+            wheel.saturation = (offset.length() / radius * 100.0).clamp(0.0, 100.0);
+            changed = true;
+        }
+        // The puck: the tint it points at, ringed in white or black so the
+        // luminance shift reads at a glance.
+        let angle = wheel.hue.to_radians();
+        let reach = wheel.saturation / 100.0;
+        let puck = pos2(
+            center.x + angle.sin() * radius * reach,
+            center.y - angle.cos() * radius * reach,
+        );
+        painter.circle_filled(puck, 4.5, wheel_color(wheel.hue, 0.9));
+        painter.circle_stroke(
+            puck,
+            4.5,
+            Stroke::new(
+                1.5_f32,
+                if wheel.luminance < 0.0 {
+                    Color32::BLACK
+                } else {
+                    Color32::WHITE
+                },
+            ),
+        );
+        // The luminance shift rides under its wheel: a bare track rather than a
+        // labelled slider, because the column is only as wide as the disc, and a
+        // double click returns the shift to neutral like every other slider.
+        // egui's slider takes its width from the panel's spacing, which is a
+        // whole row wide in the filter dialog, so the column lends it its own.
+        let panel_width = ui.spacing_mut().slider_width;
+        ui.spacing_mut().slider_width = size;
+        let mut response = ui.add_sized(
+            [size, 18.0],
+            egui::Slider::new(&mut wheel.luminance, -100.0..=100.0)
+                .clamping(egui::SliderClamping::Edits)
+                .show_value(false),
+        );
+        ui.spacing_mut().slider_width = panel_width;
+        response = response.on_hover_text("Luminance");
+        widgets::reset_on_double_click(ui, &mut response, &mut wheel.luminance, 0.0);
+        changed | response.changed()
+    })
+    .inner
 }
 
 fn detail(ui: &mut egui::Ui, d: &mut Develop) {
@@ -671,5 +838,151 @@ fn load_preset(d: &mut Develop) {
             d.selected_overlay = None;
         }
         Err(error) => d.error = Some(format!("Could not load RAW settings: {error}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui::{Pos2, Rect, vec2};
+
+    /// The grading section the way a reader meets it: collapsed at the end of a
+    /// page and opened by its header. The clock is handed in because egui reads
+    /// two clicks in the same 300 ms as one double click, whatever they landed
+    /// on.
+    fn frame(
+        ctx: &egui::Context,
+        state: &mut Grading,
+        time: f64,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(760.0, 420.0))),
+                time: Some(time),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    egui::CollapsingHeader::new("Color grading")
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            grading(ui, state);
+                        });
+                });
+            },
+        )
+    }
+
+    /// A press and a release `gap` seconds after the last click.
+    fn tap(ctx: &egui::Context, state: &mut Grading, at: Pos2, now: &mut f64, gap: f64) {
+        let events = |pressed| {
+            vec![
+                egui::Event::PointerMoved(at),
+                egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]
+        };
+        frame(ctx, state, *now, events(true));
+        *now += gap;
+        frame(ctx, state, *now, events(false));
+    }
+
+    fn text_pos(output: &egui::FullOutput, wanted: &str) -> Pos2 {
+        output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == wanted => Some(text.pos),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("Missing the {wanted} label"))
+    }
+
+    /// The first disc painted, found by its rim: no other control on the page
+    /// draws a circle that large.
+    fn first_disc(output: &egui::FullOutput) -> (Pos2, f32) {
+        output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Circle(circle) if circle.radius >= 20.0 => {
+                    Some((circle.center, circle.radius))
+                }
+                _ => None,
+            })
+            .min_by(|a, b| a.0.x.total_cmp(&b.0.x))
+            .unwrap_or_else(|| panic!("Missing a grading disc"))
+    }
+
+    /// A reader opens the section, then picks a tint off a disc: the top of it
+    /// is red at full strength and the right of it yellow, and only the wheel
+    /// under the pointer moves.
+    #[test]
+    fn a_grading_disc_picks_the_tint_under_the_pointer() {
+        let ctx = egui::Context::default();
+        let mut state = Grading::default();
+        let mut now = 0.0;
+        let opened = frame(&ctx, &mut state, now, Vec::new());
+        text_pos(&opened, "Color grading");
+        let (center, radius) = first_disc(&opened);
+        for (offset, hue) in [
+            (vec2(0.0, -radius + 1.0), 0.0),
+            (vec2(radius - 1.0, 0.0), 90.0),
+            (vec2(0.0, radius - 1.0), 180.0),
+        ] {
+            tap(&ctx, &mut state, center + offset, &mut now, 0.5);
+            frame(&ctx, &mut state, now, Vec::new());
+            let wheel = state.shadows;
+            assert!(
+                (wheel.hue - hue).abs() < 1.0,
+                "the pointer at {offset:?} picked hue {}",
+                wheel.hue
+            );
+            assert!(
+                wheel.saturation > 95.0,
+                "at full strength: {}",
+                wheel.saturation
+            );
+            assert!(!state.midtones.adjusts(), "the other wheels are untouched");
+        }
+    }
+
+    /// A double click on a disc returns that wheel to neutral, the way a double
+    /// click on a slider track returns it to its default.
+    #[test]
+    fn a_double_click_on_a_disc_returns_the_wheel_to_neutral() {
+        let ctx = egui::Context::default();
+        let mut state = Grading {
+            shadows: GradeWheel {
+                hue: 210.0,
+                saturation: 60.0,
+                luminance: -30.0,
+            },
+            blending: 20.0,
+            ..Grading::default()
+        };
+        let mut now = 0.0;
+        let (center, radius) = first_disc(&frame(&ctx, &mut state, now, Vec::new()));
+        let at = center + vec2(0.0, -(radius - 4.0));
+        tap(&ctx, &mut state, at, &mut now, 0.1);
+        assert!(
+            state.shadows.saturation > 90.0 && state.shadows.luminance == -30.0,
+            "the tap moved the tint and left the shift alone: {:?}",
+            state.shadows
+        );
+        tap(&ctx, &mut state, at, &mut now, 0.05);
+        frame(&ctx, &mut state, now, Vec::new());
+        assert_eq!(
+            state.shadows,
+            GradeWheel::default(),
+            "the second click of the pair returns the wheel to neutral"
+        );
+        assert_eq!(state.blending, 20.0, "the sliders beside it are untouched");
     }
 }

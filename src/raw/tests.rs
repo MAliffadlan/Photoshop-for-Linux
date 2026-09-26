@@ -466,3 +466,285 @@ fn a_cancelled_camera_raw_filter_says_so() {
     let cancel = AtomicBool::new(true);
     assert!(filter::render_filter(&pixels, &asked, 0.0, 0.0, &cancel).is_err());
 }
+
+#[test]
+fn a_neutral_grading_changes_nothing_and_says_so() {
+    let pixels = RgbaImage::from_fn(24, 16, |x, y| {
+        Rgba([
+            (30 + x as u16 * 9).min(255) as u8,
+            (70 + y as u16 * 10).min(255) as u8,
+            150,
+            255,
+        ])
+    });
+    let asked = DevelopSettings {
+        sharpen: 0.0,
+        color_noise: 0.0,
+        luminance_noise: 0.0,
+        ..Default::default()
+    };
+    assert!(!asked.grading.adjusts(), "the default grading is neutral");
+    let plain = filter::render_filter(&pixels, &asked, 0.0, 0.0, &AtomicBool::new(false)).unwrap();
+    let graded = filter::render_filter(
+        &pixels,
+        &DevelopSettings {
+            grading: Grading {
+                shadows: GradeWheel {
+                    hue: 210.0,
+                    saturation: 40.0,
+                    luminance: -20.0,
+                },
+                ..Grading::default()
+            },
+            ..asked.clone()
+        },
+        0.0,
+        0.0,
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    assert!(graded != plain, "a grading wheel changes the image");
+    // The dark end of the ramp moves, because the shadow wheel owns it.
+    let (dark, light) = (plain.get_pixel(0, 0), plain.get_pixel(23, 15));
+    let (dark_graded, light_graded) = (graded.get_pixel(0, 0), graded.get_pixel(23, 15));
+    assert!(
+        luminance_of(dark_graded) < luminance_of(dark) - 1,
+        "a blue shadow wheel darkens the shadows: {dark:?} -> {dark_graded:?}"
+    );
+    assert!(
+        light_graded
+            .0
+            .iter()
+            .zip(light.0)
+            .all(|(after, before)| (i32::from(*after) - i32::from(before)).abs() <= 1),
+        "and the highlight end belongs to the other wheels: {light:?} -> {light_graded:?}"
+    );
+}
+
+fn luminance_of(pixel: &Rgba<u8>) -> i32 {
+    2126 * i32::from(pixel[0]) + 7152 * i32::from(pixel[1]) + 722 * i32::from(pixel[2])
+}
+
+/// How far a grading moved a pixel, which is how a test can see which wheel
+/// reached it: a tint that darkens and a tint that brightens both show up here.
+fn reach(grading: Grading, rgb: [f32; 3]) -> f32 {
+    let graded = super::process::grade(rgb, &grading);
+    (0..3)
+        .map(|channel| (graded[channel] - rgb[channel]).abs())
+        .sum()
+}
+
+#[test]
+fn the_grading_wheels_own_the_tones_they_are_named_for() {
+    let wheel = |hue: f32| GradeWheel {
+        hue,
+        saturation: 100.0,
+        luminance: 0.0,
+    };
+    let shadows = Grading {
+        shadows: wheel(0.0),
+        ..Grading::default()
+    };
+    let highlights = Grading {
+        highlights: wheel(0.0),
+        ..Grading::default()
+    };
+    // A shadow wheel reaches a dark pixel further than a bright one, and the
+    // highlight wheel is the other way round.
+    assert!(
+        reach(shadows, [0.05, 0.05, 0.05]) > reach(highlights, [0.05, 0.05, 0.05]),
+        "the shadow wheel owns the shadows"
+    );
+    assert!(
+        reach(highlights, [0.9, 0.9, 0.9]) > reach(shadows, [0.9, 0.9, 0.9]),
+        "the highlight wheel owns the highlights"
+    );
+    // Each wheel stops at the far end of the range rather than tinting the whole
+    // picture, and they meet in the middle, which is what the blending is for.
+    assert_eq!(
+        reach(shadows, [0.9, 0.9, 0.9]),
+        0.0,
+        "the shadow wheel does not reach the highlights"
+    );
+    assert_eq!(
+        reach(highlights, [0.05, 0.05, 0.05]),
+        0.0,
+        "nor the highlight wheel the shadows"
+    );
+    assert!(
+        reach(shadows, [0.5, 0.5, 0.5]) > 0.0 && reach(highlights, [0.5, 0.5, 0.5]) > 0.0,
+        "the wheels overlap through the midtones"
+    );
+
+    // The hue is the one that lands: a red wheel lifts red on a neutral pixel and
+    // a blue wheel lifts blue.
+    let red = reach(
+        Grading {
+            global: wheel(0.0),
+            ..Grading::default()
+        },
+        [0.5, 0.5, 0.5],
+    );
+    let blue = reach(
+        Grading {
+            global: wheel(240.0),
+            ..Grading::default()
+        },
+        [0.5, 0.5, 0.5],
+    );
+    assert!(
+        red > 0.0 && blue > 0.0,
+        "the global wheel reaches everything"
+    );
+    let graded_red = super::process::grade(
+        [0.5, 0.5, 0.5],
+        &Grading {
+            global: wheel(0.0),
+            ..Grading::default()
+        },
+    );
+    let graded_blue = super::process::grade(
+        [0.5, 0.5, 0.5],
+        &Grading {
+            global: wheel(240.0),
+            ..Grading::default()
+        },
+    );
+    assert!(
+        graded_red[0] > graded_red[2] && graded_blue[2] > graded_blue[0],
+        "each wheel tints with its own hue: {graded_red:?} and {graded_blue:?}"
+    );
+
+    // Balance moves the crossover, so a shadow wheel reaches further into the
+    // picture when the balance favours shadows.
+    let favouring_shadows = reach(
+        Grading {
+            shadows: wheel(0.0),
+            balance: -100.0,
+            ..Grading::default()
+        },
+        [0.5, 0.5, 0.5],
+    );
+    let favouring_highlights = reach(
+        Grading {
+            shadows: wheel(0.0),
+            balance: 100.0,
+            ..Grading::default()
+        },
+        [0.5, 0.5, 0.5],
+    );
+    assert!(
+        favouring_shadows > favouring_highlights,
+        "balance moves the crossover: {favouring_shadows} vs {favouring_highlights}"
+    );
+
+    // Blending widens how far a wheel reaches, so a pixel that sits in the
+    // other wheel's territory still gets a little of it. The weights are
+    // normalised, so this shows up as reach rather than as a stronger wheel.
+    let narrow_highlight = reach(
+        Grading {
+            shadows: wheel(0.0),
+            blending: 0.0,
+            ..Grading::default()
+        },
+        [0.8, 0.8, 0.8],
+    );
+    let wide_highlight = reach(
+        Grading {
+            shadows: wheel(0.0),
+            blending: 100.0,
+            ..Grading::default()
+        },
+        [0.8, 0.8, 0.8],
+    );
+    assert!(
+        wide_highlight > narrow_highlight,
+        "a wider blend reaches further into the highlights: {wide_highlight} vs {narrow_highlight}"
+    );
+    let narrow_shadow = reach(
+        Grading {
+            highlights: wheel(0.0),
+            blending: 0.0,
+            ..Grading::default()
+        },
+        [0.2, 0.2, 0.2],
+    );
+    let wide_shadow = reach(
+        Grading {
+            highlights: wheel(0.0),
+            blending: 100.0,
+            ..Grading::default()
+        },
+        [0.2, 0.2, 0.2],
+    );
+    assert!(
+        wide_shadow > narrow_shadow,
+        "and into the shadows: {wide_shadow} vs {narrow_shadow}"
+    );
+
+    // A wheel with only a luminance shift moves brightness and no hue.
+    let shifted = super::process::grade(
+        [0.4, 0.4, 0.4],
+        &Grading {
+            global: GradeWheel {
+                hue: 0.0,
+                saturation: 0.0,
+                luminance: 60.0,
+            },
+            ..Grading::default()
+        },
+    );
+    let plain = super::process::grade([0.4, 0.4, 0.4], &Grading::default());
+    assert!(
+        shifted[0] > plain[0] && (shifted[0] - shifted[2]).abs() < 1e-5,
+        "a luminance shift brightens without tinting: {shifted:?}"
+    );
+    let darkened = super::process::grade(
+        [0.6, 0.6, 0.6],
+        &Grading {
+            global: GradeWheel {
+                hue: 0.0,
+                saturation: 0.0,
+                luminance: -50.0,
+            },
+            ..Grading::default()
+        },
+    );
+    assert!(
+        darkened[0] < plain[0] + 0.2 && darkened[0] > 0.0,
+        "a negative shift darkens: {darkened:?}"
+    );
+}
+
+#[test]
+fn a_grading_wheel_is_checked_before_it_is_trusted() {
+    let wheel = GradeWheel {
+        hue: 400.0,
+        saturation: 10.0,
+        luminance: 0.0,
+    };
+    let mut settings = DevelopSettings::default();
+    settings.grading.global = wheel;
+    assert!(settings.validate().is_err(), "a hue past 360 degrees");
+    settings.grading.global.hue = f32::NAN;
+    assert!(settings.validate().is_err(), "a hue that is not a number");
+    settings.grading.global = GradeWheel::default();
+    settings.grading.blending = 200.0;
+    assert!(settings.validate().is_err(), "a blend past 100");
+    settings.grading.blending = 50.0;
+    settings.grading.balance = -200.0;
+    assert!(settings.validate().is_err(), "a balance past the ends");
+    settings.grading.balance = 0.0;
+    settings.validate().unwrap();
+
+    // A file written before the wheels existed reads back neutral.
+    let mut older = serde_json::to_value(&settings).unwrap();
+    assert!(older.get("grading").is_some(), "the wheels are stored");
+    older.as_object_mut().unwrap().remove("grading");
+    let without: DevelopSettings = serde_json::from_value(older).unwrap();
+    assert!(!without.grading.adjusts());
+    assert_eq!(
+        without.grading.blending, 50.0,
+        "the neutral blend is 50, not 0"
+    );
+}

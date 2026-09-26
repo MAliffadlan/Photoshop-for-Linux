@@ -209,9 +209,18 @@ pub fn save(document: &Document, path: &Path) -> Result<()> {
         let options =
             SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
         // Guides, layer effects, the 1.2.3 blur and noise adjustment layers, the layout grid,
-        // paragraph text boxes and separately coloured letters all raise the version, because an
-        // older reader must refuse the file rather than silently drop what it cannot draw.
+        // paragraph text boxes, separately coloured letters and the colour grading wheels all raise
+        // the version, because an older reader must refuse the file rather than silently drop what
+        // it cannot draw. A graded camera file is the one that cannot be recovered from the saved
+        // pixels: the layer holds the original, and the wheels are only in here.
         let version = if document.layers.iter().any(|layer| {
+            layer
+                .raw
+                .as_ref()
+                .is_some_and(|raw| raw.settings.grading.adjusts())
+        }) {
+            9
+        } else if document.layers.iter().any(|layer| {
             layer
                 .text
                 .as_ref()
@@ -323,7 +332,7 @@ pub fn load(path: &Path) -> Result<Document> {
     let mut manifest: Manifest =
         serde_json::from_slice(&zip_read(&mut archive, "manifest.json", MAX_MANIFEST)?)?;
     ensure!(
-        READ_FORMATS.contains(&manifest.format.as_str()) && (1..=8).contains(&manifest.version),
+        READ_FORMATS.contains(&manifest.format.as_str()) && (1..=9).contains(&manifest.version),
         "Unsupported mectov project version"
     );
     let mut used_pixels = 0;
@@ -1634,7 +1643,7 @@ mod tests {
         assert_eq!(text_box.width, 120.0);
         assert_eq!(text_box.min_height, 0.0);
 
-        manifest["version"] = serde_json::json!(9);
+        manifest["version"] = serde_json::json!(10);
         write(&manifest, None);
         assert_eq!(
             load(&path).unwrap_err().to_string(),
@@ -1686,6 +1695,109 @@ mod tests {
             .clear_color_runs();
         save(&cleared, &path).unwrap();
         assert_eq!(saved_version(&path), 1);
+    }
+
+    /// A graded camera file has to be version 9: the layer keeps the original
+    /// and is developed again on open, so a reader that did not know about the
+    /// wheels would show the picture ungraded rather than refuse it.
+    #[test]
+    fn graded_raw_layers_write_version_nine_and_neutral_wheels_keep_their_version() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("graded.mectov");
+        let mut layer = Layer::image("Camera", RgbaImage::new(64, 48));
+        layer.raw = Some(crate::raw::RawAsset {
+            filename: "camera.nef".into(),
+            metadata: crate::raw::RawMetadata {
+                width: 64,
+                height: 48,
+                ..Default::default()
+            },
+            settings: Default::default(),
+            bytes: Arc::new(vec![0; 16]),
+        });
+        let mut document = Document::new(320, 240).unwrap();
+        document.insert(layer);
+        save(&document, &path).unwrap();
+        assert_eq!(
+            saved_version(&path),
+            2,
+            "an undeveloped camera file is version 2"
+        );
+
+        let grading = crate::raw::Grading {
+            shadows: crate::raw::GradeWheel {
+                hue: 214.0,
+                saturation: 47.0,
+                luminance: -23.0,
+            },
+            midtones: crate::raw::GradeWheel {
+                hue: 43.0,
+                saturation: 31.0,
+                luminance: 17.0,
+            },
+            highlights: crate::raw::GradeWheel {
+                hue: 96.0,
+                saturation: 39.0,
+                luminance: 0.0,
+            },
+            global: crate::raw::GradeWheel {
+                hue: 318.0,
+                saturation: 0.0,
+                luminance: 0.0,
+            },
+            blending: 71.0,
+            balance: -29.0,
+        };
+        let mut loaded = load(&path).unwrap();
+        loaded
+            .active_mut()
+            .unwrap()
+            .raw
+            .as_mut()
+            .unwrap()
+            .settings
+            .grading = grading;
+        save(&loaded, &path).unwrap();
+        assert_eq!(saved_version(&path), 9);
+        let loaded = load(&path).unwrap();
+        let settings = &loaded.active().unwrap().raw.as_ref().unwrap().settings;
+        assert_eq!(
+            settings.grading, grading,
+            "the wheels survive the round trip"
+        );
+        assert_eq!(settings.grading.blending, 71.0);
+        assert_eq!(settings.grading.balance, -29.0);
+
+        // A wheel that only names a hue asks for no change, so the file drops
+        // back to the version it had before.
+        let mut loaded = loaded;
+        loaded
+            .active_mut()
+            .unwrap()
+            .raw
+            .as_mut()
+            .unwrap()
+            .settings
+            .grading = crate::raw::Grading {
+            global: crate::raw::GradeWheel {
+                hue: 12.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(
+            !loaded
+                .active()
+                .unwrap()
+                .raw
+                .as_ref()
+                .unwrap()
+                .settings
+                .grading
+                .adjusts()
+        );
+        save(&loaded, &path).unwrap();
+        assert_eq!(saved_version(&path), 2);
     }
 
     #[test]
