@@ -194,6 +194,63 @@ fn text_tool_creates_edits_and_undoes_one_transaction() {
     );
 }
 
+#[test]
+fn coloured_letters_chosen_in_the_text_dialog_reach_the_layer() {
+    let (context, mut app) = app();
+    app.dimensions = [640, 480];
+    app.new_document();
+    keyboard_frame(
+        &context,
+        &mut app,
+        vec![text_key(egui::Key::T, egui::Modifiers::NONE)],
+        egui::Modifiers::NONE,
+    );
+    click_canvas(
+        &context,
+        &mut app,
+        Point::new(40.0, 50.0),
+        egui::Modifiers::NONE,
+    );
+    let style = &mut app.text_edit.as_mut().unwrap().style;
+    style.content = "Red then blue".into();
+    style.size = 64.0;
+    // The dialog colours the letters the user selected, which the style holds as
+    // a run over the first four characters.
+    style.set_color_run(0, 4, [220, 20, 20, 255]);
+    app.preview_text();
+    frame(&context, &mut app);
+    app.finish_text(true);
+    let session = app.session().unwrap();
+    let text = session.document.active().unwrap().text.as_ref().unwrap();
+    assert_eq!(text.color_runs.len(), 1);
+    assert_eq!(text.color_at(0), [220, 20, 20, 255]);
+    assert_eq!(text.color_at(4), text.color);
+    let pixels = session.document.active().unwrap().pixels.as_ref().unwrap();
+    assert!(
+        pixels
+            .pixels()
+            .any(|pixel| pixel[0] > 150 && pixel[1] < 100 && pixel[2] < 100),
+        "the selected letters are painted"
+    );
+    // Clearing the colours goes back to one colour for the whole text.
+    let id = session.document.active.unwrap();
+    app.start_text(Some(id), Point::default());
+    app.text_edit.as_mut().unwrap().style.clear_color_runs();
+    app.preview_text();
+    frame(&context, &mut app);
+    app.finish_text(true);
+    let text = app
+        .session()
+        .unwrap()
+        .document
+        .active()
+        .unwrap()
+        .text
+        .as_ref()
+        .unwrap();
+    assert!(text.color_runs.is_empty());
+}
+
 fn text_key(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
     egui::Event::Key {
         key,

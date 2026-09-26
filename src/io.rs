@@ -208,10 +208,17 @@ pub fn save(document: &Document, path: &Path) -> Result<()> {
         let mut archive = ZipWriter::new(temporary.as_file_mut());
         let options =
             SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
-        // Guides, layer effects, the 1.2.3 blur and noise adjustment layers, the layout grid and
-        // paragraph text boxes all raise the version, because an older reader must refuse the file
-        // rather than silently drop what it cannot draw.
-        let version = if document
+        // Guides, layer effects, the 1.2.3 blur and noise adjustment layers, the layout grid,
+        // paragraph text boxes and separately coloured letters all raise the version, because an
+        // older reader must refuse the file rather than silently drop what it cannot draw.
+        let version = if document.layers.iter().any(|layer| {
+            layer
+                .text
+                .as_ref()
+                .is_some_and(|text| !text.color_runs.is_empty())
+        }) {
+            8
+        } else if document
             .layers
             .iter()
             .any(|layer| layer.text.as_ref().is_some_and(|text| text.r#box.is_some()))
@@ -316,7 +323,7 @@ pub fn load(path: &Path) -> Result<Document> {
     let mut manifest: Manifest =
         serde_json::from_slice(&zip_read(&mut archive, "manifest.json", MAX_MANIFEST)?)?;
     ensure!(
-        READ_FORMATS.contains(&manifest.format.as_str()) && (1..=7).contains(&manifest.version),
+        READ_FORMATS.contains(&manifest.format.as_str()) && (1..=8).contains(&manifest.version),
         "Unsupported mectov project version"
     );
     let mut used_pixels = 0;
@@ -761,9 +768,11 @@ pub fn load_compositor(path: &Path) -> Result<Document> {
     let version = manifest["version"]
         .as_u64()
         .context("Project version missing")?;
-    // Compositor 1.2.3 writes 9, which adds blur and noise adjustment layers to 1.2.0's version 8.
+    // Compositor 1.2.3 writes 9, which adds blur and noise adjustment layers to 1.2.0's version 8,
+    // and 1.3.2 writes 10, which can colour some letters of a text layer differently. A text layer
+    // arrives as the pixels Compositor rendered, so its metadata is not read at any version.
     ensure!(
-        (1..=9).contains(&version),
+        (1..=10).contains(&version),
         "Unsupported Compositor project version {version}"
     );
     ensure!(
@@ -1471,11 +1480,24 @@ mod tests {
         let manifest_path = directory.path().join("manifest.json");
         let id = Uuid::new_v4();
         let mut manifest = compositor_v8_manifest(id);
-        manifest["version"] = serde_json::json!(10);
+        manifest["version"] = serde_json::json!(11);
         fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
         assert_eq!(
             load_compositor(directory.path()).unwrap_err().to_string(),
-            "Unsupported Compositor project version 10"
+            "Unsupported Compositor project version 11"
+        );
+        // Compositor 1.3.2 writes 10, which opens: a text layer arrives as the
+        // pixels Compositor rendered, so its letter colours change nothing here.
+        manifest["version"] = serde_json::json!(10);
+        manifest["layers"][0]["text"] = serde_json::json!({
+            "content": "Coloured",
+            "colorRuns": [{ "location": 0, "length": 3, "red": 1.0, "green": 0.0, "blue": 0.0 }]
+        });
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let loaded = load_compositor(directory.path()).unwrap();
+        assert!(
+            loaded.layers[0].text.is_none(),
+            "a .comp text layer is imported as the pixels it was saved with"
         );
         manifest["version"] = serde_json::json!(8);
         manifest["layers"][0]["effects"]["stroke"]["opacity"] = serde_json::json!(2.0);
@@ -1612,12 +1634,58 @@ mod tests {
         assert_eq!(text_box.width, 120.0);
         assert_eq!(text_box.min_height, 0.0);
 
-        manifest["version"] = serde_json::json!(8);
+        manifest["version"] = serde_json::json!(9);
         write(&manifest, None);
         assert_eq!(
             load(&path).unwrap_err().to_string(),
             "Unsupported mectov project version"
         );
+    }
+
+    #[test]
+    fn coloured_letters_write_version_eight_and_plain_text_keeps_its_version() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("text.mectov");
+        let mut renderer = crate::text::TextRenderer::default();
+        let mut style = crate::text::TextStyle {
+            content: "Coloured letters".into(),
+            size: 24.0,
+            ..Default::default()
+        };
+        let mut layer = Layer::image(style.layer_name(), renderer.render(&style).unwrap());
+        layer.text = Some(style.clone());
+        let mut document = Document::new(320, 240).unwrap();
+        document.insert(layer);
+        save(&document, &path).unwrap();
+        assert_eq!(saved_version(&path), 1, "plain text stays version 1");
+
+        style.set_color_run(0, 8, [220, 20, 20, 255]);
+        style.set_color_run(9, 6, [20, 120, 220, 255]);
+        let pixels = renderer.render(&style).unwrap();
+        let mut layer = Layer::image(style.layer_name(), pixels.clone());
+        layer.text = Some(style.clone());
+        let mut document = Document::new(320, 240).unwrap();
+        document.insert(layer);
+        save(&document, &path).unwrap();
+        assert_eq!(saved_version(&path), 8);
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.active().unwrap().text, Some(style));
+        assert_eq!(
+            loaded.active().unwrap().pixels.as_ref().unwrap(),
+            &Arc::new(pixels)
+        );
+
+        // Clearing the colours drops the document back to the version it had.
+        let mut cleared = load(&path).unwrap();
+        cleared
+            .active_mut()
+            .unwrap()
+            .text
+            .as_mut()
+            .unwrap()
+            .clear_color_runs();
+        save(&cleared, &path).unwrap();
+        assert_eq!(saved_version(&path), 1);
     }
 
     #[test]

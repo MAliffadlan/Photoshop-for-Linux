@@ -332,6 +332,9 @@ impl EditorApp {
             .open(&mut open)
             .show(ctx, |ui| {
                 ui.spacing_mut().item_spacing.y = 10.0;
+                // The letters the user has selected in the content, which is
+                // what Compositor 1.3.2 colours on its own.
+                let mut selected: Option<(u32, u32)> = None;
                 let response = egui::ScrollArea::vertical()
                     .id_salt("text_content_scroll")
                     .max_height(140.0)
@@ -345,6 +348,16 @@ impl EditorApp {
                         )
                     })
                     .inner;
+                if let Some(state) = egui::TextEdit::load_state(ctx, response.id)
+                    && let Some(range) = state.cursor.char_range()
+                {
+                    let (primary, secondary) = (range.primary.index, range.secondary.index);
+                    let (start, end) = (primary.min(secondary), primary.max(secondary));
+                    let (start, end) = text::utf16_range(&edit.style.content, start, end);
+                    if end > start {
+                        selected = Some((start, end));
+                    }
+                }
                 if edit.focus {
                     response.request_focus();
                     if let Some(mut state) = egui::TextEdit::load_state(ctx, response.id) {
@@ -381,6 +394,37 @@ impl EditorApp {
                     ui.label("Color");
                     widgets::color_well(ui, &mut edit.style.color);
                 });
+                if let Some((start, end)) = selected {
+                    ui.horizontal(|ui| {
+                        ui.label("Selected letters");
+                        let mut picked = edit.style.color_at(start);
+                        if widgets::color_well(ui, &mut picked).changed() {
+                            edit.style.set_color_run(start, end - start, picked);
+                        }
+                        ui.label(
+                            RichText::new(format!("{}–{}", start + 1, end)).color(theme::MUTED),
+                        );
+                    });
+                }
+                if !edit.style.color_runs.is_empty() {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "{} coloured {}",
+                                edit.style.color_runs.len(),
+                                if edit.style.color_runs.len() == 1 {
+                                    "range"
+                                } else {
+                                    "ranges"
+                                }
+                            ))
+                            .color(theme::MUTED),
+                        );
+                        if widgets::button(ui, "Clear").clicked() {
+                            edit.style.clear_color_runs();
+                        }
+                    });
+                }
                 ui.horizontal(|ui| {
                     widgets::checkbox(ui, &mut edit.style.bold, "Bold");
                     widgets::checkbox(ui, &mut edit.style.italic, "Italic");

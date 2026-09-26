@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use cosmic_text::{
     Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, Style, SwashCache, Weight, Wrap,
 };
@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 use crate::document::{Layer, MAX_SIDE, Point, validate_size};
 
 pub const MAX_TEXT_BYTES: usize = 16_384;
+/// How many separately coloured ranges one text layer may hold.
+pub const MAX_COLOR_RUNS: usize = 1_024;
 const FALLBACK_FAMILY: &str = "Inter Variable";
 /// The leading a plain text layer uses, matching the multiplier a paragraph box defaults to.
 const DEFAULT_LINE_SPACING: f32 = 1.3;
@@ -96,6 +98,20 @@ fn default_line_spacing() -> f32 {
     DEFAULT_LINE_SPACING
 }
 
+/// Letters painted in their own colour, as Compositor 1.3.2 stores them: offsets
+/// in UTF-16 code units, because that is what a text editor counts, so a range
+/// keeps its meaning for text outside the basic multilingual plane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TextColorRun {
+    /// The first UTF-16 code unit of the run within the content.
+    pub start: u32,
+    /// How many UTF-16 code units the run covers.
+    pub length: u32,
+    /// The colour those letters take. The layer's own alpha still applies, as
+    /// it does to every other pixel of the text.
+    pub color: [u8; 4],
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TextStyle {
     pub content: String,
@@ -106,6 +122,9 @@ pub struct TextStyle {
     pub italic: bool,
     pub underline: bool,
     pub strikethrough: bool,
+    /// Ranges of letters that take a colour other than the layer's own.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub color_runs: Vec<TextColorRun>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub r#box: Option<TextBox>,
 }
@@ -121,6 +140,7 @@ impl Default for TextStyle {
             italic: false,
             underline: false,
             strikethrough: false,
+            color_runs: Vec::new(),
             r#box: None,
         }
     }
@@ -140,10 +160,60 @@ impl TextStyle {
             self.size.is_finite() && (1.0..=1024.0).contains(&self.size),
             "Font size must be between 1 and 1024 pixels"
         );
+        ensure!(
+            self.color_runs.len() <= MAX_COLOR_RUNS,
+            "A text layer is limited to {MAX_COLOR_RUNS} coloured ranges"
+        );
+        let units = self.content.encode_utf16().count();
+        let mut previous_end = 0;
+        for run in &self.color_runs {
+            ensure!(run.length > 0, "A coloured text range is empty");
+            let end = run
+                .start
+                .checked_add(run.length)
+                .context("Coloured text range overflow")?;
+            ensure!(
+                run.start >= previous_end,
+                "Coloured text ranges overlap or are out of order"
+            );
+            ensure!(
+                end as usize <= units,
+                "A coloured text range is past the end of the text"
+            );
+            previous_end = end;
+        }
         if let Some(text_box) = &self.r#box {
             text_box.validate()?;
         }
         Ok(())
+    }
+
+    /// The colour of the letter at UTF-16 code unit `index`, which is the
+    /// layer's own colour unless a run covers it.
+    pub fn color_at(&self, index: u32) -> [u8; 4] {
+        self.color_runs
+            .iter()
+            .find(|run| run.start <= index && index < run.start + run.length)
+            .map_or(self.color, |run| run.color)
+    }
+
+    /// Give every letter in `start..start + length` the colour, replacing any
+    /// run that overlaps it, and leaving the rest of the text as it was.
+    pub fn set_color_run(&mut self, start: u32, length: u32, color: [u8; 4]) {
+        let end = start.saturating_add(length);
+        self.color_runs
+            .retain(|run| run.start + run.length <= start || run.start >= end);
+        self.color_runs.push(TextColorRun {
+            start,
+            length,
+            color,
+        });
+        self.color_runs.sort_by_key(|run| run.start);
+    }
+
+    /// Drop the letter colours, so the whole text is the layer's own colour.
+    pub fn clear_color_runs(&mut self) {
+        self.color_runs.clear();
     }
 
     pub fn line_spacing(&self) -> f32 {
@@ -163,6 +233,53 @@ impl TextStyle {
             .collect();
         if name.is_empty() { "Text".into() } else { name }
     }
+}
+
+/// The UTF-16 offsets of a character range in `text`, which is how a colour run
+/// counts. Both ends are clamped to the text and an end before the start is
+/// swapped, so a selection made by a text editor can be handed over as it is.
+pub fn utf16_range(text: &str, start: usize, end: usize) -> (u32, u32) {
+    let mut utf16 = 0_u32;
+    let mut begin = None;
+    let mut finish = 0;
+    for (index, ch) in text
+        .char_indices()
+        .chain(std::iter::once((text.len(), ' ')))
+    {
+        if index >= start {
+            begin.get_or_insert(utf16);
+        }
+        if index >= end {
+            finish = utf16;
+            break;
+        }
+        utf16 += ch.len_utf16() as u32;
+    }
+    (begin.unwrap_or(utf16), finish)
+}
+
+/// The byte offset of every UTF-16 code unit in `text`, plus one past the end,
+/// so that a colour run's offsets can be turned into the byte range the layout
+/// reports. A character outside the basic multilingual plane is one code unit
+/// for each of its two halves, and both name the same byte.
+fn utf16_offsets(text: &str) -> Vec<usize> {
+    let mut offsets = Vec::with_capacity(text.len() / 2 + 2);
+    for (byte, ch) in text.char_indices() {
+        offsets.push(byte);
+        if ch.len_utf16() == 2 {
+            offsets.push(byte);
+        }
+    }
+    offsets.push(text.len());
+    offsets
+}
+
+/// The byte range of the content a colour run covers, or `None` when the run
+/// points past the text.
+fn color_run_bytes(offsets: &[usize], run: &TextColorRun) -> Option<(usize, usize)> {
+    let start = run.start as usize;
+    let end = start.checked_add(run.length as usize)?;
+    Some((*offsets.get(start)?, *offsets.get(end)?))
 }
 
 /// One font database per editor, loaded lazily when the text tool is first used.
@@ -277,9 +394,38 @@ impl TextRenderer {
         let mut cache = SwashCache::new();
         let (mut left, mut top) = (0, 0);
         let (mut right, mut bottom) = (right.ceil() as i32, bottom.ceil() as i32);
+        // Colour runs are UTF-16 offsets while glyphs report byte offsets into
+        // their own line, so the runs are resolved to byte ranges once here.
+        let mut color_runs = Vec::new();
+        if !style.color_runs.is_empty() {
+            let offsets = utf16_offsets(&style.content);
+            // Validation refuses a run that points past the text, so one that
+            // cannot be resolved here has nowhere to paint and is dropped.
+            color_runs = style
+                .color_runs
+                .iter()
+                .filter_map(|run| {
+                    let (start, end) = color_run_bytes(&offsets, run)?;
+                    Some((start, end, run.color))
+                })
+                .collect();
+        }
+        // Glyphs report a byte offset into the line they belong to, and a
+        // wrapped line is reported once per row, so the line's place in the
+        // content is found once per line and reused by its rows.
+        let mut cursor = 0;
+        let mut line = None;
         let mut glyphs = Vec::new();
         let mut rules = Vec::new();
         for run in buffer.layout_runs() {
+            if line.map(|(index, _): (usize, usize)| index) != Some(run.line_i) {
+                let at = style.content[cursor..]
+                    .find(run.text)
+                    .map_or(cursor, |at| cursor + at);
+                cursor = at + run.text.len();
+                line = Some((run.line_i, at));
+            }
+            let found = line.map_or(0, |(_, at)| at);
             let (offset_x, offset_y) = shift(&run);
             let (offset_x, offset_y) = (offset_x.round() as i32, offset_y.round() as i32);
             for glyph in run.glyphs {
@@ -315,7 +461,12 @@ impl TextRenderer {
                     right = right.max(x + placement.width as i32 + embolden);
                     bottom = bottom.max(y + placement.height as i32);
                 }
-                glyphs.push((physical, y, embolden, offset_x, offset_y));
+                let index = found + glyph.start;
+                let color = color_runs
+                    .iter()
+                    .find(|(start, end, _)| index >= *start && index < *end)
+                    .map_or(style.color, |(_, _, color)| *color);
+                glyphs.push((physical, y, embolden, offset_x, offset_y, color));
             }
             let thickness = (style.size / 16.0).max(1.0);
             for (enabled, y) in [
@@ -346,7 +497,8 @@ impl TextRenderer {
         };
         let mut pixels = RgbaImage::new(width, height);
         let color = Color::rgb(style.color[0], style.color[1], style.color[2]);
-        for (glyph, baseline, embolden, offset_x, offset_y) in glyphs {
+        for (glyph, baseline, embolden, offset_x, offset_y, glyph_color) in glyphs {
+            let color = Color::rgb(glyph_color[0], glyph_color[1], glyph_color[2]);
             cache.with_pixels(&mut self.fonts, glyph.cache_key, color, |x, y, color| {
                 for offset in 0..=embolden {
                     if let Some(pixel) = pixels.get_pixel_mut_checked(
@@ -490,6 +642,160 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn colour_runs_paint_only_the_letters_they_cover() {
+        let mut renderer = renderer();
+        let style = TextStyle {
+            content: "Office fj Å\nSecond".into(),
+            color: [30, 110, 190, 255],
+            ..Default::default()
+        };
+        // "fj Å" sits at UTF-16 units 7..12 of the first line, and the emoji
+        // outside the basic multilingual plane counts as two units.
+        let red = TextColorRun {
+            start: 7,
+            length: 5,
+            color: [220, 20, 20, 255],
+        };
+        style.validate().unwrap();
+        let mut coloured = style.clone();
+        coloured.color_runs = vec![red];
+        coloured.validate().unwrap();
+        assert_eq!(
+            style.color_at(7),
+            style.color,
+            "the plain style has no runs"
+        );
+        assert_eq!(coloured.color_at(0), style.color);
+        assert_eq!(coloured.color_at(7), [220, 20, 20, 255]);
+        assert_eq!(coloured.color_at(11), [220, 20, 20, 255]);
+        assert_eq!(coloured.color_at(12), style.color);
+
+        let plain = renderer.render(&style).unwrap();
+        let painted = renderer.render(&coloured).unwrap();
+        assert_ne!(painted, plain, "a colour run must change the ink");
+        assert_eq!(painted.dimensions(), plain.dimensions());
+        // The same letters are drawn, in the same places: only the colour of the
+        // ones the run covers changes, and they leave the layer's colour behind.
+        let ink = |image: &RgbaImage| image.pixels().filter(|pixel| pixel[3] > 0).count();
+        let red = |image: &RgbaImage| {
+            image
+                .pixels()
+                .filter(|pixel| pixel[0] > 150 && pixel[1] < 100 && pixel[2] < 100)
+                .count()
+        };
+        let blue = |image: &RgbaImage| {
+            image
+                .pixels()
+                .filter(|pixel| pixel[2] > 150 && pixel[0] < 100 && pixel[3] > 0)
+                .count()
+        };
+        assert_eq!(ink(&painted), ink(&plain), "the same letters are drawn");
+        assert!(red(&painted) > 20, "the run is painted red");
+        assert_eq!(red(&plain), 0, "the plain text has no red in it");
+        assert!(blue(&painted) < blue(&plain), "those letters left the blue");
+    }
+
+    #[test]
+    fn colour_runs_are_checked_before_they_are_trusted() {
+        let style = TextStyle {
+            content: "Twelve chars".into(),
+            ..Default::default()
+        };
+        let run = |start, length| TextColorRun {
+            start,
+            length,
+            color: [1, 2, 3, 255],
+        };
+        let mut checked = style.clone();
+        checked.color_runs = vec![run(0, 0)];
+        assert!(checked.validate().is_err(), "an empty run paints nothing");
+        checked.color_runs = vec![run(0, 14)];
+        assert!(checked.validate().is_err(), "a run past the end");
+        checked.color_runs = vec![run(4, 4), run(2, 3)];
+        assert!(checked.validate().is_err(), "runs out of order");
+        checked.color_runs = vec![run(0, 6), run(4, 4)];
+        assert!(checked.validate().is_err(), "runs overlap");
+        checked.color_runs = vec![run(0, 6), run(6, 6)];
+        checked.validate().unwrap();
+        checked.color_runs = vec![run(u32::MAX, 2)];
+        assert!(checked.validate().is_err(), "a run that overflows");
+        checked.color_runs = vec![run(0, 1); MAX_COLOR_RUNS + 1];
+        assert!(checked.validate().is_err(), "too many runs");
+        // A file that leaves the field out is the layer's own colour throughout.
+        let plain = TextStyle {
+            content: "Twelve chars".into(),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&plain).unwrap();
+        assert!(
+            !json.contains("color_runs"),
+            "the field is left out: {json}"
+        );
+        let parsed: TextStyle = serde_json::from_str(&json).unwrap();
+        assert!(parsed.color_runs.is_empty());
+        assert_eq!(parsed, plain);
+    }
+
+    #[test]
+    fn setting_a_colour_run_replaces_what_it_covers() {
+        let mut style = TextStyle {
+            content: "0123456789".into(),
+            ..Default::default()
+        };
+        style.set_color_run(2, 3, [10, 20, 30, 255]);
+        assert_eq!(style.color_runs.len(), 1);
+        // A run over the same letters replaces the earlier one instead of
+        // stacking a second colour on them.
+        style.set_color_run(3, 2, [40, 50, 60, 255]);
+        assert_eq!(style.color_runs.len(), 1);
+        assert_eq!(style.color_runs[0].start, 3);
+        assert_eq!(style.color_at(2), style.color);
+        assert_eq!(style.color_at(3), [40, 50, 60, 255]);
+        // A run beside another one keeps both, in order.
+        style.set_color_run(7, 2, [70, 80, 90, 255]);
+        assert_eq!(style.color_runs.len(), 2);
+        style.validate().unwrap();
+        style.clear_color_runs();
+        assert!(style.color_runs.is_empty());
+    }
+
+    #[test]
+    fn a_wrapped_line_keeps_its_letters_coloured() {
+        let mut renderer = renderer();
+        let style = TextStyle {
+            content: "First line that wraps\nsecond".into(),
+            size: 24.0,
+            color: [10, 10, 10, 255],
+            r#box: Some(TextBox {
+                width: 120.0,
+                ..boxed(0.0, 0.0)
+            }),
+            ..Default::default()
+        };
+        let mut coloured = style.clone();
+        // The second line starts after the first, which wraps into several rows
+        // and is reported more than once, so this only passes if a line's place
+        // in the content is found rather than assumed.
+        let second = style.content.find("second").unwrap() as u32;
+        coloured.color_runs = vec![TextColorRun {
+            start: second,
+            length: 6,
+            color: [220, 20, 20, 255],
+        }];
+        coloured.validate().unwrap();
+        let painted = renderer.render(&coloured).unwrap();
+        let plain = renderer.render(&style).unwrap();
+        assert_eq!(painted.dimensions(), plain.dimensions());
+        assert_ne!(painted, plain);
+        assert!(
+            painted
+                .pixels()
+                .any(|pixel| pixel[0] > 150 && pixel[1] < 100 && pixel[2] < 100),
+            "the second line is painted"
+        );
     }
 
     #[test]
