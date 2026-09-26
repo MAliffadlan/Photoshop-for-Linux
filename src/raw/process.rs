@@ -193,6 +193,16 @@ pub fn render_16(
     render_at_depth(raw, settings, cancel, |v| (v * 65_535.0).round() as u16)
 }
 
+/// Develop on the CPU whatever the device could do. The Camera Raw filter uses
+/// this, because the shader has no way to carry a layer's alpha.
+pub(super) fn render_cpu(
+    raw: &DecodedRaw,
+    settings: &DevelopSettings,
+    cancel: &AtomicBool,
+) -> Result<RgbaImage> {
+    render_at_depth(raw, settings, cancel, |v| (v * 255.0).round() as u8)
+}
+
 fn accelerated(
     raw: &DecodedRaw,
     settings: &DevelopSettings,
@@ -363,9 +373,6 @@ where
             cancelled(cancel)?;
             for (x, p) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                 let rgb = image.get_pixel(left + x as u32, top + y as u32);
-                for c in 0..3 {
-                    p[c] = encode(rgb[c].clamp(0.0, 1.0));
-                }
                 let point = source_point(
                     Point::new(
                         (left as f32 + x as f32 + 0.5) / width as f32,
@@ -374,13 +381,27 @@ where
                     s,
                     aspect,
                 );
-                p[3] = encode(
-                    if (0.0..=1.0).contains(&point.x) && (0.0..=1.0).contains(&point.y) {
-                        1.0
-                    } else {
-                        0.0
-                    },
-                );
+                // Alpha is the geometry mask on its own for a camera file, and
+                // the layer's own alpha multiplied into that mask when there is
+                // one. The colour was premultiplied on the way in, so it is
+                // divided back out here to leave the buffer straight.
+                let mask = if (0.0..=1.0).contains(&point.x) && (0.0..=1.0).contains(&point.y) {
+                    1.0
+                } else {
+                    0.0
+                };
+                let alpha = match &raw.alpha {
+                    Some(plane) => {
+                        f32::from(plane.get_pixel(left + x as u32, top + y as u32)[0]) / 255.0
+                            * mask
+                    }
+                    None => mask,
+                };
+                let straight = if alpha > 0.0 { 1.0 / alpha } else { 1.0 };
+                for c in 0..3 {
+                    p[c] = encode((rgb[c] * straight).clamp(0.0, 1.0));
+                }
+                p[3] = encode(alpha.clamp(0.0, 1.0));
             }
             Ok(())
         })?;

@@ -343,6 +343,8 @@ struct EffectEdit {
     preview: bool,
     refresh: bool,
     channel: usize,
+    /// Which page of the Camera Raw filter's panel is open, kept between frames.
+    camera_raw_page: usize,
     target: Option<Uuid>,
 }
 
@@ -960,6 +962,7 @@ impl EditorApp {
             preview: true,
             refresh: true,
             channel: 0,
+            camera_raw_page: 0,
             target: None,
         });
         self.dialog = Some(Dialog::Effect);
@@ -981,6 +984,7 @@ impl EditorApp {
             preview: true,
             refresh: true,
             channel: 0,
+            camera_raw_page: 0,
             target: None,
         });
         self.dialog = Some(Dialog::Effect);
@@ -1025,6 +1029,7 @@ impl EditorApp {
             preview: true,
             refresh: true,
             channel: 0,
+            camera_raw_page: 0,
             target: Some(id),
         });
         self.dialog = Some(Dialog::Effect);

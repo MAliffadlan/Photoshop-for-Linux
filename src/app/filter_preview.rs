@@ -116,6 +116,13 @@ impl EditorApp {
             }
         }
 
+        // The Camera Raw filter's preview is a smaller copy of the layer, drawn at
+        // the layer's own transform, so the frame Apply is pressed on renders it
+        // again at full resolution rather than committing the proxy.
+        if apply && matches!(filter, Filter::CameraRaw { .. }) {
+            preview.ready = None;
+        }
+
         if preview.ready.as_ref() == Some(filter) && preview.applying {
             if let Some(session) = self.session_mut() {
                 session.history.commit();
@@ -126,6 +133,17 @@ impl EditorApp {
 
         if wanted && preview.job.is_none() && preview.ready.as_ref() != Some(filter) {
             let mut document = edit.original.clone();
+            // The develop engine reads every pixel it is given, so a preview
+            // runs on a smaller copy of the layer and leaves its transform
+            // alone: the canvas draws whatever buffer a layer holds at the size
+            // its transform says.
+            if !preview.applying
+                && let Filter::CameraRaw { .. } = filter
+                && let Some(layer) = document.active_mut()
+                && let Some(pixels) = layer.pixels.as_ref().cloned()
+            {
+                layer.pixels = Some(Arc::new(mectov::raw::preview_source(&pixels, 1600)));
+            }
             let filter = filter.clone();
             let worker_filter = filter.clone();
             let mask_target = self.mask_target;
@@ -221,9 +239,184 @@ mod tests {
             if finished || !edit.filter_preview.busy() {
                 return finished;
             }
-            assert!(Instant::now() < deadline, "Filter worker did not finish");
+            assert!(
+                Instant::now() < deadline,
+                "Filter worker did not finish: {:?}",
+                app.error
+            );
             std::thread::yield_now();
         }
+    }
+
+    /// A layer big enough that the Camera Raw filter's preview has to be a
+    /// smaller copy of it, so the proxy path is the one under test.
+    fn camera_raw_setup(width: u32, height: u32, exposure: f32) -> (EditorApp, EffectEdit) {
+        let context = egui::Context::default();
+        let mut app = EditorApp::with_context(&context, Vec::new(), false, None);
+        app.dimensions = [width, height];
+        app.new_document();
+        {
+            use image::{Rgba, RgbaImage};
+            let session = app.session_mut().unwrap();
+            session.document.layers.clear();
+            let mut layer = mectov::document::Layer::image(
+                "Photo",
+                RgbaImage::from_fn(width, height, |x, y| {
+                    Rgba([
+                        (30 + x % 200).min(255) as u8,
+                        (60 + y % 180).min(255) as u8,
+                        140,
+                        255,
+                    ])
+                }),
+            );
+            layer.transform.x = 5.0;
+            session.document.insert(layer);
+        }
+        app.start_filter(camera_raw(exposure));
+        let edit = app.effect.take().unwrap();
+        (app, edit)
+    }
+
+    fn camera_raw(exposure: f32) -> Filter {
+        Filter::CameraRaw {
+            settings: Box::new(mectov::raw::DevelopSettings {
+                exposure,
+                sharpen: 0.0,
+                color_noise: 0.0,
+                luminance_noise: 0.0,
+                ..Default::default()
+            }),
+            temperature: 0.0,
+            tint: 0.0,
+        }
+    }
+
+    #[test]
+    fn the_camera_raw_preview_is_a_proxy_and_apply_is_the_layers_own_pixels() {
+        let (mut app, mut edit) = camera_raw_setup(2000, 1200, 1.0);
+        let full = edit
+            .original
+            .layers
+            .first()
+            .and_then(|layer| layer.pixels.clone())
+            .expect("the photo layer");
+        assert_eq!(full.dimensions(), (2000, 1200));
+        let transform = edit.original.layers[0].transform;
+
+        // The preview is a smaller copy at the layer's own transform, so the
+        // canvas draws it in the same place, just softer.
+        let started = std::time::Instant::now();
+        assert!(!wait(&mut app, &mut edit));
+        eprintln!("DBG preview took {:?}", started.elapsed());
+        let preview = app
+            .session()
+            .unwrap()
+            .document
+            .active()
+            .unwrap()
+            .pixels
+            .clone()
+            .unwrap();
+        assert_eq!(preview.dimensions(), (1600, 960));
+        assert_eq!(
+            app.session().unwrap().document.active().unwrap().transform,
+            transform,
+            "the proxy does not move the layer"
+        );
+        let revision = app.session().unwrap().history.revision;
+        assert!(
+            preview != full,
+            "the preview is developed, and it is not the layer's own buffer"
+        );
+
+        // Apply cannot reuse a proxy, so it renders the layer again at its own
+        // resolution, commits exactly one edit, and closes the dialog.
+        let mut edit = edit;
+        assert!(
+            !app.update_filter_preview(&mut edit, false, true),
+            "a worker starts"
+        );
+        assert!(edit.filter_preview.applying, "apply is under way");
+        assert!(wait(&mut app, &mut edit), "apply closes the dialog");
+        let session = app.session().unwrap();
+        assert_eq!(session.history.revision, revision + 1);
+        let applied = session.document.active().unwrap().pixels.clone().unwrap();
+        assert_eq!(
+            applied.dimensions(),
+            (2000, 1200),
+            "applied at full resolution"
+        );
+        assert_ne!(applied, full, "and it is the developed image");
+
+        // One undo puts the original buffer back.
+        app.command("undo");
+        assert_eq!(
+            app.session()
+                .unwrap()
+                .document
+                .active()
+                .unwrap()
+                .pixels
+                .as_ref(),
+            Some(&full)
+        );
+    }
+
+    #[test]
+    fn the_camera_raw_preview_is_not_committed_when_the_settings_change() {
+        let (mut app, mut edit) = camera_raw_setup(600, 400, 0.0);
+        assert!(!wait(&mut app, &mut edit));
+        let preview = app
+            .session()
+            .unwrap()
+            .document
+            .active()
+            .unwrap()
+            .pixels
+            .clone()
+            .unwrap();
+        assert_eq!(
+            preview.dimensions(),
+            (600, 400),
+            "small enough to be its own pixels"
+        );
+        let revision = app.session().unwrap().history.revision;
+
+        // A different exposure is a different filter, so Apply renders it again
+        // rather than committing what the preview left in the document.
+        edit.filter = Some(camera_raw(1.5));
+        assert!(!wait(&mut app, &mut edit));
+        let brighter = app
+            .session()
+            .unwrap()
+            .document
+            .active()
+            .unwrap()
+            .pixels
+            .clone()
+            .unwrap();
+        assert!(brighter != preview, "the new settings were rendered");
+        let mut edit = edit;
+        assert!(
+            !app.update_filter_preview(&mut edit, false, true),
+            "a worker starts"
+        );
+        assert!(edit.filter_preview.applying, "apply is under way");
+        assert!(wait(&mut app, &mut edit), "apply closes the dialog");
+        assert_eq!(app.session().unwrap().history.revision, revision + 1);
+        app.command("undo");
+        assert_eq!(
+            app.session()
+                .unwrap()
+                .document
+                .active()
+                .unwrap()
+                .pixels
+                .as_ref(),
+            Some(&preview),
+            "undo returns the layer the way it was before the filter"
+        );
     }
 
     #[test]

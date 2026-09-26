@@ -523,6 +523,15 @@ pub enum Filter {
         distortion: f32,
         vignette: f32,
     },
+    /// The develop pipeline as a filter, with the white balance counted in
+    /// relative steps the way a rendered image can be counted. The settings are
+    /// boxed because a develop sheet is far larger than any other filter's, and
+    /// this value is compared on every frame to spot a stale preview.
+    CameraRaw {
+        settings: Box<crate::raw::DevelopSettings>,
+        temperature: f32,
+        tint: f32,
+    },
 }
 
 impl Filter {
@@ -535,6 +544,7 @@ impl Filter {
             Self::BloomGlow { .. } => "Bloom / Glow",
             Self::TonalContrast { .. } => "Tonal Contrast",
             Self::LensCorrection { .. } => "Lens Correction",
+            Self::CameraRaw { .. } => "Camera Raw Filter",
         }
     }
 }
@@ -801,6 +811,20 @@ fn tonal_contrast(
 fn filtered_cpu(image: &RgbaImage, filter: &Filter, fill_empty_vignette: bool) -> RgbaImage {
     let (w, h) = image.dimensions();
     let result = match filter {
+        // The develop engine reports why it could not finish, so this one filter
+        // is applied where a failure can be shown rather than swallowed here.
+        Filter::CameraRaw {
+            settings,
+            temperature,
+            tint,
+        } => crate::raw::render_filter(
+            image,
+            settings,
+            *temperature,
+            *tint,
+            &AtomicBool::new(false),
+        )
+        .unwrap_or_else(|_| image.clone()),
         Filter::GaussianBlur { radius } => premultiplied_blur(image, *radius),
         Filter::MotionBlur { distance, angle } => {
             motion_blur(image, *distance, *angle, &AtomicBool::new(false))
@@ -1867,6 +1891,130 @@ mod tests {
         assert!(result.get_pixel(5, 8)[0] < source.get_pixel(5, 8)[0]);
         assert!(result.get_pixel(13, 8)[0] > source.get_pixel(13, 8)[0]);
         assert_eq!(result.get_pixel(5, 8)[3], 255);
+    }
+
+    #[test]
+    fn the_camera_raw_filter_applies_to_a_layer_and_undoes_as_one_edit() {
+        let mut document = Document::new(24, 16).unwrap();
+        document.layers.clear();
+        let pixels = RgbaImage::from_fn(24, 16, |x, y| {
+            Rgba([
+                (40 + x as u16 * 8).min(255) as u8,
+                (80 + y as u16 * 10).min(255) as u8,
+                150,
+                255,
+            ])
+        });
+        let original = pixels.clone();
+        let mut layer = crate::document::Layer::image("Photo", pixels);
+        layer.transform.x = 12.0;
+        layer.transform.y = 7.0;
+        layer.opacity = 0.6;
+        let transform = layer.transform;
+        document.insert(layer);
+        let mask = document.layers[0].mask.as_ref().map(|mask| mask.placement);
+
+        let mut filter = crate::raw::DevelopSettings {
+            sharpen: 0.0,
+            color_noise: 0.0,
+            luminance_noise: 0.0,
+            ..Default::default()
+        };
+        filter.exposure = 1.5;
+        apply_filter(
+            &mut document,
+            &Filter::CameraRaw {
+                settings: Box::new(filter),
+                temperature: 0.0,
+                tint: 0.0,
+            },
+            false,
+        )
+        .unwrap();
+        let result = document.layers[0].pixels.as_ref().unwrap();
+        assert!(**result != original, "the filter changed the pixels");
+        // A filter may not move a layer, and this one has nothing to spread.
+        assert_eq!(document.layers[0].transform, transform);
+        assert_eq!(
+            document.layers[0].mask.as_ref().map(|mask| mask.placement),
+            mask
+        );
+        assert_eq!(document.layers[0].opacity, 0.6);
+        assert!(
+            result
+                .pixels()
+                .zip(original.pixels())
+                .any(|(after, before)| after[0] > before[0]),
+            "a stop and a half of exposure brightens it"
+        );
+        document.validate().unwrap();
+    }
+
+    #[test]
+    fn the_camera_raw_filter_is_refused_where_it_does_not_belong() {
+        let mut document = Document::new(8, 8).unwrap();
+        let filter = Filter::CameraRaw {
+            settings: Box::new(crate::raw::DevelopSettings {
+                sharpen: 0.0,
+                color_noise: 0.0,
+                luminance_noise: 0.0,
+                ..Default::default()
+            }),
+            temperature: 0.0,
+            tint: 0.0,
+        };
+        // A mask takes Gaussian Blur and nothing else.
+        let error = apply_filter(&mut document, &filter, true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Gaussian Blur"), "{error}");
+        // A camera file belongs to Develop, which is the same engine with the
+        // camera's own data behind it.
+        let raw = crate::raw::RawAsset {
+            filename: "photo.nef".into(),
+            metadata: Default::default(),
+            settings: Default::default(),
+            bytes: Arc::new(vec![1, 2, 3]),
+        };
+        let mut layer = crate::document::Layer::image(
+            "Camera",
+            RgbaImage::from_pixel(8, 8, Rgba([1, 2, 3, 255])),
+        );
+        layer.raw = Some(raw);
+        let pixels = layer.pixels.clone();
+        document.layers.clear();
+        document.insert(layer);
+        let error = apply_filter(&mut document, &filter, false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("RAW layer"), "{error}");
+        assert_eq!(document.layers[0].pixels, pixels, "the layer is untouched");
+    }
+
+    #[test]
+    fn cancelled_camera_raw_filter_leaves_the_layer_alone() {
+        let mut document = Document::new(12, 12).unwrap();
+        let before = document.layers[0].pixels.clone();
+        let cancel = AtomicBool::new(true);
+        let error = apply_filter_cancellable(
+            &mut document,
+            &Filter::CameraRaw {
+                settings: Box::new(crate::raw::DevelopSettings {
+                    sharpen: 0.0,
+                    color_noise: 0.0,
+                    luminance_noise: 0.0,
+                    ..Default::default()
+                }),
+                temperature: 0.0,
+                tint: 0.0,
+            },
+            false,
+            &cancel,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("cancelled"), "{error}");
+        assert_eq!(document.layers[0].pixels, before);
     }
 
     #[test]

@@ -257,6 +257,7 @@ fn processing_raw_matches_cpu_at_both_depths() {
                 0.02 + (y * y % 193) as f32 / 190.0,
             ])
         }),
+        alpha: None,
         as_shot: [1.15, 1.0, 0.92],
         camera_to_rgb: [
             [1.1, -0.06, -0.04],
@@ -719,6 +720,7 @@ fn benchmark_processing_backends() {
         camera: image::Rgb32FImage::from_fn(1600, 1200, |x, y| {
             image::Rgb([x as f32 / 1300.0, y as f32 / 1500.0, 0.4])
         }),
+        alpha: None,
         as_shot: [1.0; 3],
         camera_to_rgb: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
         xyz_to_camera: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],

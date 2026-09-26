@@ -522,7 +522,7 @@ fn histogram(ui: &mut egui::Ui, d: &Develop) {
     });
 }
 
-fn curve(ui: &mut egui::Ui, knots: &mut [f32; 5], channel: usize) {
+pub(super) fn curve(ui: &mut egui::Ui, knots: &mut [f32; 5], channel: usize) {
     let (rect, response) =
         ui.allocate_exact_size(vec2(ui.available_width(), 175.0), Sense::click_and_drag());
     let rect = rect.shrink(5.0);

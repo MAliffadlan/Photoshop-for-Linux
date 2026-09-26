@@ -13,6 +13,11 @@ fn count(size: [u32; 2]) -> u64 {
 
 pub fn filter(image: &RgbaImage, filter: &crate::effects::Filter) -> Option<RgbaImage> {
     use crate::effects::Filter;
+    // The Camera Raw filter develops through the camera pipeline, which the
+    // shader has no path for, so the CPU engine runs it instead.
+    if matches!(filter, Filter::CameraRaw { .. }) {
+        return None;
+    }
     let size = [image.width(), image.height()];
     attempt(count(size), NEIGHBORHOOD_MIN, |gpu| {
         let bytes = match filter {
@@ -144,6 +149,9 @@ pub fn filter(image: &RgbaImage, filter: &crate::effects::Filter) -> Option<Rgba
                     )?
                     .ok_or_else(|| anyhow::anyhow!("Image exceeds GPU texture limits"));
             }
+            // Unreachable: the variant above is answered before this point, and
+            // the match has to be total.
+            Filter::CameraRaw { .. } => image.as_raw().clone(),
         };
         Ok(RgbaImage::from_raw(size[0], size[1], bytes).unwrap())
     })

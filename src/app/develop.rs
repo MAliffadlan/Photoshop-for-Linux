@@ -987,6 +987,7 @@ mod tests {
     fn fixture() -> (RawAsset, Arc<DecodedRaw>) {
         let raw = Arc::new(DecodedRaw {
             camera: image::Rgb32FImage::from_pixel(64, 48, image::Rgb([0.18; 3])),
+            alpha: None,
             as_shot: [1.0; 3],
             camera_to_rgb: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
             xyz_to_camera: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],

@@ -1,5 +1,5 @@
 use super::*;
-use image::Rgb;
+use image::{Rgb, Rgba};
 use std::sync::atomic::AtomicBool;
 
 fn synthetic() -> DecodedRaw {
@@ -7,6 +7,7 @@ fn synthetic() -> DecodedRaw {
         camera: Rgb32FImage::from_fn(64, 48, |x, y| {
             Rgb([0.02 + x as f32 / 40.0, 0.02 + y as f32 / 30.0, 0.2])
         }),
+        alpha: None,
         as_shot: [1.0; 3],
         camera_to_rgb: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
         xyz_to_camera: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
@@ -298,4 +299,170 @@ fn raw_crop_preserves_the_placement_of_surviving_pixels() {
         .transform
         .point(crate::document::Point::new(0.25, 0.5));
     assert!(center_before.distance(center_after) < 0.001);
+}
+
+#[test]
+fn the_camera_raw_filter_leaves_an_untouched_image_alone() {
+    // Compositor's own filter holds to this: its default settings change nothing.
+    let pixels = RgbaImage::from_fn(37, 23, |x, y| {
+        let checker = (((x / 4 + y / 4) % 2) as u16) * 90;
+        Rgba([
+            (20 + checker + x as u16 * 5).min(255) as u8,
+            (90 + y as u16 * 4).min(255) as u8,
+            (200 - x as u16 * 2) as u8,
+            255,
+        ])
+    });
+    let asked = DevelopSettings {
+        sharpen: 0.0,
+        color_noise: 0.0,
+        luminance_noise: 0.0,
+        ..Default::default()
+    };
+    let result = filter::render_filter(&pixels, &asked, 0.0, 0.0, &AtomicBool::new(false)).unwrap();
+    assert_eq!(result.dimensions(), pixels.dimensions());
+    let mut worst = 0_i32;
+    for (before, after) in pixels.pixels().zip(result.pixels()) {
+        assert_eq!(before[3], after[3], "alpha is untouched");
+        for c in 0..3 {
+            worst = worst.max((i32::from(after[c]) - i32::from(before[c])).abs());
+        }
+    }
+    assert!(
+        worst <= 1,
+        "the round trip through linear light moved a pixel by {worst}"
+    );
+}
+
+#[test]
+fn the_camera_raw_filter_keeps_a_layers_transparency() {
+    // A soft edge is the case a camera file never has. The engine premultiplies
+    // on the way in and divides back out on the way out, so the edge stays soft
+    // and a straight render comes back with the colour it started with, instead
+    // of fringing towards the transparent side.
+    let soft = |x: u32, y: u32| -> u8 {
+        let edge = (4.min(x) + 4.min(y) + 4.min(24 - 1 - x) + 4.min(24 - 1 - y)).min(8);
+        ((edge * 255) / 8) as u8
+    };
+    let pixels = RgbaImage::from_fn(24, 24, |x, y| Rgba([220, 120, 40, soft(x, y)]));
+    let asked = DevelopSettings {
+        sharpen: 0.0,
+        color_noise: 0.0,
+        luminance_noise: 0.0,
+        ..Default::default()
+    };
+    let untouched =
+        filter::render_filter(&pixels, &asked, 0.0, 0.0, &AtomicBool::new(false)).unwrap();
+    for (before, after) in pixels.pixels().zip(untouched.pixels()) {
+        assert_eq!(before[3], after[3], "a soft edge stays soft");
+        if before[3] > 0 {
+            for c in 0..3 {
+                assert!(
+                    (i32::from(after[c]) - i32::from(before[c])).abs() <= 2,
+                    "the straight colour survives the round trip: {before:?} -> {after:?}"
+                );
+            }
+        }
+    }
+    // Clarity reads neighbouring pixels, so it works on a premultiplied field
+    // whose alpha is a gradient. The opaque middle has no gradient to read, so
+    // its colour is the one the layer started with.
+    let mut sharpened = asked.clone();
+    sharpened.clarity = 80.0;
+    let developed =
+        filter::render_filter(&pixels, &sharpened, 0.0, 0.0, &AtomicBool::new(false)).unwrap();
+    for (before, after) in untouched.pixels().zip(developed.pixels()) {
+        assert_eq!(before[3], after[3], "clarity does not touch alpha either");
+    }
+    let solid: Vec<&Rgba<u8>> = developed.pixels().filter(|pixel| pixel[3] == 255).collect();
+    assert!(
+        solid.len() > 100,
+        "the test image has a solid middle: {}",
+        solid.len()
+    );
+    for (channel, start) in [220_i32, 120, 40].into_iter().enumerate() {
+        let mean = solid
+            .iter()
+            .map(|pixel| i32::from(pixel[channel]))
+            .sum::<i32>()
+            / solid.len() as i32;
+        assert!(
+            (mean - start).abs() <= 25,
+            "channel {channel} averaged {mean} against {start}"
+        );
+    }
+}
+
+#[test]
+fn the_camera_raw_filter_answers_its_own_controls() {
+    let pixels = RgbaImage::from_fn(16, 16, |x, y| {
+        Rgba([
+            (40 + x as u16 * 12).min(255) as u8,
+            (90 + y as u16 * 8).min(255) as u8,
+            140,
+            255,
+        ])
+    });
+    let asked = DevelopSettings {
+        sharpen: 0.0,
+        color_noise: 0.0,
+        luminance_noise: 0.0,
+        ..Default::default()
+    };
+    let base = filter::render_filter(&pixels, &asked, 0.0, 0.0, &AtomicBool::new(false)).unwrap();
+    let brighter =
+        filter::render_filter(&pixels, &asked, 0.0, 0.0, &AtomicBool::new(false)).unwrap();
+    assert_eq!(base, brighter, "the same settings render the same pixels");
+
+    let mut lifted = asked.clone();
+    lifted.exposure = 1.0;
+    let exposed =
+        filter::render_filter(&pixels, &lifted, 0.0, 0.0, &AtomicBool::new(false)).unwrap();
+    assert!(
+        exposed
+            .pixels()
+            .zip(base.pixels())
+            .any(|(a, b)| a[0] > b[0]),
+        "a stop of exposure brightens the image"
+    );
+
+    let mut monochrome = asked.clone();
+    monochrome.monochrome = true;
+    monochrome.bw_mix = [1.0, 1.0, 1.0];
+    let grey =
+        filter::render_filter(&pixels, &monochrome, 0.0, 0.0, &AtomicBool::new(false)).unwrap();
+    for pixel in grey.pixels() {
+        let spread = (i32::from(pixel[0]) - i32::from(pixel[1])).abs()
+            + (i32::from(pixel[1]) - i32::from(pixel[2])).abs();
+        assert!(spread < 24, "monochrome is grey: {pixel:?}");
+    }
+
+    let warm = filter::render_filter(&pixels, &asked, 100.0, 0.0, &AtomicBool::new(false)).unwrap();
+    let red = warm
+        .pixels()
+        .zip(base.pixels())
+        .filter(|(a, b)| a[0].abs_diff(b[0]) > 2)
+        .count();
+    let blue = warm
+        .pixels()
+        .zip(base.pixels())
+        .filter(|(a, b)| a[2].abs_diff(b[2]) > 2)
+        .count();
+    assert!(
+        red > 200 && blue > 200,
+        "both channels move with the temperature"
+    );
+}
+
+#[test]
+fn a_cancelled_camera_raw_filter_says_so() {
+    let pixels = RgbaImage::from_pixel(8, 8, image::Rgba([10, 20, 30, 255]));
+    let asked = DevelopSettings {
+        sharpen: 0.0,
+        color_noise: 0.0,
+        luminance_noise: 0.0,
+        ..Default::default()
+    };
+    let cancel = AtomicBool::new(true);
+    assert!(filter::render_filter(&pixels, &asked, 0.0, 0.0, &cancel).is_err());
 }

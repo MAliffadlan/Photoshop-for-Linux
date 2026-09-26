@@ -1,4 +1,5 @@
 //! Nondestructive camera RAW assets and a floating-point Develop pipeline.
+mod filter;
 mod process;
 mod settings;
 #[cfg(test)]
@@ -21,6 +22,7 @@ use rawler::{
 use serde::{Deserialize, Serialize};
 
 use crate::document::validate_size;
+pub use filter::{filter_settings, preview_source, relative_white_balance, render_filter, source};
 pub use process::{auto_exposure, render, render_16, sample_white_balance, source_point};
 pub use settings::{DevelopSettings, Overlay, OverlayKind, WhiteBalance};
 
@@ -68,7 +70,12 @@ impl RawAsset {
 /// at 1.0 and have not had white balance, exposure, color conversion or gamma applied.
 #[derive(Debug)]
 pub struct DecodedRaw {
+    /// The camera values the pipeline works on. When `alpha` is set they are
+    /// premultiplied by it, which is what keeps a soft edge from fringing.
     pub camera: Rgb32FImage,
+    /// The alpha a camera file does not have: a rendered layer's own, which the
+    /// develop pass multiplies into the geometry mask instead of replacing.
+    pub alpha: Option<Arc<image::GrayImage>>,
     pub as_shot: [f32; 3],
     pub camera_to_rgb: [[f32; 3]; 3],
     pub xyz_to_camera: [[f32; 3]; 3],
@@ -79,12 +86,18 @@ impl DecodedRaw {
     pub fn preview(&self, max_side: u32) -> Self {
         let scale =
             (max_side as f32 / self.camera.width().max(self.camera.height()) as f32).min(1.0);
+        let width = (self.camera.width() as f32 * scale).round().max(1.0) as u32;
+        let height = (self.camera.height() as f32 * scale).round().max(1.0) as u32;
         Self {
-            camera: crate::gpu::resize_rgb(
-                &self.camera,
-                (self.camera.width() as f32 * scale).round().max(1.0) as u32,
-                (self.camera.height() as f32 * scale).round().max(1.0) as u32,
-            ),
+            camera: crate::gpu::resize_rgb(&self.camera, width, height),
+            alpha: self.alpha.as_ref().map(|alpha| {
+                Arc::new(image::imageops::resize(
+                    alpha.as_ref(),
+                    width,
+                    height,
+                    image::imageops::FilterType::Triangle,
+                ))
+            }),
             as_shot: self.as_shot,
             camera_to_rgb: self.camera_to_rgb,
             xyz_to_camera: self.xyz_to_camera,
@@ -219,6 +232,7 @@ fn decode_inner(bytes: &[u8]) -> Result<DecodedRaw> {
     };
     Ok(DecodedRaw {
         camera,
+        alpha: None,
         as_shot,
         camera_to_rgb,
         xyz_to_camera,

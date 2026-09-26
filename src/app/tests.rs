@@ -251,6 +251,64 @@ fn coloured_letters_chosen_in_the_text_dialog_reach_the_layer() {
     assert!(text.color_runs.is_empty());
 }
 
+#[test]
+fn the_camera_raw_filter_panel_pages_through_and_keeps_its_settings() {
+    let (context, mut app) = app();
+    app.dimensions = [320, 240];
+    app.new_document();
+    frame(&context, &mut app);
+    app.start_filter(mectov::effects::Filter::CameraRaw {
+        settings: Box::new(mectov::raw::DevelopSettings {
+            sharpen: 0.0,
+            color_noise: 0.0,
+            luminance_noise: 0.0,
+            ..Default::default()
+        }),
+        temperature: 0.0,
+        tint: 0.0,
+    });
+    assert!(app.dialog == Some(Dialog::Effect));
+    // Every page draws, and the page the user is on is kept between frames.
+    for page in 0..6 {
+        let mut edit = app.effect.take().unwrap();
+        edit.camera_raw_page = page;
+        edit.refresh = true;
+        app.effect = Some(edit);
+        frame(&context, &mut app);
+        assert!(app.error.is_none(), "page {page}: {:?}", app.error);
+        assert_eq!(app.effect.as_ref().unwrap().camera_raw_page, page);
+    }
+    // The controls reach the filter, and the filter keeps them.
+    let mut edit = app.effect.take().unwrap();
+    edit.camera_raw_page = 0;
+    if let mectov::effects::Filter::CameraRaw { settings, .. } = edit.filter.as_mut().unwrap() {
+        settings.exposure = 1.25;
+        settings.monochrome = true;
+    }
+    app.effect = Some(edit);
+    frame(&context, &mut app);
+    let edit = app.effect.as_ref().unwrap();
+    if let mectov::effects::Filter::CameraRaw { settings, .. } = edit.filter.as_ref().unwrap() {
+        assert_eq!(settings.exposure, 1.25);
+        assert!(settings.monochrome);
+    } else {
+        panic!("the filter is still the Camera Raw filter");
+    }
+    // Cancelling leaves the document as it was.
+    let before = app.session().unwrap().document.layers[0].pixels.clone();
+    let event = egui::Event::Key {
+        key: egui::Key::Escape,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::NONE,
+    };
+    keyboard_frame(&context, &mut app, vec![event], egui::Modifiers::NONE);
+    assert!(app.effect.is_none());
+    assert!(app.dialog.is_none());
+    assert_eq!(app.session().unwrap().document.layers[0].pixels, before);
+}
+
 fn text_key(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
     egui::Event::Key {
         key,

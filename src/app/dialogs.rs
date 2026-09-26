@@ -6,7 +6,9 @@ use egui::{Color32, RichText, Stroke, vec2};
 use mectov::{
     document::{Adjustment, Layer, LayerEffects, Point},
     effects::{self, Filter},
-    io, operations, render,
+    io, operations,
+    raw::OverlayKind,
+    render,
 };
 
 use super::{Dialog, EditorApp, theme};
@@ -790,6 +792,7 @@ impl EditorApp {
                     }
                 }
                 if let Some(filter) = &mut edit.filter {
+                    let mut camera_raw_page = edit.camera_raw_page;
                     ui.add_enabled_ui(!edit.filter_preview.applying, |ui| match filter {
                         Filter::GaussianBlur { radius } => {
                             changed |= ui
@@ -950,7 +953,21 @@ impl EditorApp {
                                 )
                                 .changed();
                         }
+                        Filter::CameraRaw {
+                            settings,
+                            temperature,
+                            tint,
+                        } => {
+                            changed |= camera_raw_panel(
+                                ui,
+                                settings,
+                                temperature,
+                                tint,
+                                &mut camera_raw_page,
+                            );
+                        }
                     });
+                    edit.camera_raw_page = camera_raw_page;
                 }
                 ui.add_space(14.0);
                 ui.separator();
@@ -1612,4 +1629,216 @@ fn curve_editor(ui: &mut egui::Ui, points: &mut Vec<Point>) -> bool {
         }
     }
     changed
+}
+
+/// The Camera Raw filter's panel: the develop controls a rendered layer can take,
+/// one page at a time so the dialog stays the size every other filter is.
+///
+/// The controls a camera file has and a rendered image does not are left out
+/// rather than shown dead: an as-shot white balance, a kelvin scale, auto
+/// exposure, and the crop a filter may not apply. White balance is counted in
+/// relative steps instead, as Compositor's own filter counts it.
+fn camera_raw_panel(
+    ui: &mut egui::Ui,
+    settings: &mut Box<mectov::raw::DevelopSettings>,
+    temperature: &mut f32,
+    tint: &mut f32,
+    page: &mut usize,
+) -> bool {
+    let mut changed = false;
+    // The curve and mixer pickers belong to the Tone page rather than the edit
+    // state, so each of them is a local that the page both reads and writes.
+    let mut curve_channel = 0_usize;
+    let mut hsl_band = 0_usize;
+    const PAGES: [&str; 6] = ["Light", "Tone", "Detail", "Optics", "Geometry", "Masks"];
+    ui.horizontal(|ui| {
+        for (index, name) in PAGES.iter().enumerate() {
+            ui.selectable_value(page, index, *name);
+        }
+    });
+    ui.add_space(6.0);
+    match *page {
+        0 => {
+            changed |= widget_row(ui, "Temperature", temperature, -100.0..=100.0);
+            changed |= widget_row(ui, "Tint", tint, -100.0..=100.0);
+            for (label, value, range) in [
+                ("Exposure", &mut settings.exposure, -5.0..=5.0),
+                ("Brightness", &mut settings.brightness, -100.0..=100.0),
+                ("Contrast", &mut settings.contrast, -100.0..=100.0),
+                ("Highlights", &mut settings.highlights, -100.0..=100.0),
+                ("Shadows", &mut settings.shadows, -100.0..=100.0),
+                ("Whites", &mut settings.whites, -100.0..=100.0),
+                ("Blacks", &mut settings.blacks, -100.0..=100.0),
+            ] {
+                changed |= widget_row(ui, label, value, range);
+            }
+            ui.add_space(6.0);
+            for (label, value) in [
+                ("Saturation", &mut settings.saturation),
+                ("Vibrance", &mut settings.vibrance),
+                ("Clarity", &mut settings.clarity),
+                ("Texture", &mut settings.texture),
+                ("Dehaze", &mut settings.dehaze),
+            ] {
+                changed |= widget_row(ui, label, value, -100.0..=100.0);
+            }
+        }
+        1 => {
+            ui.horizontal(|ui| {
+                for (index, name) in ["RGB", "Red", "Green", "Blue"].iter().enumerate() {
+                    ui.selectable_value(&mut curve_channel, index, *name);
+                }
+            });
+            super::develop_controls::curve(ui, &mut settings.curves[curve_channel], curve_channel);
+            ui.horizontal(|ui| {
+                if ui.button("Linear").clicked() {
+                    settings.curves[curve_channel] = [0.0, 0.25, 0.5, 0.75, 1.0];
+                    changed = true;
+                }
+                if ui.button("S curve").clicked() {
+                    settings.curves[curve_channel] = [0.0, 0.18, 0.5, 0.82, 1.0];
+                    changed = true;
+                }
+                if ui.button("Lift blacks").clicked() {
+                    settings.curves[curve_channel] = [0.08, 0.28, 0.5, 0.75, 1.0];
+                    changed = true;
+                }
+            });
+            ui.add_space(6.0);
+            const BANDS: [&str; 8] = [
+                "Red", "Orange", "Yellow", "Green", "Aqua", "Blue", "Purple", "Magenta",
+            ];
+            egui::ComboBox::from_id_salt("camera_raw_hsl")
+                .selected_text(BANDS[hsl_band])
+                .show_ui(ui, |ui| {
+                    for (index, name) in BANDS.iter().enumerate() {
+                        ui.selectable_value(&mut hsl_band, index, *name);
+                    }
+                });
+            for (label, slot) in [("Hue", 0), ("Saturation", 1), ("Lightness", 2)] {
+                changed |= widget_row(ui, label, &mut settings.hsl[hsl_band][slot], -100.0..=100.0);
+            }
+            ui.add_space(6.0);
+            changed |= widgets::checkbox(ui, &mut settings.monochrome, "Monochrome").changed();
+            ui.add_enabled_ui(settings.monochrome, |ui| {
+                for (label, slot) in [("Red mix", 0), ("Green mix", 1), ("Blue mix", 2)] {
+                    changed |= widget_row(ui, label, &mut settings.bw_mix[slot], -1.0..=2.0);
+                }
+            });
+            ui.add_space(6.0);
+            for (label, slot) in [("Shadow hue", 0), ("Shadow amount", 1)] {
+                changed |= widget_row(ui, label, &mut settings.shadow_tone[slot], 0.0..=360.0);
+            }
+            settings.shadow_tone[1] = settings.shadow_tone[1].clamp(0.0, 100.0);
+            for (label, slot) in [("Highlight hue", 0), ("Highlight amount", 1)] {
+                changed |= widget_row(ui, label, &mut settings.highlight_tone[slot], 0.0..=360.0);
+            }
+            settings.highlight_tone[1] = settings.highlight_tone[1].clamp(0.0, 100.0);
+            changed |= widget_row(ui, "Balance", &mut settings.tone_balance, -100.0..=100.0);
+        }
+        2 => {
+            for (label, value, range) in [
+                (
+                    "Luminance noise",
+                    &mut settings.luminance_noise,
+                    0.0..=100.0,
+                ),
+                ("Color noise", &mut settings.color_noise, 0.0..=100.0),
+                ("Sharpen", &mut settings.sharpen, 0.0..=150.0),
+                ("Radius", &mut settings.sharpen_radius, 0.3..=3.0),
+                ("Threshold", &mut settings.sharpen_threshold, 0.0..=100.0),
+            ] {
+                changed |= widget_row(ui, label, value, range);
+            }
+        }
+        3 => {
+            for (label, value) in [
+                ("Distortion", &mut settings.distortion),
+                ("Red / cyan", &mut settings.chromatic_red),
+                ("Blue / yellow", &mut settings.chromatic_blue),
+                ("Defringe", &mut settings.defringe),
+                ("Vignette", &mut settings.vignette),
+            ] {
+                changed |= widget_row(ui, label, value, -100.0..=100.0);
+            }
+        }
+        4 => {
+            changed |= widget_row(ui, "Straighten", &mut settings.rotation, -45.0..=45.0);
+            changed |= widget_row(
+                ui,
+                "Horizontal",
+                &mut settings.perspective[0],
+                -100.0..=100.0,
+            );
+            changed |= widget_row(ui, "Vertical", &mut settings.perspective[1], -100.0..=100.0);
+        }
+        _ => {
+            ui.label(
+                RichText::new(
+                    "A gradient over part of the layer. A brush mask needs the Develop sheet.",
+                )
+                .color(theme::MUTED),
+            );
+            ui.horizontal(|ui| {
+                for (label, kind) in [
+                    ("+ Linear", OverlayKind::Linear),
+                    ("+ Radial", OverlayKind::Radial),
+                ] {
+                    if ui.button(label).clicked() && settings.overlays.len() < 32 {
+                        let mut overlay = mectov::raw::Overlay {
+                            kind,
+                            ..Default::default()
+                        };
+                        overlay.name = format!(
+                            "{} {}",
+                            label.trim_start_matches("+ "),
+                            settings.overlays.len() + 1
+                        );
+                        settings.overlays.push(overlay);
+                        changed = true;
+                    }
+                }
+            });
+            let mut remove = None;
+            for (index, overlay) in settings.overlays.iter_mut().enumerate() {
+                if overlay.kind == OverlayKind::Brush {
+                    continue;
+                }
+                ui.horizontal(|ui| {
+                    changed |= widgets::checkbox(ui, &mut overlay.enabled, &overlay.name).changed();
+                    if ui.small_button("Remove").clicked() {
+                        remove = Some(index);
+                    }
+                });
+                if !overlay.enabled {
+                    continue;
+                }
+                ui.add_enabled_ui(true, |ui| {
+                    changed |= widget_row(ui, "Exposure", &mut overlay.exposure, -3.0..=3.0);
+                    changed |= widget_row(ui, "Warmth", &mut overlay.warmth, -100.0..=100.0);
+                    changed |=
+                        widget_row(ui, "Saturation", &mut overlay.saturation, -100.0..=100.0);
+                    changed |= widget_row(ui, "Radius", &mut overlay.radius, 0.0..=1.0);
+                    changed |= widget_row(ui, "Feather", &mut overlay.feather, 0.0..=1.0);
+                    changed |= widgets::checkbox(ui, &mut overlay.invert, "Invert").changed();
+                });
+            }
+            if let Some(index) = remove {
+                settings.overlays.remove(index);
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+/// One labelled slider, in the same shape every other filter's rows use.
+fn widget_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+) -> bool {
+    ui.add(widgets::Slider::new(value, range).text(label))
+        .changed()
 }

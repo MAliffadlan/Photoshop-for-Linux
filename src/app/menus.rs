@@ -99,6 +99,12 @@ impl EditorApp {
         let mut filter = None;
         let mut adjustment_layer = false;
         let has_doc = self.session().is_some();
+        // Develop is the Camera Raw filter's counterpart for a camera file, so a
+        // RAW layer is not offered the filter as well.
+        let raw_layer_selected = self
+            .session()
+            .and_then(|session| session.document.active())
+            .is_some_and(|layer| layer.raw.is_some());
         let blocked = self.job.is_some()
             || self.dialog.is_some()
             || self.close_app
@@ -388,11 +394,28 @@ impl EditorApp {
                                             distortion: 0.0,
                                             vignette: 0.0,
                                         },
+                                        // Develop already owns a camera file, so the
+                                        // filter is offered for the layers it does not
+                                        // cover, which is everything but a RAW one.
+                                        Filter::CameraRaw {
+                                            settings: Box::new(mectov::raw::DevelopSettings {
+                                                sharpen: 0.0,
+                                                color_noise: 0.0,
+                                                luminance_noise: 0.0,
+                                                ..Default::default()
+                                            }),
+                                            temperature: 0.0,
+                                            tint: 0.0,
+                                        },
                                     ] {
-                                        if ui.button(format!("{}…", f.name())).clicked() {
-                                            filter = Some(f);
-                                            ui.close();
-                                        }
+                                        let offered = !raw_layer_selected
+                                            || !matches!(f, Filter::CameraRaw { .. });
+                                        ui.add_enabled_ui(offered, |ui| {
+                                            if ui.button(format!("{}…", f.name())).clicked() {
+                                                filter = Some(f);
+                                                ui.close();
+                                            }
+                                        });
                                     }
                                 });
                             });
