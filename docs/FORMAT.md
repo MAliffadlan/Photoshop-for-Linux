@@ -12,7 +12,7 @@ Saving validates the document, writes a sibling temporary archive, flushes it, a
 
 Projects written before the rename carry an earlier identifier and the previous project extension. The reader accepts both identifiers and both extensions, so those projects load unchanged; saving always writes the `me.silverl.mectov` identifier and the `.mectov` extension.
 
-Limits: 30,000 pixels per canvas/image dimension, 100 megapixels per canvas, 100 megapixels of layer assets plus 100 megapixels of masks, 10,000 layers, 64 nested group levels, 4 MiB manifest JSON, and 512 MiB encoded asset files.
+Limits: 30,000 pixels per canvas/image dimension, 200 megapixels for one image, 800 megapixels for a whole document measured as the canvas plus every layer and mask, 10,000 layers, 64 nested group levels, 4 MiB manifest JSON, and 1 GiB encoded asset files. Compositor's own ceilings are 200 and 800 megapixels; mectov lowers them to what the machine can hold, so a project saved on a large machine can be refused by a small one, with the size and the memory it found named in the error.
 
 The importer accepts Compositor package versions 1–9, including Swift's alternating-key enum dictionaries, individual color channels, mask placement/link flags, grain parameters, live shape styles and line geometry, alignment guides, layer effects, Photoshop's blend modes, the Black & White, Color Balance and Invert adjustments, and 1.2.3's Add Noise, Gaussian Blur and Motion Blur. Versions 8 and 9 both cover Compositor 1.2.1 and 1.2.2, which kept version 8; 1.2.3 and 1.2.4 write version 9, which is the version that allows the blur and noise adjustment layers. Import is one-way: Save creates a `.mectov` file and leaves the `.comp` package untouched.
 

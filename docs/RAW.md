@@ -25,7 +25,7 @@ Rawler decodes the actual sensor data, corrects camera black/white levels, and p
 
 **Develop** renders a full-resolution 8-bit sRGB photo layer, matching the existing compositor. **16-bit TIFF…** renders directly from the floating-point pipeline, without an intermediate 8-bit conversion, and embeds an sRGB ICC profile. It exports the current RAW development alone, including crop and local masks. To export the whole composition, use the normal photo editor's File → Export. Both outputs are independent of preview zoom and comparison/clipping overlays.
 
-Decoding, previews, full-resolution development, and TIFF encoding run in background workers. Preview edits are debounced, and stale results are discarded. Cancelling never commits a worker's late result. RAW import/development is limited to the editor's 100-megapixel image limit; project RAW sources have an aggregate 512 MiB budget. Full-resolution processing uses substantially more memory than the fit preview.
+Decoding, previews, full-resolution development, and TIFF encoding run in background workers. Preview edits are debounced, and stale results are discarded. Cancelling never commits a worker's late result. RAW import/development is limited to the editor's image limit for the machine, which is 200 megapixels on a machine with memory to match; project RAW sources have an aggregate 512 MiB budget. Full-resolution processing uses substantially more memory than the fit preview.
 
 ## Current limits
 
