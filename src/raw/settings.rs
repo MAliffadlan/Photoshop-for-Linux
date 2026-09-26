@@ -150,6 +150,202 @@ impl Grading {
     }
 }
 
+/// Glow's three looks. Warmth tints Diffusion and Bloom from cool to warm;
+/// Halation's fringe stays red and warmth only pushes it further that way.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GlowStyle {
+    #[default]
+    Diffusion,
+    Bloom,
+    Halation,
+}
+
+impl GlowStyle {
+    /// The value Compositor's kernel switches on.
+    pub fn kernel_value(self) -> u32 {
+        match self {
+            GlowStyle::Diffusion => 0,
+            GlowStyle::Bloom => 1,
+            GlowStyle::Halation => 2,
+        }
+    }
+
+    /// The name the panel shows, which is Compositor's own.
+    pub fn name(self) -> &'static str {
+        match self {
+            GlowStyle::Diffusion => "Diffusion",
+            GlowStyle::Bloom => "Bloom",
+            GlowStyle::Halation => "Halation",
+        }
+    }
+
+    pub const ALL: [GlowStyle; 3] = [GlowStyle::Diffusion, GlowStyle::Bloom, GlowStyle::Halation];
+}
+
+/// The post-crop vignette's three looks. Highlight Priority is the one whose
+/// Highlights slider protects bright pixels. Paint Overlay is the plain
+/// vignette here: the colour it is named for belongs to Compositor's standalone
+/// Vignette filter, which is driven by its own function.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VignetteStyle {
+    #[default]
+    HighlightPriority,
+    ColorPriority,
+    PaintOverlay,
+}
+
+impl VignetteStyle {
+    pub fn kernel_value(self) -> u32 {
+        match self {
+            VignetteStyle::HighlightPriority => 0,
+            VignetteStyle::ColorPriority => 1,
+            VignetteStyle::PaintOverlay => 2,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            VignetteStyle::HighlightPriority => "Highlight Priority",
+            VignetteStyle::ColorPriority => "Color Priority",
+            VignetteStyle::PaintOverlay => "Paint Overlay",
+        }
+    }
+
+    pub const ALL: [VignetteStyle; 3] = [
+        VignetteStyle::HighlightPriority,
+        VignetteStyle::ColorPriority,
+        VignetteStyle::PaintOverlay,
+    ];
+}
+
+/// How hard the calibration sliders are allowed to push. Compositor keeps the
+/// older processes so a look can be matched; version 6 is its current default
+/// and the only one that applies the sliders at full strength.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum ProcessVersion {
+    Version1,
+    Version2,
+    Version3,
+    Version4,
+    Version5,
+    #[default]
+    Version6,
+}
+
+impl ProcessVersion {
+    /// Compositor counts from one, and its kernel treats anything below one the
+    /// same as version one.
+    pub fn kernel_value(self) -> u32 {
+        match self {
+            ProcessVersion::Version1 => 1,
+            ProcessVersion::Version2 => 2,
+            ProcessVersion::Version3 => 3,
+            ProcessVersion::Version4 => 4,
+            ProcessVersion::Version5 => 5,
+            ProcessVersion::Version6 => 6,
+        }
+    }
+
+    /// How strongly the process scales the calibration it is given: the older
+    /// processes are a gentler correction of the same sliders.
+    pub fn scale(self) -> f32 {
+        match self {
+            ProcessVersion::Version1 => 0.55,
+            ProcessVersion::Version2 => 0.65,
+            ProcessVersion::Version3 => 0.75,
+            ProcessVersion::Version4 => 0.85,
+            ProcessVersion::Version5 => 0.92,
+            ProcessVersion::Version6 => 1.0,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            ProcessVersion::Version1 => "Version 1",
+            ProcessVersion::Version2 => "Version 2",
+            ProcessVersion::Version3 => "Version 3",
+            ProcessVersion::Version4 => "Version 4",
+            ProcessVersion::Version5 => "Version 5",
+            ProcessVersion::Version6 => "Version 6",
+        }
+    }
+
+    /// What Compositor says about each process, shown under the picker.
+    pub fn summary(self) -> &'static str {
+        match self {
+            ProcessVersion::Version1 => {
+                "The first process, and the gentlest. The calibration sliders below apply at 55%."
+            }
+            ProcessVersion::Version2 => "The calibration sliders below apply at 65%.",
+            ProcessVersion::Version3 => "The calibration sliders below apply at 75%.",
+            ProcessVersion::Version4 => "The calibration sliders below apply at 85%.",
+            ProcessVersion::Version5 => "The calibration sliders below apply at 92%.",
+            ProcessVersion::Version6 => {
+                "Current default. The calibration sliders below apply at full strength."
+            }
+        }
+    }
+
+    pub const ALL: [ProcessVersion; 6] = [
+        ProcessVersion::Version1,
+        ProcessVersion::Version2,
+        ProcessVersion::Version3,
+        ProcessVersion::Version4,
+        ProcessVersion::Version5,
+        ProcessVersion::Version6,
+    ];
+}
+
+/// Calibration: one shadow tint and a hue and saturation for each of the three
+/// primaries, all in the same −100…100 the panel's sliders use.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Calibration {
+    #[serde(default)]
+    pub process: ProcessVersion,
+    /// Rotates the hue of everything darker than a fixed lightness.
+    #[serde(default)]
+    pub shadow_tint: f32,
+    #[serde(default)]
+    pub red_hue: f32,
+    #[serde(default)]
+    pub red_saturation: f32,
+    #[serde(default)]
+    pub green_hue: f32,
+    #[serde(default)]
+    pub green_saturation: f32,
+    #[serde(default)]
+    pub blue_hue: f32,
+    #[serde(default)]
+    pub blue_saturation: f32,
+}
+
+impl Calibration {
+    /// Whether any slider asks for a change. The process on its own does not:
+    /// it only decides how hard the sliders push.
+    pub fn adjusts(&self) -> bool {
+        self.sliders().iter().any(|value| *value != 0.0)
+    }
+
+    pub fn sliders(&self) -> [f32; 7] {
+        [
+            self.shadow_tint,
+            self.red_hue,
+            self.red_saturation,
+            self.green_hue,
+            self.green_saturation,
+            self.blue_hue,
+            self.blue_saturation,
+        ]
+    }
+
+    fn validate(&self) -> Result<()> {
+        for value in self.sliders() {
+            range(value, -100.0, 100.0)?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DevelopSettings {
@@ -181,6 +377,30 @@ pub struct DevelopSettings {
     pub tone_balance: f32,
     /// The colour grading wheels, applied after the tone curve and the mixer.
     pub grading: Grading,
+    /// Glow, from the bright areas outwards, and its three looks.
+    pub glow: f32,
+    pub glow_style: GlowStyle,
+    /// How bright an area has to be to glow.
+    pub glow_range: f32,
+    /// How far the glow reaches.
+    pub glow_spread: f32,
+    /// From cool to warm; Halation stays red.
+    pub glow_warmth: f32,
+    /// The post-crop vignette. `vignette` below is the lens correction, which
+    /// runs later and is a different control.
+    pub vignette_amount: f32,
+    pub vignette_style: VignetteStyle,
+    pub vignette_midpoint: f32,
+    pub vignette_roundness: f32,
+    pub vignette_feather: f32,
+    /// Protects bright pixels while a dark vignette is applied.
+    pub vignette_highlights: f32,
+    pub grain_amount: f32,
+    pub grain_size: f32,
+    pub grain_roughness: f32,
+    /// Applied before the light pass, in the same encoded values the rest of
+    /// the creative work uses.
+    pub calibration: Calibration,
     pub luminance_noise: f32,
     pub color_noise: f32,
     pub sharpen: f32,
@@ -225,6 +445,21 @@ impl Default for DevelopSettings {
             highlight_tone: [45.0, 0.0],
             tone_balance: 0.0,
             grading: Grading::default(),
+            glow: 0.0,
+            glow_style: GlowStyle::default(),
+            glow_range: 0.0,
+            glow_spread: 0.0,
+            glow_warmth: 0.0,
+            vignette_amount: 0.0,
+            vignette_style: VignetteStyle::default(),
+            vignette_midpoint: 50.0,
+            vignette_roundness: 0.0,
+            vignette_feather: 50.0,
+            vignette_highlights: 0.0,
+            grain_amount: 0.0,
+            grain_size: 25.0,
+            grain_roughness: 50.0,
+            calibration: Calibration::default(),
             luminance_noise: 0.0,
             color_noise: 20.0,
             sharpen: 25.0,
@@ -279,8 +514,28 @@ impl DevelopSettings {
         ] {
             range(value, -100.0, 100.0)?;
         }
-        for value in [self.luminance_noise, self.color_noise, self.defringe] {
+        for value in [
+            self.luminance_noise,
+            self.color_noise,
+            self.defringe,
+            self.glow,
+            self.vignette_midpoint,
+            self.vignette_feather,
+            self.vignette_highlights,
+            self.grain_amount,
+            self.grain_size,
+            self.grain_roughness,
+        ] {
             range(value, 0.0, 100.0)?;
+        }
+        for value in [
+            self.glow_range,
+            self.glow_spread,
+            self.glow_warmth,
+            self.vignette_amount,
+            self.vignette_roundness,
+        ] {
+            range(value, -100.0, 100.0)?;
         }
         range(self.sharpen, 0.0, 200.0)?;
         range(self.sharpen_radius, 0.3, 5.0)?;
@@ -329,6 +584,17 @@ impl DevelopSettings {
         }
         ensure!(points <= 8192, "Too many RAW brush points (maximum 8192)");
         self.grading.validate()?;
+        self.calibration.validate()?;
         Ok(())
+    }
+
+    /// Whether the post-grade effects ask for anything: glow, the post-crop
+    /// vignette, or grain. A project format has to know, because a camera layer
+    /// is developed again when a project opens.
+    pub fn adjusts_effects(&self) -> bool {
+        self.glow > 0.0
+            || self.vignette_amount != 0.0
+            || self.grain_amount > 0.0
+            || self.calibration.adjusts()
     }
 }

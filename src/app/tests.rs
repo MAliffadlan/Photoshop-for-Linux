@@ -273,7 +273,7 @@ fn the_camera_raw_filter_panel_pages_through_and_keeps_its_settings() {
     // scrolls inside a height taken from the screen it was opened on.
     tall_frame(&context, &mut app);
     // Every page draws, and the page the user is on is kept between frames.
-    for page in 0..6 {
+    for page in 0..8 {
         let mut edit = app.effect.take().unwrap();
         edit.camera_raw_page = page;
         edit.refresh = true;
@@ -282,6 +282,55 @@ fn the_camera_raw_filter_panel_pages_through_and_keeps_its_settings() {
         assert!(app.error.is_none(), "page {page}: {:?}", app.error);
         assert_eq!(app.effect.as_ref().unwrap().camera_raw_page, page);
     }
+    // The Effects page carries the presence controls, glow, the post-crop
+    // vignette and grain, and the Calibration page the process picker and the
+    // three primaries, the way Compositor's own sections do.
+    for (page, wanted) in [
+        (
+            3,
+            [
+                "Clarity",
+                "Glow",
+                "Style",
+                "Amount",
+                "Midpoint",
+                "Size",
+                "Roughness",
+            ],
+        ),
+        (
+            6,
+            [
+                "Version 6",
+                "Shadows",
+                "Tint",
+                "Red primary",
+                "Hue",
+                "Saturation",
+                "Blue primary",
+            ],
+        ),
+    ] {
+        let mut edit = app.effect.take().unwrap();
+        edit.camera_raw_page = page;
+        app.effect = Some(edit);
+        let output = tall_frame(&context, &mut app);
+        let texts: Vec<&str> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some(text.galley.text()),
+                _ => None,
+            })
+            .collect();
+        for label in wanted {
+            assert!(
+                texts.contains(&label),
+                "page {page} offers {label}: {texts:?}"
+            );
+        }
+    }
+
     // The Tone page carries the grading wheels, at the end of the page beside
     // the split toning they follow.
     let mut edit = app.effect.take().unwrap();

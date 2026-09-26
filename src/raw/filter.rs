@@ -113,16 +113,21 @@ pub fn source(pixels: &RgbaImage) -> DecodedRaw {
 /// carry, and this filter's does, which the shader would need a fourth channel
 /// for; the engine is shared with Develop, and a change to its shader for a
 /// feature only this filter has is not worth the risk to the camera path.
+///
+/// `scale` is preview pixels per layer pixel, so a glow reaches the same
+/// distance and a grain the same size in a preview copy as in the layer Apply
+/// renders.
 pub fn render_filter(
     pixels: &RgbaImage,
     settings: &DevelopSettings,
     temperature: f32,
     tint: f32,
+    scale: f32,
     cancel: &AtomicBool,
 ) -> Result<RgbaImage> {
     let source = source(pixels);
     let settings = filter_settings(settings, temperature, tint);
-    process::render_cpu(&source, &settings, cancel)
+    process::render_cpu(&source, &settings, scale, cancel)
 }
 
 /// A smaller copy of a rendered layer for the filter to preview itself with.

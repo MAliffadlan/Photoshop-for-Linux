@@ -319,7 +319,8 @@ fn the_camera_raw_filter_leaves_an_untouched_image_alone() {
         luminance_noise: 0.0,
         ..Default::default()
     };
-    let result = filter::render_filter(&pixels, &asked, 0.0, 0.0, &AtomicBool::new(false)).unwrap();
+    let result =
+        filter::render_filter(&pixels, &asked, 0.0, 0.0, 1.0, &AtomicBool::new(false)).unwrap();
     assert_eq!(result.dimensions(), pixels.dimensions());
     let mut worst = 0_i32;
     for (before, after) in pixels.pixels().zip(result.pixels()) {
@@ -352,7 +353,7 @@ fn the_camera_raw_filter_keeps_a_layers_transparency() {
         ..Default::default()
     };
     let untouched =
-        filter::render_filter(&pixels, &asked, 0.0, 0.0, &AtomicBool::new(false)).unwrap();
+        filter::render_filter(&pixels, &asked, 0.0, 0.0, 1.0, &AtomicBool::new(false)).unwrap();
     for (before, after) in pixels.pixels().zip(untouched.pixels()) {
         assert_eq!(before[3], after[3], "a soft edge stays soft");
         if before[3] > 0 {
@@ -370,7 +371,7 @@ fn the_camera_raw_filter_keeps_a_layers_transparency() {
     let mut sharpened = asked.clone();
     sharpened.clarity = 80.0;
     let developed =
-        filter::render_filter(&pixels, &sharpened, 0.0, 0.0, &AtomicBool::new(false)).unwrap();
+        filter::render_filter(&pixels, &sharpened, 0.0, 0.0, 1.0, &AtomicBool::new(false)).unwrap();
     for (before, after) in untouched.pixels().zip(developed.pixels()) {
         assert_eq!(before[3], after[3], "clarity does not touch alpha either");
     }
@@ -409,15 +410,16 @@ fn the_camera_raw_filter_answers_its_own_controls() {
         luminance_noise: 0.0,
         ..Default::default()
     };
-    let base = filter::render_filter(&pixels, &asked, 0.0, 0.0, &AtomicBool::new(false)).unwrap();
+    let base =
+        filter::render_filter(&pixels, &asked, 0.0, 0.0, 1.0, &AtomicBool::new(false)).unwrap();
     let brighter =
-        filter::render_filter(&pixels, &asked, 0.0, 0.0, &AtomicBool::new(false)).unwrap();
+        filter::render_filter(&pixels, &asked, 0.0, 0.0, 1.0, &AtomicBool::new(false)).unwrap();
     assert_eq!(base, brighter, "the same settings render the same pixels");
 
     let mut lifted = asked.clone();
     lifted.exposure = 1.0;
     let exposed =
-        filter::render_filter(&pixels, &lifted, 0.0, 0.0, &AtomicBool::new(false)).unwrap();
+        filter::render_filter(&pixels, &lifted, 0.0, 0.0, 1.0, &AtomicBool::new(false)).unwrap();
     assert!(
         exposed
             .pixels()
@@ -429,15 +431,16 @@ fn the_camera_raw_filter_answers_its_own_controls() {
     let mut monochrome = asked.clone();
     monochrome.monochrome = true;
     monochrome.bw_mix = [1.0, 1.0, 1.0];
-    let grey =
-        filter::render_filter(&pixels, &monochrome, 0.0, 0.0, &AtomicBool::new(false)).unwrap();
+    let grey = filter::render_filter(&pixels, &monochrome, 0.0, 0.0, 1.0, &AtomicBool::new(false))
+        .unwrap();
     for pixel in grey.pixels() {
         let spread = (i32::from(pixel[0]) - i32::from(pixel[1])).abs()
             + (i32::from(pixel[1]) - i32::from(pixel[2])).abs();
         assert!(spread < 24, "monochrome is grey: {pixel:?}");
     }
 
-    let warm = filter::render_filter(&pixels, &asked, 100.0, 0.0, &AtomicBool::new(false)).unwrap();
+    let warm =
+        filter::render_filter(&pixels, &asked, 100.0, 0.0, 1.0, &AtomicBool::new(false)).unwrap();
     let red = warm
         .pixels()
         .zip(base.pixels())
@@ -464,7 +467,7 @@ fn a_cancelled_camera_raw_filter_says_so() {
         ..Default::default()
     };
     let cancel = AtomicBool::new(true);
-    assert!(filter::render_filter(&pixels, &asked, 0.0, 0.0, &cancel).is_err());
+    assert!(filter::render_filter(&pixels, &asked, 0.0, 0.0, 1.0, &cancel).is_err());
 }
 
 #[test]
@@ -484,7 +487,8 @@ fn a_neutral_grading_changes_nothing_and_says_so() {
         ..Default::default()
     };
     assert!(!asked.grading.adjusts(), "the default grading is neutral");
-    let plain = filter::render_filter(&pixels, &asked, 0.0, 0.0, &AtomicBool::new(false)).unwrap();
+    let plain =
+        filter::render_filter(&pixels, &asked, 0.0, 0.0, 1.0, &AtomicBool::new(false)).unwrap();
     let graded = filter::render_filter(
         &pixels,
         &DevelopSettings {
@@ -500,6 +504,7 @@ fn a_neutral_grading_changes_nothing_and_says_so() {
         },
         0.0,
         0.0,
+        1.0,
         &AtomicBool::new(false),
     )
     .unwrap();
@@ -747,4 +752,584 @@ fn a_grading_wheel_is_checked_before_it_is_trusted() {
         without.grading.blending, 50.0,
         "the neutral blend is 50, not 0"
     );
+}
+
+/// A picture with a bright spot in the middle and dark edges, which is what
+/// glow, a vignette and calibration all have something to bite on.
+fn ramp() -> RgbaImage {
+    RgbaImage::from_fn(48, 32, |x, y| {
+        let bright = (x as f32 / 48.0 - 0.5).abs() < 0.2 && (y as f32 / 32.0 - 0.5).abs() < 0.2;
+        let level = if bright { 200 } else { 40 };
+        Rgba([level, level, level, 255])
+    })
+}
+
+fn quiet() -> DevelopSettings {
+    DevelopSettings {
+        sharpen: 0.0,
+        color_noise: 0.0,
+        luminance_noise: 0.0,
+        clarity: 0.0,
+        texture: 0.0,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn glow_spreads_the_bright_parts_and_warms_where_it_is_told() {
+    let pixels = ramp();
+    let asked = quiet();
+    let plain =
+        filter::render_filter(&pixels, &asked, 0.0, 0.0, 1.0, &AtomicBool::new(false)).unwrap();
+    let lit = DevelopSettings {
+        glow: 80.0,
+        ..asked.clone()
+    };
+    let glowed =
+        filter::render_filter(&pixels, &lit, 0.0, 0.0, 1.0, &AtomicBool::new(false)).unwrap();
+    // A diffusion glow blurs five pixels, so a pixel just outside the bright
+    // block falls inside its window and one at the far corner does not.
+    let edge = (12, 16);
+    let far = (47, 0);
+    let gain = |image: &RgbaImage, at: (u32, u32)| {
+        i32::from(image.get_pixel(at.0, at.1)[0]) - i32::from(plain.get_pixel(at.0, at.1)[0])
+    };
+    assert!(
+        gain(&glowed, edge) > 2,
+        "the glow reaches away from the light: {}",
+        gain(&glowed, edge)
+    );
+    assert!(
+        gain(&glowed, edge) > gain(&glowed, far),
+        "and falls off with distance: {} vs {}",
+        gain(&glowed, edge),
+        gain(&glowed, far)
+    );
+
+    // Warmth tints the glow: at zero it is cool, and warmth pushes red up and
+    // blue down.
+    let cool = glowed.get_pixel(edge.0, edge.1).0;
+    let warm = filter::render_filter(
+        &pixels,
+        &DevelopSettings {
+            glow: 80.0,
+            glow_warmth: 100.0,
+            ..asked.clone()
+        },
+        0.0,
+        0.0,
+        1.0,
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    let hot = warm.get_pixel(edge.0, edge.1).0;
+    assert!(
+        hot[0] - hot[2] > cool[0] - cool[2],
+        "warmth moves the glow from cool to warm: {cool:?} -> {hot:?}"
+    );
+
+    // Halation's fringe stays red whatever the warmth does.
+    let halation = filter::render_filter(
+        &pixels,
+        &DevelopSettings {
+            glow: 80.0,
+            glow_style: GlowStyle::Halation,
+            ..asked.clone()
+        },
+        0.0,
+        0.0,
+        1.0,
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    let fringe = halation.get_pixel(edge.0, edge.1).0;
+    assert!(
+        fringe[0] > fringe[1] && fringe[0] > fringe[2],
+        "halation fringes red: {fringe:?}"
+    );
+    // Bloom lands harder than Diffusion from the same picture.
+    let bloom = filter::render_filter(
+        &pixels,
+        &DevelopSettings {
+            glow: 80.0,
+            glow_style: GlowStyle::Bloom,
+            ..asked
+        },
+        0.0,
+        0.0,
+        1.0,
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    // Bloom is the tighter look with the stronger gain, so it lands harder on
+    // the light itself while diffusion reaches further past it.
+    let source = (14, 16);
+    assert!(
+        bloom.get_pixel(source.0, source.1)[0] > glowed.get_pixel(source.0, source.1)[0],
+        "bloom lands harder on the light: {} vs {}",
+        bloom.get_pixel(source.0, source.1)[0],
+        glowed.get_pixel(source.0, source.1)[0]
+    );
+}
+
+#[test]
+fn a_glow_ignores_pixels_below_its_range() {
+    let flat = RgbaImage::from_pixel(24, 16, Rgba([120, 120, 120, 255]));
+    let mut settings = quiet();
+    let plain =
+        filter::render_filter(&flat, &settings, 0.0, 0.0, 1.0, &AtomicBool::new(false)).unwrap();
+    settings.glow = 60.0;
+    // Range at its top asks for a brightness mid grey never reaches, so the
+    // picture is left exactly as it was.
+    settings.glow_range = 100.0;
+    let untouched =
+        filter::render_filter(&flat, &settings, 0.0, 0.0, 1.0, &AtomicBool::new(false)).unwrap();
+    assert!(
+        untouched
+            .as_raw()
+            .iter()
+            .zip(plain.as_raw())
+            .all(|(a, b)| a == b),
+        "nothing glows below the threshold"
+    );
+    // Lowering the range lets the same grey glow, and lowering it further glows
+    // harder: the slider is a threshold, not an amount.
+    let mut previous = 0;
+    for range in [-50.0_f32, -75.0, -100.0] {
+        settings.glow_range = range;
+        let glowed =
+            filter::render_filter(&flat, &settings, 0.0, 0.0, 1.0, &AtomicBool::new(false))
+                .unwrap();
+        let lifted = i32::from(glowed.get_pixel(0, 0)[0]) - i32::from(plain.get_pixel(0, 0)[0]);
+        assert!(
+            lifted > previous,
+            "a range of {range} glows more: {lifted} vs {previous}"
+        );
+        previous = lifted;
+    }
+}
+
+#[test]
+fn the_vignette_darkens_the_corners_and_leaves_the_middle_alone() {
+    let pixels = RgbaImage::from_pixel(64, 48, Rgba([180, 180, 180, 255]));
+    let asked = quiet();
+    let plain =
+        filter::render_filter(&pixels, &asked, 0.0, 0.0, 1.0, &AtomicBool::new(false)).unwrap();
+    let dark = DevelopSettings {
+        vignette_amount: -80.0,
+        ..asked.clone()
+    };
+    let vignetted =
+        filter::render_filter(&pixels, &dark, 0.0, 0.0, 1.0, &AtomicBool::new(false)).unwrap();
+    let middle = (32, 24);
+    assert_eq!(
+        vignetted.get_pixel(middle.0, middle.1).0,
+        plain.get_pixel(middle.0, middle.1).0,
+        "the centre does not change"
+    );
+    let corner = (0, 0);
+    assert!(
+        vignetted.get_pixel(corner.0, corner.1)[0] + 10 < plain.get_pixel(corner.0, corner.1)[0],
+        "the corner darkens: {:?} -> {:?}",
+        plain.get_pixel(corner.0, corner.1),
+        vignetted.get_pixel(corner.0, corner.1)
+    );
+    // A corner is further out than an edge midpoint, so it darkens harder.
+    let edge = (32, 0);
+    assert!(
+        vignetted.get_pixel(corner.0, corner.1)[0] < vignetted.get_pixel(edge.0, edge.1)[0],
+        "corners fall away hardest"
+    );
+    // Roundness squares the falloff off, which pulls the edges in with it.
+    let square = filter::render_filter(
+        &pixels,
+        &DevelopSettings {
+            vignette_amount: -80.0,
+            vignette_roundness: -100.0,
+            ..asked.clone()
+        },
+        0.0,
+        0.0,
+        1.0,
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    assert!(
+        square.get_pixel(edge.0, edge.1)[0] < vignetted.get_pixel(edge.0, edge.1)[0],
+        "a square vignette reaches the edge midpoint: {:?} vs {:?}",
+        vignetted.get_pixel(edge.0, edge.1),
+        square.get_pixel(edge.0, edge.1)
+    );
+    // A positive amount lightens instead, and never past white.
+    let light = filter::render_filter(
+        &pixels,
+        &DevelopSettings {
+            vignette_amount: 100.0,
+            ..asked.clone()
+        },
+        0.0,
+        0.0,
+        1.0,
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    assert!(
+        light.get_pixel(corner.0, corner.1)[0] > plain.get_pixel(corner.0, corner.1)[0],
+        "a positive amount lightens the edges"
+    );
+}
+
+#[test]
+fn the_vignette_styles_differ_where_compositor_says_they_do() {
+    let pixels = RgbaImage::from_fn(64, 48, |x, y| {
+        // Bright along the right edge, dark elsewhere, so the highlight
+        // protection has something bright to protect and the corner being read
+        // is not the same pixel.
+        let level = if x > 56 {
+            250
+        } else {
+            30 + ((x * 4 + y * 3) % 120) as u8
+        };
+        Rgba([level, level / 2, 255 - level, 255])
+    });
+    let asked = quiet();
+    let highlight_priority = filter::render_filter(
+        &pixels,
+        &DevelopSettings {
+            vignette_amount: -80.0,
+            vignette_highlights: 100.0,
+            ..asked.clone()
+        },
+        0.0,
+        0.0,
+        1.0,
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    let colour_priority = filter::render_filter(
+        &pixels,
+        &DevelopSettings {
+            vignette_amount: -80.0,
+            vignette_style: VignetteStyle::ColorPriority,
+            ..asked.clone()
+        },
+        0.0,
+        0.0,
+        1.0,
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    let paint_overlay = filter::render_filter(
+        &pixels,
+        &DevelopSettings {
+            vignette_amount: -80.0,
+            vignette_style: VignetteStyle::PaintOverlay,
+            ..asked.clone()
+        },
+        0.0,
+        0.0,
+        1.0,
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    let plain_highlight = filter::render_filter(
+        &pixels,
+        &DevelopSettings {
+            vignette_amount: -80.0,
+            ..asked.clone()
+        },
+        0.0,
+        0.0,
+        1.0,
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    let corner = (0, 0);
+    // Paint Overlay is the plain vignette in the raw pipeline, and Highlight
+    // Priority without its slider set is the same again.
+    assert_eq!(
+        paint_overlay.get_pixel(corner.0, corner.1).0,
+        plain_highlight.get_pixel(corner.0, corner.1).0
+    );
+    // The bright pixel is protected from the darkening.
+    let bright = (60, 24);
+    let kept = i32::from(highlight_priority.get_pixel(bright.0, bright.1)[0])
+        - i32::from(plain_highlight.get_pixel(bright.0, bright.1)[0]);
+    assert!(
+        kept > 0,
+        "a bright pixel keeps more of itself: {kept} above a plain vignette"
+    );
+    // Color Priority takes the colour out of the edges it darkens.
+    let spread = |image: &RgbaImage, at: (u32, u32)| {
+        let pixel = image.get_pixel(at.0, at.1).0;
+        (i32::from(pixel[0]) - i32::from(pixel[2])).abs()
+    };
+    assert!(
+        spread(&colour_priority, corner) < spread(&plain_highlight, corner),
+        "colour priority desaturates: {} vs {}",
+        spread(&colour_priority, corner),
+        spread(&plain_highlight, corner)
+    );
+}
+
+#[test]
+fn grain_shows_in_the_midtones_and_leaves_the_extremes_alone() {
+    let pixels = RgbaImage::from_fn(64, 48, |x, _| {
+        let level = if x < 21 {
+            4
+        } else if x < 43 {
+            128
+        } else {
+            251
+        };
+        Rgba([level, level, level, 255])
+    });
+    let asked = quiet();
+    let grain = DevelopSettings {
+        grain_amount: 100.0,
+        grain_size: 25.0,
+        grain_roughness: 50.0,
+        ..asked.clone()
+    };
+    let noisy =
+        filter::render_filter(&pixels, &grain, 0.0, 0.0, 1.0, &AtomicBool::new(false)).unwrap();
+    let plain =
+        filter::render_filter(&pixels, &asked, 0.0, 0.0, 1.0, &AtomicBool::new(false)).unwrap();
+    let spread = |x: u32| -> i32 {
+        let row: Vec<i32> = (0..48)
+            .map(|y| i32::from(noisy.get_pixel(x, y)[0]) - i32::from(plain.get_pixel(x, y)[0]))
+            .collect();
+        row.iter().max().unwrap() - row.iter().min().unwrap()
+    };
+    assert!(
+        spread(32) > spread(4),
+        "grain shows in the midtones: {} vs {}",
+        spread(32),
+        spread(4)
+    );
+    assert!(spread(4) <= spread(32), "and less in the deep blacks");
+    // The same settings twice give the same pattern: a preview that redraws
+    // must not make the grain crawl.
+    let again =
+        filter::render_filter(&pixels, &grain, 0.0, 0.0, 1.0, &AtomicBool::new(false)).unwrap();
+    assert_eq!(noisy, again, "grain is seeded, so it holds still");
+    // A smaller grain size is a finer pattern.
+    let fine = filter::render_filter(
+        &pixels,
+        &DevelopSettings {
+            grain_amount: 100.0,
+            grain_size: 0.0,
+            ..grain
+        },
+        0.0,
+        0.0,
+        1.0,
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    let row: Vec<i32> = (0..48)
+        .map(|y| i32::from(fine.get_pixel(32, y)[0]) - i32::from(plain.get_pixel(32, y)[0]))
+        .collect();
+    let fine_spread = row.iter().max().unwrap() - row.iter().min().unwrap();
+    assert!(fine_spread > 0, "a fine grain still shows");
+}
+
+#[test]
+fn calibration_rotates_the_shadows_and_the_dominant_primary() {
+    // A saturated red in the light, a desaturated green in the dark.
+    let pixels = RgbaImage::from_fn(32, 16, |_x, y| {
+        if y < 8 {
+            Rgba([200, 120, 110, 255])
+        } else {
+            Rgba([60, 110, 55, 255])
+        }
+    });
+    let asked = quiet();
+    let plain =
+        filter::render_filter(&pixels, &asked, 0.0, 0.0, 1.0, &AtomicBool::new(false)).unwrap();
+    let tinted = filter::render_filter(
+        &pixels,
+        &DevelopSettings {
+            calibration: Calibration {
+                shadow_tint: 100.0,
+                ..Calibration::default()
+            },
+            ..asked.clone()
+        },
+        0.0,
+        0.0,
+        1.0,
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    let shadow = (4, 12);
+    let light = (4, 4);
+    assert_ne!(
+        tinted.get_pixel(shadow.0, shadow.1).0,
+        plain.get_pixel(shadow.0, shadow.1).0,
+        "the shadow tint rotates the dark end"
+    );
+    assert_eq!(
+        tinted.get_pixel(light.0, light.1).0,
+        plain.get_pixel(light.0, light.1).0,
+        "and leaves the light end alone"
+    );
+    // The red primary's saturation, on a pixel red already dominates.
+    let saturated = filter::render_filter(
+        &pixels,
+        &DevelopSettings {
+            calibration: Calibration {
+                red_saturation: 100.0,
+                ..Calibration::default()
+            },
+            ..asked.clone()
+        },
+        0.0,
+        0.0,
+        1.0,
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    let spread = |p: &[u8; 4]| i32::from(p[0]) - i32::from(p[1]);
+    assert!(
+        spread(&saturated.get_pixel(light.0, light.1).0)
+            > spread(&plain.get_pixel(light.0, light.1).0),
+        "a red pixel gets stronger: {:?} -> {:?}",
+        plain.get_pixel(light.0, light.1),
+        saturated.get_pixel(light.0, light.1)
+    );
+    // An older process is the same correction at less strength.
+    let older = filter::render_filter(
+        &pixels,
+        &DevelopSettings {
+            calibration: Calibration {
+                red_saturation: 100.0,
+                process: ProcessVersion::Version1,
+                ..Calibration::default()
+            },
+            ..asked.clone()
+        },
+        0.0,
+        0.0,
+        1.0,
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    let current = saturated.get_pixel(light.0, light.1).0;
+    let gentle = older.get_pixel(light.0, light.1).0;
+    assert!(
+        spread(&current) > spread(&gentle),
+        "version 1 pushes less than version 6: {gentle:?} vs {current:?}"
+    );
+    // A neutral picture has no primary to shift.
+    let grey = filter::render_filter(
+        &RgbaImage::from_pixel(16, 8, Rgba([128, 128, 128, 255])),
+        &DevelopSettings {
+            calibration: Calibration {
+                red_hue: 100.0,
+                green_hue: -100.0,
+                blue_hue: 100.0,
+                shadow_tint: 0.0,
+                ..Calibration::default()
+            },
+            ..asked
+        },
+        0.0,
+        0.0,
+        1.0,
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    let grey_pixel = grey.get_pixel(8, 4).0;
+    assert_eq!(
+        [grey_pixel[0], grey_pixel[1], grey_pixel[2]],
+        [128, 128, 128],
+        "a grey stays a grey"
+    );
+}
+
+#[test]
+fn the_new_settings_are_checked_and_survive_a_round_trip() {
+    let mut settings = DevelopSettings::default();
+    settings.validate().unwrap();
+    assert!(!settings.adjusts_effects(), "the defaults ask for nothing");
+    settings.glow = 40.0;
+    assert!(settings.adjusts_effects());
+    settings.glow = 0.0;
+    settings.grain_amount = 10.0;
+    assert!(settings.adjusts_effects());
+    settings.grain_amount = 0.0;
+    settings.vignette_amount = -20.0;
+    assert!(settings.adjusts_effects());
+    settings.vignette_amount = 0.0;
+    settings.calibration.red_hue = 10.0;
+    assert!(settings.adjusts_effects());
+    settings.calibration.red_hue = 0.0;
+    assert!(!settings.adjusts_effects());
+    // Midpoint and feather start where Compositor starts them, not at zero.
+    assert_eq!(settings.vignette_midpoint, 50.0);
+    assert_eq!(settings.vignette_feather, 50.0);
+    assert_eq!(settings.grain_size, 25.0);
+    assert_eq!(settings.grain_roughness, 50.0);
+    assert_eq!(settings.calibration.process, ProcessVersion::Version6);
+
+    for bad in [
+        DevelopSettings {
+            glow: 101.0,
+            ..Default::default()
+        },
+        DevelopSettings {
+            glow_range: -101.0,
+            ..Default::default()
+        },
+        DevelopSettings {
+            vignette_midpoint: -1.0,
+            ..Default::default()
+        },
+        DevelopSettings {
+            vignette_feather: 101.0,
+            ..Default::default()
+        },
+        DevelopSettings {
+            grain_size: -1.0,
+            ..Default::default()
+        },
+        DevelopSettings {
+            grain_roughness: 101.0,
+            ..Default::default()
+        },
+        DevelopSettings {
+            calibration: Calibration {
+                shadow_tint: 101.0,
+                ..Calibration::default()
+            },
+            ..Default::default()
+        },
+        DevelopSettings {
+            calibration: Calibration {
+                blue_saturation: f32::NAN,
+                ..Calibration::default()
+            },
+            ..Default::default()
+        },
+    ] {
+        assert!(bad.validate().is_err(), "{bad:?} should be refused");
+    }
+
+    let mut older = serde_json::to_value(&settings).unwrap();
+    for key in ["glow", "vignette_amount", "grain_amount", "calibration"] {
+        older.as_object_mut().unwrap().remove(key);
+    }
+    let read: DevelopSettings = serde_json::from_value(older).unwrap();
+    assert!(!read.adjusts_effects(), "a file without them reads neutral");
+    assert_eq!(read.grain_size, 25.0);
+    assert_eq!(read.vignette_midpoint, 50.0);
+    assert_eq!(read.calibration.process, ProcessVersion::Version6);
+
+    settings.glow_style = GlowStyle::Halation;
+    settings.vignette_style = VignetteStyle::ColorPriority;
+    let json = serde_json::to_string(&settings).unwrap();
+    let back: DevelopSettings = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.glow_style, GlowStyle::Halation);
+    assert_eq!(back.vignette_style, VignetteStyle::ColorPriority);
 }

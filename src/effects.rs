@@ -206,9 +206,13 @@ fn lattice(x: i32, y: i32, seed: u32) -> f32 {
     (hash & 65535) as f32 / 65535.0 + (hash >> 16) as f32 / 65535.0 - 1.0
 }
 
-fn film_grain(point: Point, size: f32, roughness: f32, seed: u32) -> f32 {
-    let x = point.x / size;
-    let y = point.y / size;
+/// Smooth seeded noise whose features follow `size` document pixels: four
+/// neighbouring lattice values blended with a smoothstep, scaled by 1.6 because
+/// blending narrows the spread.
+pub fn grain_field(u: f32, v: f32, size: f32, seed: u32) -> f32 {
+    let scale = if size > 0.0 { size } else { 1.0 };
+    let x = u / scale;
+    let y = v / scale;
     let ix = x.floor() as i32;
     let iy = y.floor() as i32;
     let smoothstep = |v: f32| v * v * (3.0 - 2.0 * v);
@@ -216,13 +220,27 @@ fn film_grain(point: Point, size: f32, roughness: f32, seed: u32) -> f32 {
     let ty = smoothstep(y - y.floor());
     let top = lattice(ix, iy, seed) * (1.0 - tx) + lattice(ix + 1, iy, seed) * tx;
     let bottom = lattice(ix, iy + 1, seed) * (1.0 - tx) + lattice(ix + 1, iy + 1, seed) * tx;
-    let smooth = (top * (1.0 - ty) + bottom * ty) * 1.6;
-    let fine = lattice(
-        point.x.floor() as i32,
-        point.y.floor() as i32,
-        mix32(seed ^ 0xa511e9b3),
-    );
-    smooth + (fine - smooth) * roughness / 100.0
+    (top * (1.0 - ty) + bottom * ty) * 1.6
+}
+
+/// Compositor's grain field: one scale, plus a finer one that Roughness fades in.
+/// The finer particles keep their size proportional to Size instead of
+/// collapsing onto single pixels, and both are smooth, which is what keeps a
+/// rough grain from turning into a grid of dots.
+pub fn film_grain_field(u: f32, v: f32, size: f32, roughness: f32, seed: u32) -> f32 {
+    let smooth = grain_field(u, v, size, seed);
+    let detail = grain_field(u, v, (size * 0.35).max(0.5), mix32(seed ^ 0xa511e9b3));
+    smooth + (detail - smooth) * roughness
+}
+
+fn film_grain(point: Point, size: f32, roughness: f32, seed: u32) -> f32 {
+    film_grain_field(
+        point.x,
+        point.y,
+        size,
+        (roughness / 100.0).clamp(0.0, 1.0),
+        seed,
+    )
 }
 
 pub fn adjust(pixel: [f32; 4], adjustment: &Adjustment, point: Point) -> [f32; 4] {
@@ -550,13 +568,21 @@ impl Filter {
 }
 
 pub fn filtered(image: &RgbaImage, filter: &Filter) -> RgbaImage {
+    filtered_at_scale(image, filter, 1.0)
+}
+
+/// The same filter, told how far its input has been scaled down. A preview
+/// renders a smaller copy of the layer, and the Camera Raw filter is the one
+/// filter whose controls are distances and sizes rather than amounts, so it
+/// needs to know. Every other filter ignores it.
+pub fn filtered_at_scale(image: &RgbaImage, filter: &Filter, scale: f32) -> RgbaImage {
     if let Some(result) = crate::gpu::filter(image, filter) {
         return result;
     }
     if crate::gpu::cancelled() {
         return image.clone();
     }
-    filtered_cpu(image, filter, false)
+    filtered_cpu(image, filter, scale, false)
 }
 
 fn premultiplied_blur(image: &RgbaImage, radius: f32) -> RgbaImage {
@@ -808,7 +834,12 @@ fn tonal_contrast(
     })
 }
 
-fn filtered_cpu(image: &RgbaImage, filter: &Filter, fill_empty_vignette: bool) -> RgbaImage {
+fn filtered_cpu(
+    image: &RgbaImage,
+    filter: &Filter,
+    scale: f32,
+    fill_empty_vignette: bool,
+) -> RgbaImage {
     let (w, h) = image.dimensions();
     let result = match filter {
         // The develop engine reports why it could not finish, so this one filter
@@ -822,6 +853,7 @@ fn filtered_cpu(image: &RgbaImage, filter: &Filter, fill_empty_vignette: bool) -
             settings,
             *temperature,
             *tint,
+            scale,
             &AtomicBool::new(false),
         )
         .unwrap_or_else(|_| image.clone()),
@@ -960,6 +992,18 @@ pub fn apply_filter_cancellable(
     mask_target: bool,
     cancel: &AtomicBool,
 ) -> Result<()> {
+    apply_filter_cancellable_at_scale(document, filter, mask_target, 1.0, cancel)
+}
+
+/// The same filter on a document whose layer is a smaller copy of the real one:
+/// `scale` is the layer's full-resolution pixels per pixel in `document`.
+pub fn apply_filter_cancellable_at_scale(
+    document: &mut Document,
+    filter: &Filter,
+    mask_target: bool,
+    scale: f32,
+    cancel: &AtomicBool,
+) -> Result<()> {
     let processor = crate::gpu::current();
     let gpu = processor
         .as_ref()
@@ -970,7 +1014,7 @@ pub fn apply_filter_cancellable(
                 .is_some_and(|p| u64::from(p.width()) * u64::from(p.height()) >= 16_384)
         })
         .map(|p| &p.motion_blur);
-    apply_filter_impl(document, filter, mask_target, cancel, gpu)
+    apply_filter_impl(document, filter, mask_target, scale, cancel, gpu)
 }
 
 /// Use the GPU for full-resolution Motion Blur, with CPU fallback for device
@@ -979,16 +1023,18 @@ pub fn apply_filter_with_gpu(
     document: &mut Document,
     filter: &Filter,
     mask_target: bool,
+    scale: f32,
     cancel: &AtomicBool,
     gpu: &crate::gpu::GpuMotionBlur,
 ) -> Result<()> {
-    apply_filter_impl(document, filter, mask_target, cancel, Some(gpu))
+    apply_filter_impl(document, filter, mask_target, scale, cancel, Some(gpu))
 }
 
 fn apply_filter_impl(
     document: &mut Document,
     filter: &Filter,
     mask_target: bool,
+    scale: f32,
     cancel: &AtomicBool,
     gpu: Option<&crate::gpu::GpuMotionBlur>,
 ) -> Result<()> {
@@ -1096,8 +1142,8 @@ fn apply_filter_impl(
             Filter::MotionBlur { distance, angle } => {
                 motion_blur(&expanded, *distance, *angle, cancel)?
             }
-            Filter::Vignette { .. } if empty_layer => filtered_cpu(&expanded, filter, true),
-            _ => filtered(&expanded, filter),
+            Filter::Vignette { .. } if empty_layer => filtered_cpu(&expanded, filter, 1.0, true),
+            _ => filtered_at_scale(&expanded, filter, scale),
         }
     };
     ensure!(!cancel.load(Ordering::Relaxed), "Filter cancelled");

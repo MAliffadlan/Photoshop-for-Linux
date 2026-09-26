@@ -1663,7 +1663,16 @@ fn camera_raw_panel(
     // state, so each of them is a local that the page both reads and writes.
     let mut curve_channel = 0_usize;
     let mut hsl_band = 0_usize;
-    const PAGES: [&str; 6] = ["Light", "Tone", "Detail", "Optics", "Geometry", "Masks"];
+    const PAGES: [&str; 8] = [
+        "Light",
+        "Tone",
+        "Detail",
+        "Effects",
+        "Optics",
+        "Geometry",
+        "Calibration",
+        "Masks",
+    ];
     ui.horizontal(|ui| {
         for (index, name) in PAGES.iter().enumerate() {
             ui.selectable_value(page, index, *name);
@@ -1689,9 +1698,6 @@ fn camera_raw_panel(
             for (label, value) in [
                 ("Saturation", &mut settings.saturation),
                 ("Vibrance", &mut settings.vibrance),
-                ("Clarity", &mut settings.clarity),
-                ("Texture", &mut settings.texture),
-                ("Dehaze", &mut settings.dehaze),
             ] {
                 changed |= widget_row(ui, label, value, -100.0..=100.0);
             }
@@ -1774,16 +1780,55 @@ fn camera_raw_panel(
         }
         3 => {
             for (label, value) in [
+                ("Clarity", &mut settings.clarity),
+                ("Texture", &mut settings.texture),
+                ("Dehaze", &mut settings.dehaze),
+            ] {
+                changed |= widget_row(ui, label, value, -100.0..=100.0);
+            }
+            ui.add_space(8.0);
+            ui.strong("Glow");
+            changed |= widget_row(ui, "Glow", &mut settings.glow, 0.0..=100.0);
+            changed |= glow_style(ui, &mut settings.glow_style);
+            changed |= widget_row(ui, "Range", &mut settings.glow_range, -100.0..=100.0);
+            changed |= widget_row(ui, "Spread", &mut settings.glow_spread, -100.0..=100.0);
+            changed |= widget_row(ui, "Warmth", &mut settings.glow_warmth, -100.0..=100.0);
+            ui.add_space(8.0);
+            ui.strong("Vignette");
+            changed |= widget_row(ui, "Amount", &mut settings.vignette_amount, -100.0..=100.0);
+            changed |= vignette_style(ui, &mut settings.vignette_style);
+            changed |= widget_row(ui, "Midpoint", &mut settings.vignette_midpoint, 0.0..=100.0);
+            changed |= widget_row(
+                ui,
+                "Roundness",
+                &mut settings.vignette_roundness,
+                -100.0..=100.0,
+            );
+            changed |= widget_row(ui, "Feather", &mut settings.vignette_feather, 0.0..=100.0);
+            changed |= widget_row(
+                ui,
+                "Highlights",
+                &mut settings.vignette_highlights,
+                -100.0..=100.0,
+            );
+            ui.add_space(8.0);
+            ui.strong("Grain");
+            changed |= widget_row(ui, "Amount", &mut settings.grain_amount, 0.0..=100.0);
+            changed |= widget_row(ui, "Size", &mut settings.grain_size, 0.0..=100.0);
+            changed |= widget_row(ui, "Roughness", &mut settings.grain_roughness, 0.0..=100.0);
+        }
+        4 => {
+            for (label, value) in [
                 ("Distortion", &mut settings.distortion),
                 ("Red / cyan", &mut settings.chromatic_red),
                 ("Blue / yellow", &mut settings.chromatic_blue),
                 ("Defringe", &mut settings.defringe),
-                ("Vignette", &mut settings.vignette),
+                ("Vignetting", &mut settings.vignette),
             ] {
                 changed |= widget_row(ui, label, value, -100.0..=100.0);
             }
         }
-        4 => {
+        5 => {
             changed |= widget_row(ui, "Straighten", &mut settings.rotation, -45.0..=45.0);
             changed |= widget_row(
                 ui,
@@ -1792,6 +1837,51 @@ fn camera_raw_panel(
                 -100.0..=100.0,
             );
             changed |= widget_row(ui, "Vertical", &mut settings.perspective[1], -100.0..=100.0);
+        }
+        6 => {
+            let mut shown = settings.calibration.process;
+            egui::ComboBox::from_id_salt("camera_raw_process")
+                .selected_text(shown.name())
+                .show_ui(ui, |ui| {
+                    for version in mectov::raw::ProcessVersion::ALL {
+                        ui.selectable_value(&mut shown, version, version.name());
+                    }
+                });
+            if shown != settings.calibration.process {
+                settings.calibration.process = shown;
+                changed = true;
+            }
+            ui.label(RichText::new(settings.calibration.process.summary()).color(theme::MUTED));
+            ui.add_space(8.0);
+            for (name, hue, saturation) in [
+                ("Shadows", &mut settings.calibration.shadow_tint, None),
+                (
+                    "Red primary",
+                    &mut settings.calibration.red_hue,
+                    Some(&mut settings.calibration.red_saturation),
+                ),
+                (
+                    "Green primary",
+                    &mut settings.calibration.green_hue,
+                    Some(&mut settings.calibration.green_saturation),
+                ),
+                (
+                    "Blue primary",
+                    &mut settings.calibration.blue_hue,
+                    Some(&mut settings.calibration.blue_saturation),
+                ),
+            ] {
+                ui.strong(name);
+                changed |= widget_row(
+                    ui,
+                    if saturation.is_some() { "Hue" } else { "Tint" },
+                    hue,
+                    -100.0..=100.0,
+                );
+                if let Some(saturation) = saturation {
+                    changed |= widget_row(ui, "Saturation", saturation, -100.0..=100.0);
+                }
+            }
         }
         _ => {
             ui.label(
@@ -1854,6 +1944,45 @@ fn camera_raw_panel(
 }
 
 /// One labelled slider, in the same shape every other filter's rows use.
+/// Compositor's glow and vignette styles, as rows of choices, so the current one
+/// is visible without opening a menu.
+fn glow_style(ui: &mut egui::Ui, style: &mut mectov::raw::GlowStyle) -> bool {
+    style_row(
+        ui,
+        "Style",
+        style,
+        mectov::raw::GlowStyle::ALL.map(|style| (style, style.name())),
+    )
+}
+
+fn vignette_style(ui: &mut egui::Ui, style: &mut mectov::raw::VignetteStyle) -> bool {
+    style_row(
+        ui,
+        "Style",
+        style,
+        mectov::raw::VignetteStyle::ALL.map(|style| (style, style.name())),
+    )
+}
+
+fn style_row<T: Copy + PartialEq>(
+    ui: &mut egui::Ui,
+    label: &str,
+    choice: &mut T,
+    all: [(T, &'static str); 3],
+) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.add_sized([105.0, 20.0], egui::Label::new(label));
+        for (index, (option, name)) in all.into_iter().enumerate() {
+            if index > 0 {
+                ui.label("/");
+            }
+            changed |= ui.selectable_value(choice, option, name).changed();
+        }
+    });
+    changed
+}
+
 fn widget_row(
     ui: &mut egui::Ui,
     label: &str,

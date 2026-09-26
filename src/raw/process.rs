@@ -4,7 +4,10 @@ use anyhow::{Result, ensure};
 use image::{ImageBuffer, Primitive, Rgb32FImage, Rgba, RgbaImage};
 use rayon::prelude::*;
 
-use super::{DecodedRaw, DevelopSettings, Grading, Overlay, OverlayKind, WhiteBalance};
+use super::{
+    Calibration, DecodedRaw, DevelopSettings, GlowStyle, Grading, Overlay, OverlayKind,
+    VignetteStyle, WhiteBalance,
+};
 use crate::document::Point;
 
 fn luminance(p: [f32; 3]) -> f32 {
@@ -171,7 +174,9 @@ pub fn render(
             crate::gpu::raw_crop(settings, [raw.camera.width(), raw.camera.height()]);
         return Ok(RgbaImage::from_raw(r - l, b - t, bytes).unwrap());
     }
-    render_at_depth(raw, settings, cancel, |v| (v * 255.0).round() as u8)
+    render_at_depth(raw, settings, proxy_scale(raw), cancel, |v| {
+        (v * 255.0).round() as u8
+    })
 }
 
 pub fn render_16(
@@ -190,7 +195,16 @@ pub fn render_16(
             .collect();
         return Ok(ImageBuffer::from_raw(r - l, b - t, pixels).unwrap());
     }
-    render_at_depth(raw, settings, cancel, |v| (v * 65_535.0).round() as u16)
+    render_at_depth(raw, settings, proxy_scale(raw), cancel, |v| {
+        (v * 65_535.0).round() as u16
+    })
+}
+
+/// Preview pixels per layer pixel: a develop preview that is a smaller copy of
+/// the camera file says so through its own dimensions, so every radius and
+/// every grain size scales with it instead of changing the look.
+fn proxy_scale(raw: &DecodedRaw) -> f32 {
+    raw.camera.width() as f32 / raw.metadata.width as f32
 }
 
 /// Develop on the CPU whatever the device could do. The Camera Raw filter uses
@@ -198,9 +212,10 @@ pub fn render_16(
 pub(super) fn render_cpu(
     raw: &DecodedRaw,
     settings: &DevelopSettings,
+    scale: f32,
     cancel: &AtomicBool,
 ) -> Result<RgbaImage> {
-    render_at_depth(raw, settings, cancel, |v| (v * 255.0).round() as u8)
+    render_at_depth(raw, settings, scale, cancel, |v| (v * 255.0).round() as u8)
 }
 
 fn accelerated(
@@ -225,6 +240,7 @@ fn accelerated(
 fn render_at_depth<T: Primitive + Send + Sync>(
     raw: &DecodedRaw,
     settings: &DevelopSettings,
+    scale: f32,
     cancel: &AtomicBool,
     encode: fn(f32) -> T,
 ) -> Result<ImageBuffer<Rgba<T>, Vec<T>>>
@@ -331,15 +347,17 @@ where
         pixel.copy_from_slice(&rgb);
     });
     cancelled(cancel)?;
-    let scale = width as f32 / raw.metadata.width as f32;
+    // Compositor's glow source is the luma of the picture before texture and
+    // clarity have their say, but the glow itself lands on the pixels they have
+    // already worked on, so the plane is taken here and blurred after them.
+    let glow = if s.glow > 0.0 {
+        Some(glow_source(&image, s, scale))
+    } else {
+        None
+    };
     for (amount, radius, threshold) in [
         (s.clarity / 100.0, 24.0 * scale, 0.0),
         (s.texture / 100.0, 3.0 * scale, 0.0),
-        (
-            s.sharpen / 100.0,
-            s.sharpen_radius * scale,
-            s.sharpen_threshold,
-        ),
     ] {
         if amount != 0.0 {
             cancelled(cancel)?;
@@ -357,6 +375,33 @@ where
                     }
                 });
         }
+    }
+    // Glow, then the post-crop vignette, then grain: all per pixel and in that
+    // order, which is where Compositor puts them, after the creative grade and
+    // before the sharpening that closes the chain.
+    if s.adjusts_effects() {
+        cancelled(cancel)?;
+        let blurred = match glow {
+            Some((plane, radius)) => Some(box_blur_plane(&plane, width, height, radius, cancel)?),
+            None => None,
+        };
+        effects(&mut image, raw, s, blurred.as_deref(), scale, cancel)?;
+    }
+    if s.sharpen != 0.0 {
+        cancelled(cancel)?;
+        let blurred = image::imageops::blur(&image, (s.sharpen_radius * scale).max(0.3));
+        image
+            .as_mut()
+            .par_chunks_mut(3)
+            .zip(blurred.as_raw().par_chunks(3))
+            .for_each(|(p, b)| {
+                let lum = luminance([p[0], p[1], p[2]]);
+                let delta = lum - luminance([b[0], b[1], b[2]]);
+                if delta.abs() >= s.sharpen_threshold {
+                    let gain = (lum + delta * s.sharpen / 100.0).max(0.0) / lum.max(0.00001);
+                    p.iter_mut().for_each(|v| *v *= gain);
+                }
+            });
     }
     cancelled(cancel)?;
     let left = (s.crop[0] * width as f32).floor() as u32;
@@ -495,6 +540,297 @@ fn from_hsl([h, s, l]: [f32; 3]) -> [f32; 3] {
     rgb.map(|v| v + l - c * 0.5)
 }
 
+/// Compositor's calibration: a hue rotation for everything darker than a fixed
+/// lightness, and a hue and saturation shift for whichever primary dominates
+/// the pixel. The process scales the whole thing, and the lightness is never
+/// touched.
+fn calibrate(rgb: [f32; 3], calibration: &Calibration) -> [f32; 3] {
+    if !calibration.adjusts() {
+        return rgb;
+    }
+    let scale = calibration.process.scale();
+    let mut hsl = to_hsl(rgb);
+    if hsl[2] < 0.35 {
+        // Compositor counts hue in turns, where 0.06 of a turn is the 21.6
+        // degrees this panel's slider reaches; mectov's HSL works in degrees.
+        hsl[0] += calibration.shadow_tint / 100.0 * scale * 0.06 * 360.0;
+    }
+    // One primary at a time, and only where there is a primary to speak of: a
+    // grey has nothing to shift, which is why the gate is on the channel spread.
+    let spread = rgb[0].max(rgb[1]).max(rgb[2]) - rgb[0].min(rgb[1]).min(rgb[2]);
+    if spread > 1e-5 {
+        let (hue, saturation) = if rgb[0] >= rgb[1] && rgb[0] >= rgb[2] {
+            (calibration.red_hue, calibration.red_saturation)
+        } else if rgb[1] >= rgb[0] && rgb[1] >= rgb[2] {
+            (calibration.green_hue, calibration.green_saturation)
+        } else {
+            (calibration.blue_hue, calibration.blue_saturation)
+        };
+        // A primary's hue moves by fifteen degrees at full strength.
+        hsl[0] += hue / 100.0 * 15.0 * scale;
+        hsl[1] = (hsl[1] * (1.0 + saturation / 100.0 * 0.45 * scale)).clamp(0.0, 1.0);
+    }
+    from_hsl([hsl[0].rem_euclid(360.0), hsl[1], hsl[2]])
+}
+
+/// Compositor's glow source: how much of the picture is bright enough to glow.
+/// It reads the luma of the encoded value, which is where the blur starts, and
+/// Compositor takes that reading before texture and clarity have their say.
+fn glow_source(image: &Rgb32FImage, s: &DevelopSettings, scale: f32) -> (Vec<f32>, u32) {
+    let threshold = 0.55 + 0.4 * (s.glow_range / 100.0);
+    let span = (1.0 - threshold).max(0.05);
+    // Bloom is the tighter of the two soft looks, so it starts from a smaller
+    // radius; Halation spreads Diffusion's.
+    let base = if s.glow_style == GlowStyle::Bloom {
+        2.0
+    } else {
+        5.0
+    };
+    let radius =
+        ((base * (1.0 + s.glow_spread / 100.0) * scale).round() as i64).clamp(1, 64) as u32;
+    let plane = image
+        .as_raw()
+        .par_chunks(3)
+        .map(|pixel| {
+            let luma = luminance([pixel[0], pixel[1], pixel[2]]);
+            ((luma - threshold) / span).clamp(0.0, 1.0)
+        })
+        .collect();
+    (plane, radius)
+}
+
+/// The colour a glow carries, and how much of it lands. Halation's fringe is
+/// red and warmth only pushes it further that way; the other two start cool and
+/// warm across all three channels, and Bloom lands harder.
+fn glow_tint(s: &DevelopSettings) -> ([f32; 3], f32) {
+    let warmth = s.glow_warmth / 100.0;
+    if s.glow_style == GlowStyle::Halation {
+        ([1.0, 0.35 - 0.3 * warmth, 0.2 - 0.2 * warmth], 1.0)
+    } else {
+        (
+            [
+                0.75 + 0.25 * warmth,
+                0.6 + 0.2 * warmth,
+                0.75 - 0.6 * warmth,
+            ],
+            if s.glow_style == GlowStyle::Bloom {
+                1.4
+            } else {
+                1.0
+            },
+        )
+    }
+}
+
+/// One separable box blur over a single plane, edge-clamped, accumulating in
+/// f64 and storing f32 — the arithmetic Compositor's kernel uses, so a glow
+/// matches it rather than merely resembling it. It is a box and not a Gaussian:
+/// the shape of the falloff is the look.
+fn box_blur_plane(
+    source: &[f32],
+    width: u32,
+    height: u32,
+    radius: u32,
+    cancel: &AtomicBool,
+) -> Result<Vec<f32>> {
+    let window = (radius * 2 + 1) as usize;
+    let mut temp = vec![0.0_f32; source.len()];
+    let rows = height as usize;
+    let columns = width as usize;
+    temp.par_chunks_mut(columns)
+        .zip(source.par_chunks(columns))
+        .try_for_each(|(out, row)| -> Result<()> {
+            cancelled(cancel)?;
+            for (x, slot) in out.iter_mut().enumerate() {
+                let mut sum = 0.0_f64;
+                for offset in -(radius as isize)..=(radius as isize) {
+                    sum +=
+                        row[(x as isize + offset).clamp(0, columns as isize - 1) as usize] as f64;
+                }
+                *slot = (sum / window as f64) as f32;
+            }
+            Ok(())
+        })?;
+    cancelled(cancel)?;
+    // One column per thread, which is what the pass runs along.
+    let mut columns_out: Vec<Vec<f32>> = (0..columns).map(|_| vec![0.0_f32; rows]).collect();
+    columns_out
+        .par_iter_mut()
+        .enumerate()
+        .try_for_each(|(x, column)| {
+            for y in 0..rows {
+                let mut sum = 0.0_f64;
+                for offset in -(radius as isize)..=(radius as isize) {
+                    sum += temp
+                        [(y as isize + offset).clamp(0, rows as isize - 1) as usize * columns + x]
+                        as f64;
+                }
+                column[y] = (sum / window as f64) as f32;
+            }
+            Ok::<_, anyhow::Error>(())
+        })?;
+    let mut blurred = Vec::with_capacity(source.len());
+    for y in 0..rows {
+        for column in &columns_out {
+            blurred.push(column[y]);
+        }
+    }
+    Ok(blurred)
+}
+
+/// The post-grade effects, in Compositor's order: glow lands on the picture,
+/// the vignette reads the result, and grain goes on top of both. Compositor
+/// stores after every one of them, so this clamps in the same places.
+fn effects(
+    image: &mut Rgb32FImage,
+    raw: &DecodedRaw,
+    s: &DevelopSettings,
+    glow: Option<&[f32]>,
+    scale: f32,
+    cancel: &AtomicBool,
+) -> Result<()> {
+    let (width, height) = image.dimensions();
+    let columns = width as usize;
+    let amount = s.glow / 100.0;
+    let (tint, gain) = glow_tint(s);
+    let glow = glow.filter(|_| amount > 0.0);
+    let grain = s.grain_amount / 100.0 * 0.35;
+    let grain_size = 0.5 + (s.grain_size / 100.0) * 19.5;
+    let roughness = (s.grain_roughness / 100.0).clamp(0.0, 1.0);
+    // Compositor measures grain in document pixels while this pass walks
+    // preview pixels, so the pattern stays put in the picture rather than
+    // swimming when the preview scale changes.
+    let units = if scale > 0.0 { 1.0 / scale } else { 1.0 };
+    let falloff = Vignette::new(s);
+    image
+        .as_mut()
+        .par_chunks_mut(columns * 3)
+        .enumerate()
+        .try_for_each(|(y, row)| -> Result<()> {
+            cancelled(cancel)?;
+            for (x, pixel) in row.as_chunks_mut::<3>().0.iter_mut().enumerate() {
+                let index = y * columns + x;
+                // A camera file has no alpha and the geometry mask has not been
+                // applied yet; a filtered layer carries its own, and Compositor
+                // leaves fully transparent pixels alone.
+                let straight = match &raw.alpha {
+                    Some(plane) => {
+                        let alpha = f32::from(plane.get_pixel(x as u32, y as u32)[0]) / 255.0;
+                        if alpha <= 0.0 {
+                            continue;
+                        }
+                        1.0 / alpha
+                    }
+                    None => 1.0,
+                };
+                let mut rgb = [
+                    pixel[0] * straight,
+                    pixel[1] * straight,
+                    pixel[2] * straight,
+                ];
+                if let Some(plane) = glow {
+                    let add = plane[index] * amount * gain;
+                    for c in 0..3 {
+                        rgb[c] = (rgb[c] + add * tint[c]).clamp(0.0, 1.0);
+                    }
+                }
+                if falloff.amount != 0.0 {
+                    vignette(
+                        &mut rgb,
+                        x as f32 + 0.5,
+                        y as f32 + 0.5,
+                        width as f32,
+                        height as f32,
+                        &falloff,
+                    );
+                }
+                if grain > 0.0 {
+                    let noise = crate::effects::film_grain_field(
+                        (x as f32 + 0.5) * units,
+                        (y as f32 + 0.5) * units,
+                        grain_size,
+                        roughness,
+                        0,
+                    );
+                    let level = luminance(rgb).clamp(0.0, 1.0);
+                    // Film grain shows most in the midtones, and least in the
+                    // extremes, which is what Compositor's parabola is for.
+                    let delta = noise * grain * (0.4 + 2.4 * level * (1.0 - level));
+                    rgb = rgb.map(|value| (value + delta).clamp(0.0, 1.0));
+                }
+                pixel.copy_from_slice(&rgb);
+            }
+            Ok(())
+        })
+}
+
+/// The vignette's strength at a point, and what it does with the pixel once it
+/// has it. Roundness is Compositor's: positive rounds the falloff toward a
+/// circle, negative squares it off, and the midpoint is measured against the
+/// frame's half-diagonal so the corners always fall away hardest.
+/// The vignette's own numbers, gathered so the helper below reads like the
+/// shader's rather than like the settings struct.
+struct Vignette {
+    amount: f32,
+    style: VignetteStyle,
+    highlights: f32,
+    midpoint: f32,
+    shape: f32,
+    soft: f32,
+}
+
+impl Vignette {
+    fn new(s: &DevelopSettings) -> Self {
+        Self {
+            amount: s.vignette_amount,
+            style: s.vignette_style,
+            highlights: s.vignette_highlights,
+            midpoint: s.vignette_midpoint / 100.0 * 0.85,
+            shape: (1.0 - s.vignette_roundness / 100.0) * 0.5,
+            soft: (s.vignette_feather / 100.0).max(0.05),
+        }
+    }
+}
+
+fn vignette(rgb: &mut [f32; 3], px: f32, py: f32, width: f32, height: f32, v: &Vignette) {
+    let nx = px / width * 2.0 - 1.0;
+    let ny = py / height * 2.0 - 1.0;
+    let square = nx.abs().max(ny.abs());
+    let circle = (nx * nx + ny * ny).sqrt() / std::f32::consts::SQRT_2;
+    let distance = circle + (square - circle) * v.shape;
+    let mask = smooth((distance - v.midpoint) / v.soft);
+    let mut effect = v.amount / 100.0 * mask;
+    // Only a darkening vignette has bright pixels to protect, and only
+    // Highlight Priority protects them.
+    if effect < 0.0 && v.style == VignetteStyle::HighlightPriority {
+        let bright = ((luminance(*rgb) - 0.45) / 0.55).clamp(0.0, 1.0);
+        effect *= 1.0 - v.highlights / 100.0 * bright;
+    }
+    if effect < 0.0 {
+        let factor = 1.0 + effect;
+        for value in rgb.iter_mut() {
+            *value *= factor;
+        }
+    } else if effect > 0.0 {
+        for value in rgb.iter_mut() {
+            *value += (1.0 - *value) * effect;
+        }
+    }
+    for value in rgb.iter_mut() {
+        *value = value.clamp(0.0, 1.0);
+    }
+    // Color Priority also pulls the colour out of the edges it darkens. Paint
+    // Overlay is the plain vignette here, like Compositor's own kernel: the
+    // painted version belongs to the standalone Vignette filter.
+    if v.style == VignetteStyle::ColorPriority && mask > 0.0 {
+        let lum = luminance(*rgb);
+        let saturation = 1.0 - 0.75 * mask * (v.amount / 100.0).abs();
+        for value in rgb.iter_mut() {
+            *value = (lum + (*value - lum) * saturation).clamp(0.0, 1.0);
+        }
+    }
+}
+
 fn tone(mut rgb: [f32; 3], s: &DevelopSettings) -> [f32; 3] {
     let lum = luminance(rgb).max(0.00001);
     let shadow_weight = (1.0 - (lum / 0.5).clamp(0.0, 1.0)).powi(2);
@@ -504,13 +840,18 @@ fn tone(mut rgb: [f32; 3], s: &DevelopSettings) -> [f32; 3] {
         let v = (v * gain * 2.0_f32.powf(s.whites / 100.0) + s.blacks / 1000.0).max(0.0);
         let v = ((v - s.dehaze / 1000.0) / (1.0 - s.dehaze / 500.0)).max(0.0);
         let v = v.powf(2.0_f32.powf(-s.brightness / 100.0));
-        let v = if v <= 0.0031308 {
+        if v <= 0.0031308 {
             v * 12.92
         } else {
             1.055 * v.powf(1.0 / 2.4) - 0.055
-        };
-        ((v - 0.5) * 2.0_f32.powf(s.contrast / 100.0) + 0.5).clamp(0.0, 1.0)
+        }
     });
+    // Compositor calibrates the encoded picture, before the light pass's own
+    // contrast and long before the curve. This is the first point in mectov's
+    // chain where the values are encoded, so the calibration lands where its
+    // hue and saturation rotations expect to find them.
+    rgb = calibrate(rgb, &s.calibration);
+    rgb = rgb.map(|v| ((v - 0.5) * 2.0_f32.powf(s.contrast / 100.0) + 0.5).clamp(0.0, 1.0));
     if s.defringe > 0.0 {
         let excess = ((rgb[0] + rgb[2]) * 0.5 - rgb[1]).max(0.0);
         let amount = excess * s.defringe / 100.0;

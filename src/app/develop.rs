@@ -1080,6 +1080,137 @@ mod tests {
         )
     }
 
+    /// The Effects page carries glow, the post-crop vignette and grain, and the
+    /// Calibration page the process picker and the three primaries. A change on
+    /// either reaches the develop settings the engine reads.
+    #[test]
+    fn the_effects_and_calibration_pages_edit_the_develop_settings() {
+        let ctx = egui::Context::default();
+        let mut app = EditorApp::with_context(&ctx, vec![], false, None);
+        app.develop = Some(ready(&ctx));
+        app.develop.as_mut().unwrap().panel = 3;
+        frame(&ctx, &mut app, Vec::new());
+        let labels = |app: &mut EditorApp| -> Vec<String> {
+            frame_output(&ctx, app, Vec::new())
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) => Some(text.galley.text().to_string()),
+                    _ => None,
+                })
+                .collect()
+        };
+        // The page is longer than the panel, so what a reader sees first is the
+        // presence controls, glow and the vignette. The grain section below them
+        // is covered by the filter panel's own test, which has the room for it.
+        let painted = labels(&mut app);
+        for wanted in [
+            "Presence",
+            "Clarity",
+            "Texture",
+            "Dehaze",
+            "Glow",
+            "Style",
+            "Range",
+            "Spread",
+            "Warmth",
+            "Vignette",
+            "Amount",
+            "Midpoint",
+            "Roundness",
+        ] {
+            assert!(
+                painted.iter().any(|text| text == wanted),
+                "{wanted} is on the Effects page: {painted:?}"
+            );
+        }
+        // Compositor's three glow looks are offered by name, and choosing one
+        // reaches the settings.
+        for (name, expected) in [
+            ("Bloom", raw::GlowStyle::Bloom),
+            ("Halation", raw::GlowStyle::Halation),
+        ] {
+            let at = frame_output(&ctx, &mut app, Vec::new())
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text() == name => Some(text.pos),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{name} is offered"));
+            for pressed in [Some(true), Some(false)] {
+                frame(&ctx, &mut app, click(at, pressed));
+            }
+            frame(&ctx, &mut app, Vec::new());
+            assert_eq!(
+                app.develop.as_ref().unwrap().settings.glow_style,
+                expected,
+                "{name} was chosen"
+            );
+        }
+        // A slider on the page reaches the settings as well.
+        let track = track_beside(&ctx, &mut app, "Roundness");
+        for pressed in [Some(true), Some(false)] {
+            frame(&ctx, &mut app, click(track, pressed));
+        }
+        frame(&ctx, &mut app, Vec::new());
+        assert!(
+            app.develop.as_ref().unwrap().settings.vignette_roundness != 0.0,
+            "the vignette roundness moved"
+        );
+
+        app.develop.as_mut().unwrap().panel = 5;
+        frame(&ctx, &mut app, Vec::new());
+        let painted = labels(&mut app);
+        assert!(
+            painted.iter().any(|text| text == "Version 6"),
+            "the process picker shows the current default"
+        );
+        for wanted in [
+            "Shadows",
+            "Tint",
+            "Red Primary",
+            "Hue",
+            "Saturation",
+            "Blue Primary",
+        ] {
+            assert!(
+                painted.iter().any(|text| text == wanted),
+                "{wanted} is on the Calibration page"
+            );
+        }
+        // The picker opens on a click, and only then are the older processes
+        // there to choose from.
+        let open = frame_output(&ctx, &mut app, Vec::new())
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == "Version 6" => Some(text.pos),
+                _ => None,
+            })
+            .expect("the process picker shows the current one");
+        for pressed in [Some(true), Some(false)] {
+            frame(&ctx, &mut app, click(open, pressed));
+        }
+        let at = frame_output(&ctx, &mut app, Vec::new())
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == "Version 2" => Some(text.pos),
+                _ => None,
+            })
+            .expect("the open picker lists the older processes");
+        for pressed in [Some(true), Some(false)] {
+            frame(&ctx, &mut app, click(at, pressed));
+        }
+        frame(&ctx, &mut app, Vec::new());
+        assert_eq!(
+            app.develop.as_ref().unwrap().settings.calibration.process,
+            raw::ProcessVersion::Version2,
+            "an older process was chosen"
+        );
+    }
+
     #[test]
     fn a_double_click_on_a_develop_slider_returns_it_to_its_default() {
         let ctx = egui::Context::default();
@@ -1116,7 +1247,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = EditorApp::with_context(&ctx, vec![], false, None);
         app.develop = Some(ready(&ctx));
-        for panel in 0..6 {
+        for panel in 0..8 {
             app.develop.as_mut().unwrap().panel = panel;
             frame(&ctx, &mut app, vec![]);
         }

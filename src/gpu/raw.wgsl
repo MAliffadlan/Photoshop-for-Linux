@@ -169,6 +169,58 @@ fn raw_rgb(hsl: vec3<f32>) -> vec3<f32> {
     return rgb + hsl.z - c * 0.5;
 }
 
+// Compositor's calibration: a hue rotation for everything darker than a fixed
+// lightness, and a hue and saturation shift for whichever primary dominates the
+// pixel. config[41] carries the shadow tint, the red primary and the process
+// version; config[42] the other two primaries. The process scales all of it, and
+// the lightness is never touched.
+fn raw_calibrate(rgb: vec3<f32>) -> vec3<f32> {
+    let calibration = config[41];
+    let others = config[42];
+    if (calibration.x == 0.0 && calibration.y == 0.0 && calibration.z == 0.0 && others.x == 0.0 &&
+        others.y == 0.0 && others.z == 0.0 && others.w == 0.0) {
+        return rgb;
+    }
+    let scale = calibration_scale(calibration.w);
+    var hsl = raw_hsl(rgb);
+    if (hsl.z < 0.35) {
+        // Compositor counts hue in turns; 0.06 of a turn is the 21.6 degrees
+        // this panel's slider reaches.
+        hsl.x += calibration.x * 21.6 * scale;
+    }
+    // One primary at a time, and only where there is one to speak of.
+    let highest = max(rgb.r, max(rgb.g, rgb.b));
+    let lowest = min(rgb.r, min(rgb.g, rgb.b));
+    if (highest - lowest > 1e-5) {
+        var hue = 0.0;
+        var saturation = 0.0;
+        if (rgb.r >= rgb.g && rgb.r >= rgb.b) {
+            hue = calibration.y;
+            saturation = calibration.z;
+        } else if (rgb.g >= rgb.r && rgb.g >= rgb.b) {
+            hue = others.x;
+            saturation = others.y;
+        } else {
+            hue = others.z;
+            saturation = others.w;
+        }
+        hsl.x += hue * 15.0 * scale;
+        hsl.y = clamp(hsl.y * (1.0 + saturation * 0.45 * scale), 0.0, 1.0);
+    }
+    hsl.x = hsl.x - floor(hsl.x / 360.0) * 360.0;
+    return clamp(raw_rgb(hsl), vec3(0.0), vec3(1.0));
+}
+
+// How hard a process version pushes the calibration it is given.
+fn calibration_scale(version: f32) -> f32 {
+    if (version <= 1.0) { return 0.55; }
+    if (version <= 2.0) { return 0.65; }
+    if (version <= 3.0) { return 0.75; }
+    if (version <= 4.0) { return 0.85; }
+    if (version <= 5.0) { return 0.92; }
+    return 1.0;
+}
+
 // The colour grading wheels, in Compositor's order: the three tonal wheels
 // weighted by how dark or bright the pixel is, then the global one at full
 // weight. config[15] carries the blending, the balance and whether any wheel
@@ -226,6 +278,7 @@ fn raw_tone(@builtin(global_invocation_id) id: vec3<u32>) {
     rgb = max((rgb - config[9].x / 1000.0) / (1.0 - config[9].x / 500.0), vec3(0.0));
     rgb = pow(rgb, vec3(exp2(-config[9].y / 100.0)));
     rgb = select(1.055 * pow(rgb, vec3(1.0 / 2.4)) - 0.055, rgb * 12.92, rgb <= vec3(0.0031308));
+    rgb = raw_calibrate(rgb);
     rgb = clamp((rgb - 0.5) * exp2(config[9].z / 100.0) + 0.5, vec3(0.0), vec3(1.0));
     let excess = max((rgb.r + rgb.b) * 0.5 - rgb.g, 0.0) * config[9].w / 100.0;
     rgb -= vec3(excess, 0.0, excess);
@@ -253,6 +306,152 @@ fn raw_tone(@builtin(global_invocation_id) id: vec3<u32>) {
     rgb = mix(rgb, raw_rgb(vec3(tones.z, 1.0, 0.5)), tones.w / 100.0 * high * 0.35);
     rgb = raw_grade(rgb);
     store_float(i, vec4(rgb, p.a));
+}
+
+// Compositor's glow source: how much of the picture is bright enough to glow.
+// It reads the luma of the encoded value, which is where the blur starts, and
+// Compositor takes that reading before texture and clarity have their say.
+@compute @workgroup_size(8, 8)
+fn raw_glow_source(@builtin(global_invocation_id) id: vec3<u32>) {
+    let size = vec2<u32>(config[0].xy);
+    if (any(id.xy >= size)) {
+        return;
+    }
+    let i = id.y * size.x + id.x;
+    let p = load_float(i);
+    let threshold = 0.55 + 0.4 * (config[36].z / 100.0);
+    let span = max(1.0 - threshold, 0.05);
+    store_float(i, vec4(clamp((raw_luma(p.rgb) - threshold) / span, 0.0, 1.0), 0.0, 0.0, p.a));
+}
+
+// One separable box blur over the glow plane, edge-clamped, along the direction
+// config[1].zw points. Compositor's kernel is a box and not a Gaussian: the
+// shape of the falloff is the look, so this walks the window rather than
+// sharing the Gaussian the sharpening passes use.
+@compute @workgroup_size(8, 8)
+fn raw_glow_blur(@builtin(global_invocation_id) id: vec3<u32>) {
+    let size = vec2<u32>(config[0].xy);
+    if (any(id.xy >= size)) {
+        return;
+    }
+    // config[1] carries the radius this pass runs at and the direction it runs
+    // in, so the blur does not carry the whole develop's settings.
+    let radius = i32(max(config[1].x, 1.0));
+    let step = vec2<i32>(i32(config[1].z), i32(config[1].w));
+    let limit = vec2<i32>(size) - vec2<i32>(1);
+    var sum = 0.0;
+    for (var k = -radius; k <= radius; k++) {
+        let at = clamp(vec2<i32>(id.xy) + step * k, vec2<i32>(0), limit);
+        sum += bitcast<f32>(auxiliary[(u32(at.y) * size.x + u32(at.x)) * 4u]);
+    }
+    let i = id.y * size.x + id.x;
+    let alpha = bitcast<f32>(auxiliary[i * 4u + 3u]);
+    store_float(i, vec4(sum / f32(radius * 2 + 1), 0.0, 0.0, alpha));
+}
+
+// Compositor's post-grade effects, in its order: the glow lands on the picture,
+// the vignette reads the result, and grain goes on top of both. Compositor
+// stores after every one of them, so this clamps in the same places.
+@compute @workgroup_size(8, 8)
+fn raw_effects(@builtin(global_invocation_id) id: vec3<u32>) {
+    let size = vec2<u32>(config[0].xy);
+    if (any(id.xy >= size)) {
+        return;
+    }
+    let i = id.y * size.x + id.x;
+    let p = load_float(i);
+    var rgb = p.rgb;
+    let glow = config[36];
+    if (glow.x > 0.0) {
+        // Halation's fringe is red and warmth only pushes it further that way;
+        // the other two start cool and warm across all three channels, and
+        // Bloom lands harder.
+        let warmth = config[37].x / 100.0;
+        var tint = vec3(0.75 + 0.25 * warmth, 0.6 + 0.2 * warmth, 0.75 - 0.6 * warmth);
+        var gain = 1.0;
+        if (glow.y == 1.0) {
+            gain = 1.4;
+        }
+        if (glow.y == 2.0) {
+            tint = vec3(1.0, 0.35 - 0.3 * warmth, 0.2 - 0.2 * warmth);
+        }
+        let plane = bitcast<f32>(auxiliary[i * 4u]) * (glow.x / 100.0) * gain;
+        rgb = clamp(rgb + plane * tint, vec3(0.0), vec3(1.0));
+    }
+    let vignette = config[38];
+    if (vignette.x != 0.0) {
+        // Roundness is Compositor's: positive rounds the falloff toward a circle
+        // and negative squares it. The midpoint is measured against the frame's
+        // half-diagonal, so the corners always fall away hardest.
+        let nx = (f32(id.x) + 0.5) / f32(size.x) * 2.0 - 1.0;
+        let ny = (f32(id.y) + 0.5) / f32(size.y) * 2.0 - 1.0;
+        let square = max(abs(nx), abs(ny));
+        let circle = length(vec2<f32>(nx, ny)) / sqrt(2.0);
+        let distance = circle + (square - circle) * vignette.w;
+        let mask = smooth_weight((distance - vignette.z) / config[39].x);
+        var effect = vignette.x / 100.0 * mask;
+        // Only a darkening vignette has bright pixels to protect, and only
+        // Highlight Priority protects them.
+        if (effect < 0.0 && vignette.y == 0.0) {
+            let bright = clamp((raw_luma(rgb) - 0.45) / 0.55, 0.0, 1.0);
+            effect *= 1.0 - config[39].y / 100.0 * bright;
+        }
+        if (effect < 0.0) {
+            rgb *= 1.0 + effect;
+        } else if (effect > 0.0) {
+            rgb += (1.0 - rgb) * effect;
+        }
+        rgb = clamp(rgb, vec3(0.0), vec3(1.0));
+        // Color Priority also pulls the colour out of the edges it darkens.
+        // Paint Overlay is the plain vignette here, like Compositor's kernel.
+        if (vignette.y == 1.0 && mask > 0.0) {
+            let lum = raw_luma(rgb);
+            let saturation = 1.0 - 0.75 * mask * abs(vignette.x / 100.0);
+            rgb = clamp(vec3<f32>(lum) + (rgb - vec3<f32>(lum)) * saturation, vec3(0.0), vec3(1.0));
+        }
+    }
+    let grain = config[40];
+    if (grain.x > 0.0) {
+        // Compositor measures grain in document pixels while this pass walks
+        // preview pixels, so the pattern stays put in the picture.
+        let point = (vec2<f32>(id.xy) + 0.5) * grain.w;
+        // Roughness fades in the finer scale, whose particles keep their size
+        // proportional to Size rather than collapsing onto single pixels.
+        let coarse = raw_grain_field(point, grain.y, 0u);
+        let fine = raw_grain_field(point, max(grain.y * 0.35, 0.5), raw_mix32(0xa511e9b3u));
+        let noise = mix(coarse, fine, grain.z);
+        let level = clamp(raw_luma(rgb), 0.0, 1.0);
+        // Film grain shows most in the midtones, and least in the extremes.
+        let delta = noise * (grain.x / 100.0 * 0.35) * (0.4 + 2.4 * level * (1.0 - level));
+        rgb = clamp(rgb + vec3<f32>(delta), vec3(0.0), vec3(1.0));
+    }
+    store_float(i, vec4(rgb, p.a));
+}
+
+// Compositor's grain field: one scale, plus the finer one Roughness fades in.
+// The same three functions serve adjustments.wgsl's film grain, kept in step
+// with the CPU kernel in src/effects.rs.
+fn raw_mix32(value: u32) -> u32 {
+    var mixed = (value ^ (value >> 16u)) * 0x7feb352du;
+    mixed = (mixed ^ (mixed >> 15u)) * 0x846ca68bu;
+    return mixed ^ (mixed >> 16u);
+}
+
+fn raw_lattice(point: vec2<i32>, seed: u32) -> f32 {
+    let hash = raw_mix32(bitcast<u32>(point.x) * 0x9e3779b1u ^
+                         raw_mix32(bitcast<u32>(point.y) * 0x85ebca77u ^ seed));
+    return f32(hash & 65535u) / 65535.0 + f32(hash >> 16u) / 65535.0 - 1.0;
+}
+
+fn raw_grain_field(point: vec2<f32>, size: f32, seed: u32) -> f32 {
+    let cell = point / max(size, 0.0001);
+    let origin = vec2<i32>(floor(cell));
+    let f = fract(cell);
+    let t = f * f * (3.0 - 2.0 * f);
+    let top = mix(raw_lattice(origin, seed), raw_lattice(origin + vec2(1, 0), seed), t.x);
+    let bottom =
+        mix(raw_lattice(origin + vec2(0, 1), seed), raw_lattice(origin + vec2(1, 1), seed), t.x);
+    return mix(top, bottom, t.y) * 1.6;
 }
 
 @compute @workgroup_size(8, 8)

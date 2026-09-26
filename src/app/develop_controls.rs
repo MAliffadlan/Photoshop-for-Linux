@@ -6,7 +6,10 @@ use std::{
 };
 
 use egui::{Color32, Sense, Stroke, pos2, vec2};
-use mectov::raw::{self, DevelopSettings, GradeWheel, Grading, Overlay, OverlayKind, WhiteBalance};
+use mectov::raw::{
+    self, DevelopSettings, GlowStyle, GradeWheel, Grading, Overlay, OverlayKind, ProcessVersion,
+    VignetteStyle, WhiteBalance,
+};
 
 use super::{develop::Develop, theme, widgets};
 
@@ -107,9 +110,18 @@ pub(super) fn controls(ui: &mut egui::Ui, d: &mut Develop) {
     });
     ui.add_space(8.0);
     ui.horizontal_wrapped(|ui| {
-        for (index, name) in ["Basic", "Tone", "Detail", "Lens", "Masks", "Info"]
-            .into_iter()
-            .enumerate()
+        for (index, name) in [
+            "Basic",
+            "Tone",
+            "Detail",
+            "Effects",
+            "Lens",
+            "Calibration",
+            "Masks",
+            "Info",
+        ]
+        .into_iter()
+        .enumerate()
         {
             ui.selectable_value(&mut d.panel, index, name);
         }
@@ -124,12 +136,153 @@ pub(super) fn controls(ui: &mut egui::Ui, d: &mut Develop) {
                 0 => basic(ui, d),
                 1 => tones(ui, d),
                 2 => detail(ui, d),
-                3 => lens(ui, d),
-                4 => masks(ui, d),
+                3 => effects(ui, d),
+                4 => lens(ui, d),
+                5 => calibration(ui, d),
+                6 => masks(ui, d),
                 _ => metadata(ui, d),
             }
             ui.add_space(16.0);
         });
+}
+
+/// Compositor's Effects page: the presence controls, then glow, the post-crop
+/// vignette, and grain. The two style pickers are Compositor's own sets, and
+/// every slider here has the reset value its panel shows.
+pub(super) fn effects(ui: &mut egui::Ui, d: &mut Develop) {
+    heading(ui, "Presence");
+    percent(ui, "Clarity", &mut d.settings.clarity);
+    percent(ui, "Texture", &mut d.settings.texture);
+    percent(ui, "Dehaze", &mut d.settings.dehaze);
+
+    heading(ui, "Glow");
+    slider(ui, "Glow", &mut d.settings.glow, 0.0..=100.0);
+    style_picker(ui, "Style", &mut d.settings.glow_style, GlowStyle::ALL);
+    ui.vertical(|ui| {
+        ui.add_space(-4.0);
+        percent(ui, "Range", &mut d.settings.glow_range);
+        percent(ui, "Spread", &mut d.settings.glow_spread);
+        percent(ui, "Warmth", &mut d.settings.glow_warmth);
+    });
+
+    heading(ui, "Vignette");
+    percent(ui, "Amount", &mut d.settings.vignette_amount);
+    style_picker(
+        ui,
+        "Style",
+        &mut d.settings.vignette_style,
+        VignetteStyle::ALL,
+    );
+    ui.vertical(|ui| {
+        ui.add_space(-4.0);
+        slider_to(
+            ui,
+            "Midpoint",
+            &mut d.settings.vignette_midpoint,
+            0.0..=100.0,
+            50.0,
+        );
+        percent(ui, "Roundness", &mut d.settings.vignette_roundness);
+        slider_to(
+            ui,
+            "Feather",
+            &mut d.settings.vignette_feather,
+            0.0..=100.0,
+            50.0,
+        );
+        percent(ui, "Highlights", &mut d.settings.vignette_highlights);
+    });
+
+    heading(ui, "Grain");
+    slider(ui, "Amount", &mut d.settings.grain_amount, 0.0..=100.0);
+    slider_to(ui, "Size", &mut d.settings.grain_size, 0.0..=100.0, 25.0);
+    slider_to(
+        ui,
+        "Roughness",
+        &mut d.settings.grain_roughness,
+        0.0..=100.0,
+        50.0,
+    );
+}
+
+/// Compositor's Calibration page: the process picker, then a shadow tint and a
+/// hue and saturation for each of the three primaries.
+pub(super) fn calibration(ui: &mut egui::Ui, d: &mut Develop) {
+    let calibration = &mut d.settings.calibration;
+    let mut shown = calibration.process;
+    egui::ComboBox::from_id_salt("raw_calibration_process")
+        .selected_text(shown.name())
+        .show_ui(ui, |ui| {
+            for version in ProcessVersion::ALL {
+                ui.selectable_value(&mut shown, version, version.name());
+            }
+        });
+    if shown != calibration.process {
+        calibration.process = shown;
+    }
+    ui.add(egui::Label::new(calibration.process.summary()).wrap());
+    ui.add_space(4.0);
+    heading(ui, "Shadows");
+    percent(ui, "Tint", &mut calibration.shadow_tint);
+    for (name, hue, saturation) in [
+        (
+            "Red Primary",
+            &mut calibration.red_hue,
+            &mut calibration.red_saturation,
+        ),
+        (
+            "Green Primary",
+            &mut calibration.green_hue,
+            &mut calibration.green_saturation,
+        ),
+        (
+            "Blue Primary",
+            &mut calibration.blue_hue,
+            &mut calibration.blue_saturation,
+        ),
+    ] {
+        heading(ui, name);
+        percent(ui, "Hue", hue);
+        percent(ui, "Saturation", saturation);
+    }
+}
+
+/// A style the panel can offer as a row of choices, named the way Compositor
+/// names it.
+pub(super) trait Named {
+    fn label(&self) -> &'static str;
+}
+
+impl Named for GlowStyle {
+    fn label(&self) -> &'static str {
+        self.name()
+    }
+}
+
+impl Named for VignetteStyle {
+    fn label(&self) -> &'static str {
+        self.name()
+    }
+}
+
+/// A row of choices for a style, the way Compositor's pickers read: the label,
+/// then the names themselves, so the current one is visible without opening
+/// anything.
+fn style_picker<T: Copy + PartialEq + Named>(
+    ui: &mut egui::Ui,
+    label: &str,
+    choice: &mut T,
+    all: [T; 3],
+) {
+    ui.horizontal(|ui| {
+        ui.add_sized([105.0, 20.0], egui::Label::new(label));
+        for (index, option) in all.into_iter().enumerate() {
+            if index > 0 {
+                ui.label("/");
+            }
+            ui.selectable_value(choice, option, option.label());
+        }
+    });
 }
 
 fn heading(ui: &mut egui::Ui, title: &str) {
@@ -203,10 +356,6 @@ fn basic(ui: &mut egui::Ui, d: &mut Develop) {
     percent(ui, "Shadows", &mut d.settings.shadows);
     percent(ui, "Whites", &mut d.settings.whites);
     percent(ui, "Blacks", &mut d.settings.blacks);
-    heading(ui, "Presence");
-    percent(ui, "Clarity", &mut d.settings.clarity);
-    percent(ui, "Texture", &mut d.settings.texture);
-    percent(ui, "Dehaze", &mut d.settings.dehaze);
     percent(ui, "Vibrance", &mut d.settings.vibrance);
     percent(ui, "Saturation", &mut d.settings.saturation);
 }

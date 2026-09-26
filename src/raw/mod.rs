@@ -24,7 +24,10 @@ use serde::{Deserialize, Serialize};
 use crate::document::validate_size;
 pub use filter::{filter_settings, preview_source, relative_white_balance, render_filter, source};
 pub use process::{auto_exposure, render, render_16, sample_white_balance, source_point};
-pub use settings::{DevelopSettings, GradeWheel, Grading, Overlay, OverlayKind, WhiteBalance};
+pub use settings::{
+    Calibration, DevelopSettings, GlowStyle, GradeWheel, Grading, Overlay, OverlayKind,
+    ProcessVersion, VignetteStyle, WhiteBalance,
+};
 
 pub const MAX_RAW_BYTES: u64 = 512 * 1024 * 1024;
 

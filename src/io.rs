@@ -209,11 +209,19 @@ pub fn save(document: &Document, path: &Path) -> Result<()> {
         let options =
             SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
         // Guides, layer effects, the 1.2.3 blur and noise adjustment layers, the layout grid,
-        // paragraph text boxes, separately coloured letters and the colour grading wheels all raise
-        // the version, because an older reader must refuse the file rather than silently drop what
-        // it cannot draw. A graded camera file is the one that cannot be recovered from the saved
-        // pixels: the layer holds the original, and the wheels are only in here.
+        // paragraph text boxes, separately coloured letters, the colour grading wheels and the
+        // effects and calibration that follow them all raise the version, because an older reader
+        // must refuse the file rather than silently drop what it cannot draw. A developed camera
+        // file is the one that cannot be recovered from the saved pixels: the layer holds the
+        // original, and everything above is only in here.
         let version = if document.layers.iter().any(|layer| {
+            layer
+                .raw
+                .as_ref()
+                .is_some_and(|raw| raw.settings.adjusts_effects())
+        }) {
+            10
+        } else if document.layers.iter().any(|layer| {
             layer
                 .raw
                 .as_ref()
@@ -332,7 +340,7 @@ pub fn load(path: &Path) -> Result<Document> {
     let mut manifest: Manifest =
         serde_json::from_slice(&zip_read(&mut archive, "manifest.json", MAX_MANIFEST)?)?;
     ensure!(
-        READ_FORMATS.contains(&manifest.format.as_str()) && (1..=9).contains(&manifest.version),
+        READ_FORMATS.contains(&manifest.format.as_str()) && (1..=10).contains(&manifest.version),
         "Unsupported mectov project version"
     );
     let mut used_pixels = 0;
@@ -1643,7 +1651,7 @@ mod tests {
         assert_eq!(text_box.width, 120.0);
         assert_eq!(text_box.min_height, 0.0);
 
-        manifest["version"] = serde_json::json!(10);
+        manifest["version"] = serde_json::json!(11);
         write(&manifest, None);
         assert_eq!(
             load(&path).unwrap_err().to_string(),
@@ -1765,6 +1773,32 @@ mod tests {
             settings.grading, grading,
             "the wheels survive the round trip"
         );
+        assert_eq!(saved_version(&path), 9, "the wheels alone are version 9");
+
+        // The effects and the calibration that follow them raise it again.
+        let mut loaded = loaded;
+        {
+            let settings = &mut loaded.active_mut().unwrap().raw.as_mut().unwrap().settings;
+            settings.glow = 45.0;
+            settings.glow_style = crate::raw::GlowStyle::Halation;
+            settings.vignette_amount = -30.0;
+            settings.vignette_style = crate::raw::VignetteStyle::ColorPriority;
+            settings.grain_amount = 20.0;
+            settings.calibration.red_saturation = -15.0;
+        }
+        save(&loaded, &path).unwrap();
+        assert_eq!(saved_version(&path), 10);
+        let loaded = load(&path).unwrap();
+        let settings = &loaded.active().unwrap().raw.as_ref().unwrap().settings;
+        assert_eq!(settings.glow, 45.0);
+        assert_eq!(settings.glow_style, crate::raw::GlowStyle::Halation);
+        assert_eq!(settings.vignette_amount, -30.0);
+        assert_eq!(
+            settings.vignette_style,
+            crate::raw::VignetteStyle::ColorPriority
+        );
+        assert_eq!(settings.grain_amount, 20.0);
+        assert_eq!(settings.calibration.red_saturation, -15.0);
         assert_eq!(settings.grading.blending, 71.0);
         assert_eq!(settings.grading.balance, -29.0);
 
@@ -1785,17 +1819,17 @@ mod tests {
             },
             ..Default::default()
         };
-        assert!(
-            !loaded
-                .active()
-                .unwrap()
-                .raw
-                .as_ref()
-                .unwrap()
-                .settings
-                .grading
-                .adjusts()
-        );
+        {
+            // The effects go back to their own defaults as well, since a
+            // document keeps the highest version anything in it asks for.
+            let settings = &mut loaded.active_mut().unwrap().raw.as_mut().unwrap().settings;
+            settings.glow = 0.0;
+            settings.vignette_amount = 0.0;
+            settings.grain_amount = 0.0;
+            settings.calibration = Default::default();
+        }
+        let settings = &loaded.active().unwrap().raw.as_ref().unwrap().settings;
+        assert!(!settings.grading.adjusts() && !settings.adjusts_effects());
         save(&loaded, &path).unwrap();
         assert_eq!(saved_version(&path), 2);
     }

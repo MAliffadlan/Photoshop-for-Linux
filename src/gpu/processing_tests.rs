@@ -498,6 +498,122 @@ fn processing_raw_grading_matches_cpu_at_both_depths() {
     }
 }
 
+/// Glow, the post-crop vignette, grain and calibration, checked against the CPU
+/// at both depths. Sharpening and the noise reduction are left out on purpose:
+/// their boundaries are where a software adapter disagrees with the CPU, and
+/// they would hide whether these agree.
+#[test]
+#[ignore = "requires native compute adapter"]
+fn processing_raw_effects_and_calibration_match_cpu_at_both_depths() {
+    use crate::raw::{Calibration, GlowStyle, ProcessVersion, VignetteStyle, *};
+    use std::sync::atomic::AtomicBool;
+    let gpu = processor();
+    let raw = raw_fixture();
+    let cancel = AtomicBool::new(false);
+    let quiet = DevelopSettings {
+        sharpen: 0.0,
+        color_noise: 0.0,
+        luminance_noise: 0.0,
+        ..Default::default()
+    };
+    for settings in [
+        DevelopSettings {
+            glow: 70.0,
+            glow_range: -20.0,
+            glow_spread: 40.0,
+            ..quiet.clone()
+        },
+        DevelopSettings {
+            glow: 90.0,
+            glow_style: GlowStyle::Bloom,
+            glow_warmth: 60.0,
+            ..quiet.clone()
+        },
+        DevelopSettings {
+            glow: 90.0,
+            glow_style: GlowStyle::Halation,
+            glow_warmth: -60.0,
+            ..quiet.clone()
+        },
+        DevelopSettings {
+            vignette_amount: -70.0,
+            vignette_roundness: -40.0,
+            vignette_feather: 30.0,
+            ..quiet.clone()
+        },
+        DevelopSettings {
+            vignette_amount: -70.0,
+            vignette_style: VignetteStyle::ColorPriority,
+            vignette_highlights: 40.0,
+            ..quiet.clone()
+        },
+        DevelopSettings {
+            vignette_amount: 60.0,
+            vignette_style: VignetteStyle::PaintOverlay,
+            vignette_midpoint: 20.0,
+            ..quiet.clone()
+        },
+        DevelopSettings {
+            grain_amount: 80.0,
+            grain_size: 35.0,
+            grain_roughness: 70.0,
+            ..quiet.clone()
+        },
+        DevelopSettings {
+            calibration: Calibration {
+                shadow_tint: 70.0,
+                red_hue: 40.0,
+                red_saturation: 60.0,
+                green_saturation: -50.0,
+                blue_hue: 30.0,
+                ..Calibration::default()
+            },
+            ..quiet.clone()
+        },
+        DevelopSettings {
+            calibration: Calibration {
+                red_hue: 100.0,
+                green_hue: -100.0,
+                blue_saturation: 100.0,
+                process: ProcessVersion::Version2,
+                ..Calibration::default()
+            },
+            ..quiet
+        },
+    ] {
+        let [l, t, r, b] = super::raw_crop(&settings, [89, 67]);
+        let actual = RgbaImage::from_raw(
+            r - l,
+            b - t,
+            gpu.develop(&raw, &settings, raw.as_shot, 8, &cancel)
+                .unwrap(),
+        )
+        .unwrap();
+        let expected = crate::raw::render(&raw, &settings, &cancel).unwrap();
+        compare(&actual, &expected, 1);
+        let actual = gpu
+            .develop(&raw, &settings, raw.as_shot, 16, &cancel)
+            .unwrap();
+        let expected = crate::raw::render_16(&raw, &settings, &cancel).unwrap();
+        let diffs: Vec<u32> = actual
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .zip(expected.as_raw())
+            .map(|(a, &b)| u32::from(u16::from_le_bytes(*a).abs_diff(b)))
+            .collect();
+        // A box blur and a few multiplies are where a shader and a CPU fall a
+        // rounding step apart, so the bound is on the frequency as well as the
+        // size: a wrong weight or a skipped wheel is off by far more.
+        let error = *diffs.iter().max().unwrap();
+        let outliers = diffs.iter().filter(|diff| **diff > 64).count();
+        assert!(
+            error <= 64 && outliers <= 8,
+            "16-bit effects error {error}, outliers {outliers}"
+        );
+    }
+}
+
 #[test]
 #[ignore = "requires native compute adapter"]
 fn processing_paint_masks_shapes_and_selection_match_cpu() {

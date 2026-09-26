@@ -1,5 +1,5 @@
 use super::{Processor, processor::attempt};
-use crate::raw::{DecodedRaw, DevelopSettings, Overlay, OverlayKind};
+use crate::raw::{DecodedRaw, DevelopSettings, GlowStyle, Overlay, OverlayKind};
 use anyhow::{Result, ensure};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -37,7 +37,8 @@ impl Processor {
         let count = u64::from(size[0]) * u64::from(size[1]);
         let source = self.buffer(bytemuck::cast_slice(raw.camera.as_raw()))?;
         let buffers = [self.empty(count * 16)?, self.empty(count * 16)?];
-        let mut config = settings(raw, s, wb, depth);
+        let scale = size[0] as f32 / raw.metadata.width as f32;
+        let mut config = settings(raw, s, wb, depth, scale);
         let mut encoder = self.encoder();
         ensure!(!cancel.load(Ordering::Relaxed), "RAW development cancelled");
         self.dispatch(
@@ -82,18 +83,45 @@ impl Processor {
             size,
         )?;
         current = 1 - current;
-        let scale = size[0] as f32 / raw.metadata.width as f32;
+        // Compositor's glow source is the luma of the picture before texture and
+        // clarity have their say, so it is taken here; the glow itself lands
+        // after them, in the effects pass below.
+        let glow = if s.glow > 0.0 {
+            let plane = self.empty(count * 16)?;
+            self.dispatch(
+                &mut encoder,
+                "raw_glow_source",
+                SHADER,
+                [&buffers[current], &buffers[current], &plane],
+                &config,
+                size,
+            )?;
+            let blurred = self.empty(count * 16)?;
+            let radius = config[37][1];
+            for (source, target, direction) in [
+                (&plane, &blurred, [1.0_f32, 0.0]),
+                (&blurred, &plane, [0.0_f32, 1.0]),
+            ] {
+                self.dispatch(
+                    &mut encoder,
+                    "raw_glow_blur",
+                    SHADER,
+                    [source, source, target],
+                    &[config[0], [radius, 0.0, direction[0], direction[1]]],
+                    size,
+                )?;
+            }
+            // The vertical pass ends back in the plane the compose pass reads.
+            Some(plane)
+        } else {
+            None
+        };
         if s.clarity != 0.0 || s.texture != 0.0 || s.sharpen != 0.0 {
             let scratch = self.empty(count * 16)?;
             let blurred = self.empty(count * 16)?;
             for (amount, radius, threshold) in [
                 (s.clarity / 100.0, 24.0 * scale, 0.0),
                 (s.texture / 100.0, 3.0 * scale, 0.0),
-                (
-                    s.sharpen / 100.0,
-                    s.sharpen_radius * scale,
-                    s.sharpen_threshold,
-                ),
             ] {
                 if amount == 0.0 {
                     continue;
@@ -117,6 +145,47 @@ impl Processor {
                 )?;
                 current = 1 - current;
             }
+        }
+        // Glow, then the post-crop vignette, then grain: Compositor's order,
+        // after the creative grade and before the sharpening that closes the
+        // chain.
+        if s.adjusts_effects() {
+            ensure!(!cancel.load(Ordering::Relaxed), "RAW development cancelled");
+            let plane = glow.unwrap_or_else(|| self.empty(count * 16).expect("buffer"));
+            self.dispatch(
+                &mut encoder,
+                "raw_effects",
+                SHADER,
+                [&buffers[current], &plane, &buffers[1 - current]],
+                &config,
+                size,
+            )?;
+            current = 1 - current;
+        }
+        if s.sharpen != 0.0 {
+            let scratch = self.empty(count * 16)?;
+            let blurred = self.empty(count * 16)?;
+            ensure!(!cancel.load(Ordering::Relaxed), "RAW development cancelled");
+            self.blur_passes(
+                &mut encoder,
+                &buffers[current],
+                &scratch,
+                &blurred,
+                size,
+                (s.sharpen_radius * scale).max(0.3),
+            )?;
+            self.dispatch(
+                &mut encoder,
+                "raw_detail",
+                SHADER,
+                [&buffers[current], &blurred, &buffers[1 - current]],
+                &[
+                    config[0],
+                    [s.sharpen / 100.0, s.sharpen_threshold, 0.0, 0.0],
+                ],
+                size,
+            )?;
+            current = 1 - current;
         }
         let [left, top, right, bottom] = crop(s, size);
         let target = [right - left, bottom - top];
@@ -147,9 +216,15 @@ pub(crate) fn crop(s: &DevelopSettings, size: [u32; 2]) -> [u32; 4] {
     ]
 }
 
-fn settings(raw: &DecodedRaw, s: &DevelopSettings, wb: [f32; 3], depth: u32) -> Vec<[f32; 4]> {
+fn settings(
+    raw: &DecodedRaw,
+    s: &DevelopSettings,
+    wb: [f32; 3],
+    depth: u32,
+    scale: f32,
+) -> Vec<[f32; 4]> {
     let (sin, cos) = s.rotation.to_radians().sin_cos();
-    let mut p = vec![[0.0; 4]; 36];
+    let mut p = vec![[0.0; 4]; 43];
     p[0] = [
         raw.camera.width() as f32,
         raw.camera.height() as f32,
@@ -203,7 +278,69 @@ fn settings(raw: &DecodedRaw, s: &DevelopSettings, wb: [f32; 3], depth: u32) -> 
             if wheel.adjusts() { 1.0 } else { 0.0 },
         ];
     }
+    effects(s, scale, &mut p);
     p
+}
+
+/// The post-grade effects and the calibration, packed for the shader. Compositor
+/// measures both glow's radius and grain's size in document pixels, so the
+/// preview's own scale is folded in here rather than in the shader: a preview
+/// that is a third of the size asks for a third of the radius and three times
+/// the grain scale.
+fn effects(s: &DevelopSettings, scale: f32, p: &mut [[f32; 4]]) {
+    // Bloom is the tighter of the two soft looks, so it starts from a smaller
+    // radius; Halation spreads Diffusion's.
+    let base = if s.glow_style == GlowStyle::Bloom {
+        2.0
+    } else {
+        5.0
+    };
+    p[36] = [
+        s.glow,
+        s.glow_style.kernel_value() as f32,
+        s.glow_range,
+        s.glow_spread,
+    ];
+    p[37] = [
+        s.glow_warmth,
+        (base * (1.0 + s.glow_spread / 100.0) * scale)
+            .round()
+            .clamp(1.0, 64.0),
+        0.0,
+        0.0,
+    ];
+    p[38] = [
+        s.vignette_amount,
+        s.vignette_style.kernel_value() as f32,
+        // The midpoint is measured against the frame's half-diagonal, and the
+        // roundness is Compositor's blend between a circle and a square.
+        s.vignette_midpoint / 100.0 * 0.85,
+        (1.0 - s.vignette_roundness / 100.0) * 0.5,
+    ];
+    p[39] = [
+        (s.vignette_feather / 100.0).max(0.05),
+        s.vignette_highlights,
+        0.0,
+        0.0,
+    ];
+    p[40] = [
+        s.grain_amount,
+        0.5 + (s.grain_size / 100.0) * 19.5,
+        (s.grain_roughness / 100.0).clamp(0.0, 1.0),
+        if scale > 0.0 { 1.0 / scale } else { 1.0 },
+    ];
+    p[41] = [
+        s.calibration.shadow_tint / 100.0,
+        s.calibration.red_hue / 100.0,
+        s.calibration.red_saturation / 100.0,
+        s.calibration.process.kernel_value() as f32,
+    ];
+    p[42] = [
+        s.calibration.green_hue / 100.0,
+        s.calibration.green_saturation / 100.0,
+        s.calibration.blue_hue / 100.0,
+        s.calibration.blue_saturation / 100.0,
+    ];
 }
 
 fn overlay_config(overlay: &Overlay, size: [u32; 2], cancel: &AtomicBool) -> Result<Vec<[f32; 4]>> {

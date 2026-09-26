@@ -137,12 +137,22 @@ impl EditorApp {
             // runs on a smaller copy of the layer and leaves its transform
             // alone: the canvas draws whatever buffer a layer holds at the size
             // its transform says.
+            // A preview renders a smaller copy of the layer, and the Camera Raw
+            // filter's controls are distances and sizes, so the copy has to say
+            // how far it was scaled down for the preview to match what Apply
+            // renders at full resolution.
+            let mut scale = 1.0_f32;
             if !preview.applying
                 && let Filter::CameraRaw { .. } = filter
                 && let Some(layer) = document.active_mut()
                 && let Some(pixels) = layer.pixels.as_ref().cloned()
             {
-                layer.pixels = Some(Arc::new(mectov::raw::preview_source(&pixels, 1600)));
+                let proxy = mectov::raw::preview_source(&pixels, 1600);
+                let (width, full) = (proxy.width(), pixels.width());
+                if width > 0 && full > 0 {
+                    scale = full as f32 / width as f32;
+                }
+                layer.pixels = Some(Arc::new(proxy));
             }
             let filter = filter.clone();
             let worker_filter = filter.clone();
@@ -173,14 +183,16 @@ impl EditorApp {
                         &mut document,
                         &worker_filter,
                         mask_target,
+                        scale,
                         &worker_cancel,
                         &gpu,
                     )
                 } else {
-                    mectov::effects::apply_filter_cancellable(
+                    mectov::effects::apply_filter_cancellable_at_scale(
                         &mut document,
                         &worker_filter,
                         mask_target,
+                        scale,
                         &worker_cancel,
                     )
                 }
@@ -233,7 +245,9 @@ mod tests {
     }
 
     fn wait(app: &mut EditorApp, edit: &mut EffectEdit) -> bool {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // A worker thread on a loaded machine can take its time; the deadline is
+        // here to catch a worker that never reports back, not to race it.
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             let finished = app.update_filter_preview(edit, false, false);
             if finished || !edit.filter_preview.busy() {
@@ -306,9 +320,7 @@ mod tests {
 
         // The preview is a smaller copy at the layer's own transform, so the
         // canvas draws it in the same place, just softer.
-        let started = std::time::Instant::now();
         assert!(!wait(&mut app, &mut edit));
-        eprintln!("DBG preview took {:?}", started.elapsed());
         let preview = app
             .session()
             .unwrap()

@@ -370,6 +370,7 @@ mod tests {
                     &mut actual,
                     &filter,
                     false,
+                    1.0,
                     &AtomicBool::new(false),
                     &worker,
                 )
@@ -423,8 +424,15 @@ mod tests {
         );
         let mut expected = actual.clone();
         effects::apply_filter(&mut expected, &filter, false).unwrap();
-        effects::apply_filter_with_gpu(&mut actual, &filter, false, &AtomicBool::new(false), &gpu)
-            .unwrap();
+        effects::apply_filter_with_gpu(
+            &mut actual,
+            &filter,
+            false,
+            1.0,
+            &AtomicBool::new(false),
+            &gpu,
+        )
+        .unwrap();
         assert_eq!(
             actual.active().unwrap().pixels,
             expected.active().unwrap().pixels
@@ -435,6 +443,7 @@ mod tests {
                 &mut actual,
                 &filter,
                 false,
+                1.0,
                 &AtomicBool::new(true),
                 &gpu
             )

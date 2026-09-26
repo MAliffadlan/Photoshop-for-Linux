@@ -134,15 +134,25 @@ fn lattice(point: vec2<i32>, seed: u32) -> f32 {
     return f32(h & 65535u) / 65535.0 + f32(h >> 16u) / 65535.0 - 1.0;
 }
 
-fn film_grain(point: vec2<f32>, settings: vec4<f32>) -> f32 {
-    let seed = bitcast<u32>(settings.w);
-    let cell = point / settings.y;
+// Smooth seeded noise whose features follow the requested size: four
+// neighbouring lattice values blended with a smoothstep, scaled by 1.6 because
+// blending narrows the spread.
+fn grain_field(point: vec2<f32>, size: f32, seed: u32) -> f32 {
+    let cell = point / max(size, 0.0001);
     let origin = vec2<i32>(floor(cell));
     let t = fract(cell) * fract(cell) * (3.0 - 2.0 * fract(cell));
     let top = mix(lattice(origin, seed), lattice(origin + vec2(1, 0), seed), t.x);
     let bottom = mix(lattice(origin + vec2(0, 1), seed), lattice(origin + vec2(1, 1), seed), t.x);
-    let coarse = mix(top, bottom, t.y) * 1.6;
-    let fine = lattice(vec2<i32>(floor(point)), mix32(seed ^ 0xa511e9b3u));
+    return mix(top, bottom, t.y) * 1.6;
+}
+
+fn film_grain(point: vec2<f32>, settings: vec4<f32>) -> f32 {
+    let seed = bitcast<u32>(settings.w);
+    let coarse = grain_field(point, settings.y, seed);
+    // Roughness adds smaller, less regular particles while their size stays
+    // proportional to Size, and both scales are smooth, which is what keeps a
+    // rough grain from turning into a grid of dots.
+    let fine = grain_field(point, max(settings.y * 0.35, 0.5), mix32(seed ^ 0xa511e9b3u));
     return mix(coarse, fine, settings.z / 100.0);
 }
 
