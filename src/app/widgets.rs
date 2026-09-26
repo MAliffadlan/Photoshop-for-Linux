@@ -177,6 +177,41 @@ pub fn scrub_label(
 }
 
 /// Consume vertical wheel motion over a control, leaving horizontal scrolling to its parent.
+/// A double-click on a slider's track returns it to `target`.
+///
+/// egui's own slider only asks for `Sense::drag()`, so its response never
+/// carries a double-click; the pointer is asked directly instead, and the hit
+/// is tested against the track so a double-click anywhere else — the number
+/// field, another slider, the canvas — is left alone. The number beside the
+/// track is refreshed the same way a wheel edit refreshes it.
+pub(super) fn reset_on_double_click<N: egui::emath::Numeric>(
+    ui: &Ui,
+    response: &mut Response,
+    value: &mut N,
+    target: f64,
+) {
+    if !response.enabled() {
+        return;
+    }
+    let over_track = ui.input(|input| {
+        input
+            .pointer
+            .button_double_clicked(egui::PointerButton::Primary)
+            && input
+                .pointer
+                .interact_pos()
+                .is_some_and(|pos| response.rect.contains(pos))
+    });
+    if !over_track || value.to_f64() == target {
+        return;
+    }
+    *value = N::from_f64(target);
+    response.mark_changed();
+    // DragValue caches its text while focused. Refresh it after the reset.
+    ui.data_mut(|data| data.remove::<String>(response.id));
+    ui.ctx().request_repaint();
+}
+
 fn wheel_steps(ui: &Ui, response: &Response) -> f64 {
     let id = response.id.with("wheel_remainder");
     if !response.enabled() || !response.hovered() {
@@ -371,6 +406,7 @@ pub struct Slider<'a, N> {
     suffix: String,
     logarithmic: bool,
     percentage: bool,
+    reset: Option<f64>,
 }
 impl<'a, N: egui::emath::Numeric> Slider<'a, N> {
     pub fn new(value: &'a mut N, range: RangeInclusive<N>) -> Self {
@@ -381,6 +417,7 @@ impl<'a, N: egui::emath::Numeric> Slider<'a, N> {
             suffix: String::new(),
             logarithmic: false,
             percentage: false,
+            reset: None,
         }
     }
     pub fn text(mut self, label: impl ToString) -> Self {
@@ -398,6 +435,12 @@ impl<'a, N: egui::emath::Numeric> Slider<'a, N> {
     pub fn percentage(mut self) -> Self {
         self.percentage = true;
         self.suffix = "%".into();
+        self
+    }
+    /// The value a double-click on the track returns the slider to, for a
+    /// slider whose neutral is not zero.
+    pub fn reset_to(mut self, value: impl Into<f64>) -> Self {
+        self.reset = Some(value.into());
         self
     }
 }
@@ -445,6 +488,14 @@ impl<N: egui::emath::Numeric> Widget for Slider<'_, N> {
                 speed / scale,
                 Some(decimals + if self.percentage { 2 } else { 0 }),
             );
+            // Compositor returns a slider to zero on a double-click, which is
+            // also what its own defaults are for every control that can sit at
+            // zero. A slider whose range holds no zero resets to the value its
+            // call site names, and one that names nothing has no reset to make.
+            let target = self.reset.unwrap_or(0.0);
+            if range.contains(&target) {
+                reset_on_double_click(ui, &mut response, &mut value, target);
+            }
             let r = response.rect;
             let radius = r.height() / 2.5;
             let x_range = (r.left() + radius)..=(r.right() - radius);

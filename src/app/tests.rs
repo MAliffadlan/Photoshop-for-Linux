@@ -309,6 +309,63 @@ fn the_camera_raw_filter_panel_pages_through_and_keeps_its_settings() {
     assert_eq!(app.session().unwrap().document.layers[0].pixels, before);
 }
 
+#[test]
+fn a_double_click_on_a_filter_slider_returns_it_to_its_neutral_value() {
+    let (context, mut app) = app();
+    app.dimensions = [320, 240];
+    app.new_document();
+    frame(&context, &mut app);
+    app.start_filter(Filter::TonalContrast {
+        amount: 50.0,
+        radius: 42.0,
+        shadows: 40.0,
+        midtones: 60.0,
+        highlights: 30.0,
+    });
+    for _ in 0..2 {
+        frame(&context, &mut app);
+    }
+    let radius = track_right_of(&context, &mut app, "Radius");
+    pointer_frame(
+        &context,
+        &mut app,
+        radius,
+        Some(true),
+        egui::Modifiers::NONE,
+    );
+    pointer_frame(
+        &context,
+        &mut app,
+        radius,
+        Some(false),
+        egui::Modifiers::NONE,
+    );
+    pointer_frame(
+        &context,
+        &mut app,
+        radius,
+        Some(true),
+        egui::Modifiers::NONE,
+    );
+    frame(&context, &mut app);
+    pointer_frame(
+        &context,
+        &mut app,
+        radius,
+        Some(false),
+        egui::Modifiers::NONE,
+    );
+    frame(&context, &mut app);
+    let edit = app.effect.as_ref().expect("the dialog is still open");
+    match edit.filter.as_ref().expect("the filter is still open") {
+        Filter::TonalContrast { radius, .. } => {
+            assert_eq!(*radius, 16.0, "the radius went back to its own default")
+        }
+        other => panic!("still the {other:?} filter"),
+    }
+    assert!(app.error.is_none(), "{:?}", app.error);
+}
+
 fn text_key(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
     egui::Event::Key {
         key,
@@ -3341,6 +3398,127 @@ fn slider_wheel_matches_number_steps_and_preserves_horizontal_scrolling() {
     }
 }
 
+/// One click in the given spot. A double-click is two of these in a row, in
+/// separate frames, which is how a pointer really delivers it. Each scenario
+/// gets its own context, because egui counts clicks per context and a third
+/// click in the same spot is a triple-click rather than a double-click.
+fn clicks(count: usize, pos: Pos2) -> Vec<egui::Event> {
+    let mut events = Vec::new();
+    for _ in 0..count {
+        events.push(egui::Event::PointerMoved(pos));
+        events.push(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        events.push(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+    }
+    events
+}
+
+/// Draws one slider in a `0.0..=1.0` range and reports the value, the response,
+/// and the two spots a test clicks: the track and the number beside it.
+fn unit_slider(
+    context: &egui::Context,
+    value: &mut f64,
+    reset: Option<f64>,
+    events: Vec<egui::Event>,
+) -> (f64, egui::Response, Pos2, Pos2) {
+    let mut spots = None;
+    let (response, _) = wheel_control_frame(context, events, |ui| {
+        let mut slider = widgets::Slider::new(value, 0.0..=1.0);
+        if let Some(reset) = reset {
+            slider = slider.reset_to(reset);
+        }
+        let response = ui.add(slider);
+        spots = Some((
+            egui::pos2(response.rect.left() + 10.0, response.rect.center().y),
+            egui::pos2(response.rect.right() - 10.0, response.rect.center().y),
+        ));
+        response
+    });
+    let (track, field) = spots.unwrap();
+    (*value, response, track, field)
+}
+
+/// The same, for a range that holds no zero.
+fn narrow_slider(
+    context: &egui::Context,
+    value: &mut f64,
+    reset: Option<f64>,
+    events: Vec<egui::Event>,
+) -> (f64, egui::Response, Pos2) {
+    let mut track = None;
+    let (response, _) = wheel_control_frame(context, events, |ui| {
+        let mut slider = widgets::Slider::new(value, 10.0..=100.0);
+        if let Some(reset) = reset {
+            slider = slider.reset_to(reset);
+        }
+        let response = ui.add(slider);
+        track = Some(egui::pos2(
+            response.rect.left() + 10.0,
+            response.rect.center().y,
+        ));
+        response
+    });
+    (*value, response, track.unwrap())
+}
+
+#[test]
+fn a_double_click_resets_a_slider_to_its_neutral_value() {
+    // A slider with zero in its range returns to zero.
+    let context = egui::Context::default();
+    let mut value = 0.5_f64;
+    let (after, _, track, field) = unit_slider(&context, &mut value, None, Vec::new());
+    assert_eq!(after, 0.5);
+    unit_slider(&context, &mut value, None, clicks(1, track));
+    let (after, response, _, _) = unit_slider(&context, &mut value, None, clicks(1, track));
+    assert_eq!(after, 0.0, "a double-click returns it to zero");
+    assert!(response.changed());
+    // The number beside the track keeps its own double-click, for selecting text.
+    let field_context = egui::Context::default();
+    let (after, response, _, _) =
+        unit_slider(&field_context, &mut value, Some(0.25), clicks(2, field));
+    assert_eq!(after, 0.0, "a double-click on the number does not reset");
+    assert!(!response.changed());
+    // A single click is a drag or a value change, never a reset.
+    let single = egui::Context::default();
+    let (after, response, _, _) = unit_slider(&single, &mut value, None, clicks(1, track));
+    assert_eq!(after, 0.0, "one click is not a reset");
+    assert!(!response.changed());
+}
+
+#[test]
+fn a_slider_whose_range_holds_no_zero_resets_only_to_a_named_value() {
+    let context = egui::Context::default();
+    let mut narrow = 20.0_f64;
+    let (after, _, track) = narrow_slider(&context, &mut narrow, None, Vec::new());
+    assert_eq!(after, 20.0);
+    narrow_slider(&context, &mut narrow, None, clicks(1, track));
+    let (after, response, _) = narrow_slider(&context, &mut narrow, None, clicks(1, track));
+    assert_eq!(after, 20.0, "nothing to reset to, so nothing happens");
+    assert!(!response.changed());
+
+    let named = egui::Context::default();
+    narrow_slider(&named, &mut narrow, Some(25.0), clicks(1, track));
+    let (after, response, _) = narrow_slider(&named, &mut narrow, Some(25.0), clicks(1, track));
+    assert_eq!(after, 25.0, "the named value is the neutral one");
+    assert!(response.changed());
+
+    let outside = egui::Context::default();
+    narrow_slider(&outside, &mut narrow, Some(1_000.0), clicks(1, track));
+    let (after, response, _) =
+        narrow_slider(&outside, &mut narrow, Some(1_000.0), clicks(1, track));
+    assert_eq!(after, 25.0, "a named value outside the range is ignored");
+    assert!(!response.changed());
+}
+
 #[test]
 fn number_wheel_accumulates_small_deltas_and_keeps_focused_text_current() {
     let context = egui::Context::default();
@@ -4580,6 +4758,29 @@ fn a_paragraph_box_outline_is_drawn_for_the_text_tool() {
 }
 
 /// The centre of the first painted box to the right of a label on the same row.
+/// The middle of the slider track drawn to the right of a label. A track is the
+/// widest thing on its own line, which is what tells it from the canvas
+/// backdrop behind the dialog and from the field's own frame.
+fn track_right_of(context: &egui::Context, app: &mut EditorApp, label: &str) -> Pos2 {
+    let label = layer_label(context, app, label);
+    frame(context, app)
+        .shapes
+        .iter()
+        .filter_map(|shape| match &shape.shape {
+            egui::Shape::Rect(rect)
+                if rect.rect.left() > label.x && (rect.rect.center().y - label.y).abs() < 12.0 =>
+            {
+                Some(rect.rect)
+            }
+            _ => None,
+        })
+        .max_by(|a, b| a.width().total_cmp(&b.width()))
+        .map_or_else(
+            || panic!("Missing slider track next to {label}"),
+            |rect| egui::pos2(rect.left() + 12.0, rect.center().y),
+        )
+}
+
 fn field_right_of(context: &egui::Context, app: &mut EditorApp, label: &str) -> Pos2 {
     let label = layer_label(context, app, label);
     frame(context, app)

@@ -619,7 +619,11 @@ impl EditorApp {
                                 .add(widgets::Slider::new(offset, -0.5..=0.5).text("Offset"))
                                 .changed();
                             changed |= ui
-                                .add(widgets::Slider::new(gamma, 0.1..=5.0).text("Gamma"))
+                                .add(
+                                    widgets::Slider::new(gamma, 0.1..=5.0)
+                                        .reset_to(1.0)
+                                        .text("Gamma"),
+                                )
                                 .changed();
                         }
                         Adjustment::GradientMap {
@@ -646,6 +650,7 @@ impl EditorApp {
                                 .add(
                                     widgets::Slider::new(size, 0.1..=100.0)
                                         .logarithmic(true)
+                                        .reset_to(25.0)
                                         .text("Size"),
                                 )
                                 .changed();
@@ -674,6 +679,7 @@ impl EditorApp {
                                 .add(
                                     widgets::Slider::new(radius, 0.1..=250.0)
                                         .logarithmic(true)
+                                        .reset_to(10.0)
                                         .text("Radius")
                                         .suffix(" px"),
                                 )
@@ -692,6 +698,7 @@ impl EditorApp {
                                 .add(
                                     widgets::Slider::new(distance, 1.0..=2000.0)
                                         .logarithmic(true)
+                                        .reset_to(10.0)
                                         .text("Distance")
                                         .suffix(" px"),
                                 )
@@ -707,6 +714,7 @@ impl EditorApp {
                             changed |= ui
                                 .add(
                                     widgets::Slider::new(amount, 0.1..=400.0)
+                                        .reset_to(10.0)
                                         .text("Amount")
                                         .suffix("%"),
                                 )
@@ -798,6 +806,7 @@ impl EditorApp {
                             changed |= ui
                                 .add(
                                     widgets::Slider::new(radius, 0.1..=100.0)
+                                        .reset_to(4.0)
                                         .text("Radius")
                                         .suffix(" px"),
                                 )
@@ -807,6 +816,7 @@ impl EditorApp {
                             changed |= ui
                                 .add(
                                     widgets::Slider::new(distance, 1.0..=200.0)
+                                        .reset_to(15.0)
                                         .text("Distance")
                                         .suffix(" px"),
                                 )
@@ -888,6 +898,7 @@ impl EditorApp {
                                 .add(
                                     widgets::Slider::new(radius, 1.0..=150.0)
                                         .logarithmic(true)
+                                        .reset_to(24.0)
                                         .text("Radius")
                                         .suffix(" px"),
                                 )
@@ -932,6 +943,7 @@ impl EditorApp {
                                 .add(
                                     widgets::Slider::new(radius, 1.0..=100.0)
                                         .logarithmic(true)
+                                        .reset_to(16.0)
                                         .text("Radius")
                                         .suffix(" px"),
                                 )
@@ -1177,6 +1189,7 @@ impl EditorApp {
                         self.export_changed |= ui
                             .add(
                                 widgets::Slider::new(&mut self.jpeg_quality, 1..=100)
+                                    .reset_to(90)
                                     .text("Quality"),
                             )
                             .changed();

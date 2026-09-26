@@ -1034,6 +1034,83 @@ mod tests {
         );
     }
 
+    /// The middle of the slider track drawn beside a label, found the way a
+    /// reader would: the label's own text, then the widest rectangle painted on
+    /// the same line to its right.
+    fn track_beside(ctx: &egui::Context, app: &mut EditorApp, label: &str) -> Pos2 {
+        let text = frame_output(ctx, app, Vec::new())
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == label => Some(text.pos),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("Missing the {label} slider"));
+        frame_output(ctx, app, Vec::new())
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Rect(rect)
+                    if rect.rect.left() > text.x
+                        && (rect.rect.center().y - text.y).abs() < 12.0 =>
+                {
+                    Some(rect.rect)
+                }
+                _ => None,
+            })
+            .max_by(|a, b| a.width().total_cmp(&b.width()))
+            .map_or_else(
+                || panic!("Missing the {label} track"),
+                |track| Pos2::new(track.left() + 12.0, track.center().y),
+            )
+    }
+
+    fn frame_output(
+        ctx: &egui::Context,
+        app: &mut EditorApp,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1280.0, 860.0))),
+                events,
+                ..Default::default()
+            },
+            |ctx| app.show(ctx),
+        )
+    }
+
+    #[test]
+    fn a_double_click_on_a_develop_slider_returns_it_to_its_default() {
+        let ctx = egui::Context::default();
+        let mut app = EditorApp::with_context(&ctx, vec![], false, None);
+        app.develop = Some(ready(&ctx));
+        // The Detail page holds the sharpen radius, whose neutral is one pixel
+        // rather than the zero its range cannot hold.
+        app.develop.as_mut().unwrap().panel = 2;
+        app.develop.as_mut().unwrap().settings.sharpen_radius = 4.0;
+        frame(&ctx, &mut app, Vec::new());
+        let track = track_beside(&ctx, &mut app, "Radius px");
+        for pressed in [Some(true), Some(false), Some(true), Some(false)] {
+            frame(&ctx, &mut app, click(track, pressed));
+        }
+        frame(&ctx, &mut app, Vec::new());
+        assert_eq!(app.develop.as_ref().unwrap().settings.sharpen_radius, 1.0);
+    }
+
+    fn click(pos: Pos2, pressed: Option<bool>) -> Vec<egui::Event> {
+        let mut events = vec![egui::Event::PointerMoved(pos)];
+        if let Some(pressed) = pressed {
+            events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        events
+    }
+
     #[test]
     fn develop_workspace_renders_all_panels_and_undo_retains_redo() {
         let ctx = egui::Context::default();

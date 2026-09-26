@@ -10,13 +10,29 @@ use mectov::raw::{self, DevelopSettings, Overlay, OverlayKind, WhiteBalance};
 use super::{develop::Develop, theme, widgets};
 
 fn slider(ui: &mut egui::Ui, label: &str, value: &mut f32, range: RangeInclusive<f32>) {
+    slider_to(ui, label, value, range, 0.0);
+}
+
+/// A Develop slider, for the controls whose neutral is not zero: the range has
+/// to hold the value, or there is nothing a double-click could reset to.
+fn slider_to(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut f32,
+    range: RangeInclusive<f32>,
+    reset: f32,
+) {
+    let reset = (range.contains(&reset)).then_some(reset);
     ui.horizontal(|ui| {
         ui.add_sized([105.0, 20.0], egui::Label::new(label));
-        ui.add(
+        let mut response = ui.add(
             egui::Slider::new(value, range)
                 .clamping(egui::SliderClamping::Edits)
                 .max_decimals(2),
         );
+        if let Some(reset) = reset {
+            super::widgets::reset_on_double_click(ui, &mut response, value, f64::from(reset));
+        }
     });
 }
 
@@ -279,7 +295,13 @@ fn detail(ui: &mut egui::Ui, d: &mut Develop) {
     slider(ui, "Color", &mut d.settings.color_noise, 0.0..=100.0);
     heading(ui, "Sharpening");
     slider(ui, "Amount", &mut d.settings.sharpen, 0.0..=200.0);
-    slider(ui, "Radius px", &mut d.settings.sharpen_radius, 0.3..=5.0);
+    slider_to(
+        ui,
+        "Radius px",
+        &mut d.settings.sharpen_radius,
+        0.3..=5.0,
+        raw::DevelopSettings::default().sharpen_radius,
+    );
     slider(
         ui,
         "Threshold",
@@ -316,8 +338,20 @@ fn lens(ui: &mut egui::Ui, d: &mut Develop) {
     let [left, top, right, bottom] = d.settings.crop;
     slider(ui, "Left", &mut d.settings.crop[0], 0.0..=(right - 0.01));
     slider(ui, "Top", &mut d.settings.crop[1], 0.0..=(bottom - 0.01));
-    slider(ui, "Right", &mut d.settings.crop[2], (left + 0.01)..=1.0);
-    slider(ui, "Bottom", &mut d.settings.crop[3], (top + 0.01)..=1.0);
+    slider_to(
+        ui,
+        "Right",
+        &mut d.settings.crop[2],
+        (left + 0.01)..=1.0,
+        1.0,
+    );
+    slider_to(
+        ui,
+        "Bottom",
+        &mut d.settings.crop[3],
+        (top + 0.01)..=1.0,
+        1.0,
+    );
     ui.horizontal(|ui| {
         if ui.button("Uncrop").clicked() {
             d.settings.crop = [0.0, 0.0, 1.0, 1.0];
@@ -387,13 +421,25 @@ fn masks(ui: &mut egui::Ui, d: &mut Develop) {
     ui.text_edit_singleline(&mut overlay.name);
     ui.checkbox(&mut overlay.invert, "Invert mask");
     if overlay.kind == OverlayKind::Brush {
-        slider(ui, "Brush radius", &mut overlay.radius, 0.005..=0.3);
+        slider_to(
+            ui,
+            "Brush radius",
+            &mut overlay.radius,
+            0.005..=0.3,
+            raw::Overlay::default().radius,
+        );
         if ui.button("Clear brush").clicked() {
             overlay.points.clear();
         }
     }
     if overlay.kind != OverlayKind::Linear {
-        slider(ui, "Feather", &mut overlay.feather, 0.01..=1.0);
+        slider_to(
+            ui,
+            "Feather",
+            &mut overlay.feather,
+            0.01..=1.0,
+            raw::Overlay::default().feather,
+        );
     }
     slider(ui, "Exposure EV", &mut overlay.exposure, -10.0..=10.0);
     percent(ui, "Warmth", &mut overlay.warmth);

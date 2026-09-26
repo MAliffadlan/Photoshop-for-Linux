@@ -148,6 +148,7 @@ impl EditorApp {
                                                 &mut self.brush.hardness,
                                                 0.0..=1.0,
                                             )
+                                            .reset_to(mectov::paint::Brush::default().hardness)
                                             .percentage(),
                                         );
                                         ui.label("Opacity");
@@ -156,6 +157,7 @@ impl EditorApp {
                                                  &mut self.brush.opacity,
                                                  0.01..=1.0,
                                              )
+                                             .reset_to(1.0)
                                              .percentage(),
                                          );
                                          if matches!(self.tool, Tool::Brush | Tool::Erase) {
@@ -221,6 +223,7 @@ impl EditorApp {
                                                 &mut self.brush.opacity,
                                                 0.0..=1.0,
                                             )
+                                            .reset_to(1.0)
                                             .percentage(),
                                         );
                                     }
