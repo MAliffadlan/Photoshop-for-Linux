@@ -530,6 +530,166 @@ impl TextRenderer {
     }
 }
 
+/// A set of glyphs rasterised for the Dither filter's ASCII style: one coverage
+/// map per distinct character, sorted from least inked to most, so a tone can be
+/// matched to the character that carries it.
+pub struct GlyphSet {
+    /// The cell every character shares: one character wide, `line_height` tall.
+    pub width: usize,
+    pub height: usize,
+    /// The cells, back to back, each `width * height` bytes of coverage.
+    pub maps: Vec<u8>,
+    /// Each cell's mean coverage, 0…1, in the same order as `maps`.
+    pub coverage: Vec<f32>,
+}
+
+impl GlyphSet {
+    pub fn count(&self) -> usize {
+        self.coverage.len()
+    }
+}
+
+/// The families a machine is most likely to have a monospaced face in, in the
+/// order they are preferred.
+const MONOSPACE_PREFERENCE: [&str; 5] = [
+    "DejaVu Sans Mono",
+    "Liberation Mono",
+    "Noto Sans Mono",
+    "JetBrains Mono",
+    "Cascadia Mono",
+];
+
+/// The first monospaced family available, preferring the ones above. Compositor
+/// draws its ASCII from the system monospaced face, so which one is used follows
+/// the machine, as Compositor's does.
+pub fn monospace_family(renderer: &TextRenderer) -> Option<String> {
+    let installed: Vec<&str> = renderer
+        .fonts
+        .db()
+        .faces()
+        .filter(|face| face.monospaced)
+        .flat_map(|face| face.families.iter().map(|(name, _)| name.as_str()))
+        .collect();
+    for wanted in MONOSPACE_PREFERENCE {
+        if let Some(found) = installed
+            .iter()
+            .find(|name| name.eq_ignore_ascii_case(wanted))
+        {
+            return Some((*found).to_string());
+        }
+    }
+    installed.first().map(|name| (*name).to_string())
+}
+
+/// Rasterise each distinct character into its own cell, `line_height` tall and
+/// one character wide, all on a shared baseline, and return them sorted from
+/// least ink to most. A cell's coverage is what the Dither filter matches a
+/// tone against, so the sort is the contract, not the drawing.
+pub fn monospace_glyphs(
+    renderer: &mut TextRenderer,
+    characters: &str,
+    line_height: u32,
+) -> Option<GlyphSet> {
+    let family = monospace_family(renderer).unwrap_or_else(|| FALLBACK_FAMILY.to_string());
+    let size = line_height as f32 / 1.2;
+    let face = renderer
+        .fonts
+        .db()
+        .query(&cosmic_text::fontdb::Query {
+            families: &[Family::Name(&family)],
+            weight: Weight::BOLD,
+            ..Default::default()
+        })
+        .and_then(|id| renderer.fonts.db().face(id))?;
+    let attrs = Attrs::new()
+        .family(Family::Name(&family))
+        .weight(face.weight)
+        .style(face.style)
+        .stretch(face.stretch);
+    // The cell is one character wide: the advance of an M in the same face, which
+    // a monospaced face gives every character.
+    let width = advance(renderer, &attrs, size, line_height, "M").max(1.0) as usize;
+    let height = line_height as usize;
+    let mut cache = SwashCache::new();
+    let ink = Color::rgb(255, 255, 255);
+    let mut cells: Vec<(Vec<u8>, f32)> = Vec::new();
+    for character in characters.chars() {
+        let text = character.to_string();
+        let mut buffer = Buffer::new(&mut renderer.fonts, Metrics::new(size, line_height as f32));
+        buffer.set_wrap(&mut renderer.fonts, Wrap::None);
+        buffer.set_size(&mut renderer.fonts, None, None);
+        buffer.set_text(&mut renderer.fonts, &text, &attrs, Shaping::Advanced);
+        let mut map = vec![0_u8; width * height];
+        for run in buffer.layout_runs() {
+            let advance = run.line_w;
+            let x = ((width as f32 - advance) / 2.0).round() as i32;
+            for glyph in run.glyphs {
+                let physical = glyph.physical((0.0, 0.0), 1.0);
+                let baseline = run.line_y as i32;
+                // Compositor rasterises each cell into a gray map, so a
+                // character's edge is a coverage rather than a hard edge, and the
+                // coverage is what the Dither filter blends.
+                cache.with_pixels(
+                    &mut renderer.fonts,
+                    physical.cache_key,
+                    ink,
+                    |gx, gy, color| {
+                        let px = x + physical.x + gx;
+                        let py = baseline + gy;
+                        if px < 0 || py < 0 {
+                            return;
+                        }
+                        if let Some(slot) = map.get_mut(py as usize * width + px as usize) {
+                            *slot = (*slot).max(color.as_rgba()[3]);
+                        }
+                    },
+                );
+            }
+        }
+        let ink: u32 = map.iter().map(|value| u32::from(*value)).sum();
+        let coverage = ink as f32 / (255.0 * (width * height) as f32);
+        if !cells.iter().any(|(existing, _)| *existing == map) {
+            cells.push((map, coverage));
+        }
+    }
+    if cells.is_empty() {
+        return None;
+    }
+    // A terminal's ramp runs from the lightest character to the fullest, so a
+    // tone picks the character whose ink is nearest to it.
+    cells.sort_by(|a, b| a.1.total_cmp(&b.1));
+    let mut set = GlyphSet {
+        width,
+        height,
+        maps: Vec::with_capacity(cells.len() * width * height),
+        coverage: Vec::with_capacity(cells.len()),
+    };
+    for (map, coverage) in cells {
+        set.maps.extend_from_slice(&map);
+        set.coverage.push(coverage);
+    }
+    Some(set)
+}
+
+/// The width the given face gives a run of text, which for a monospaced face is
+/// the cell every character shares.
+fn advance(
+    renderer: &mut TextRenderer,
+    attrs: &Attrs<'_>,
+    size: f32,
+    line_height: u32,
+    text: &str,
+) -> f32 {
+    let mut buffer = Buffer::new(&mut renderer.fonts, Metrics::new(size, line_height as f32));
+    buffer.set_wrap(&mut renderer.fonts, Wrap::None);
+    buffer.set_size(&mut renderer.fonts, None, None);
+    buffer.set_text(&mut renderer.fonts, text, attrs, Shaping::Advanced);
+    buffer
+        .layout_runs()
+        .map(|run| run.line_w)
+        .fold(0.0_f32, f32::max)
+}
+
 /// Replace the text while retaining the layer's scale, rotation, and top-left anchor.
 pub fn update_layer(layer: &mut Layer, style: TextStyle, pixels: RgbaImage) -> Result<()> {
     style.validate()?;

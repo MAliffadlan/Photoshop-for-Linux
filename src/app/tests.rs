@@ -252,6 +252,132 @@ fn coloured_letters_chosen_in_the_text_dialog_reach_the_layer() {
 }
 
 #[test]
+fn the_dither_filter_panel_offers_the_chosen_style_s_own_controls() {
+    let (context, mut app) = app();
+    app.dimensions = [320, 240];
+    app.new_document();
+    frame(&context, &mut app);
+    app.start_filter(mectov::effects::Filter::Dither {
+        settings: Box::new(mectov::dither::DitherSettings {
+            pixel_size: 1.0,
+            ..Default::default()
+        }),
+    });
+    assert!(app.dialog == Some(Dialog::Effect));
+    // A style's own controls come and go with it: nothing is shown that would
+    // mean nothing to the style that is chosen.
+    for (style, wanted, unwanted) in [
+        (
+            mectov::dither::DitherStyle::Atkinson,
+            vec!["Diffusion", "Levels", "Density", "Contrast"],
+            vec!["Cell size", "Text size", "Characters"],
+        ),
+        (
+            mectov::dither::DitherStyle::Bayer4,
+            vec!["Levels"],
+            vec!["Diffusion", "Cell size", "Text size", "Characters"],
+        ),
+        (
+            mectov::dither::DitherStyle::HalftoneDots,
+            vec!["Cell size", "Angle", "Density", "Contrast"],
+            vec!["Diffusion", "Levels", "Text size", "Characters"],
+        ),
+        (
+            mectov::dither::DitherStyle::Ascii,
+            vec!["Text size", "Characters", "Density", "Contrast"],
+            vec!["Diffusion", "Levels", "Cell size"],
+        ),
+    ] {
+        let mut edit = app.effect.take().unwrap();
+        if let mectov::effects::Filter::Dither { settings } = edit.filter.as_mut().unwrap() {
+            settings.style = style;
+        }
+        app.effect = Some(edit);
+        // The panel is longer than the usual test window is tall, so it is opened
+        // on a taller screen: a window keeps the place it was given, and its body
+        // scrolls inside a height taken from the screen it was opened on.
+        let output = tall_panel(&context, &mut app);
+        let texts: Vec<&str> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some(text.galley.text()),
+                _ => None,
+            })
+            .collect();
+        assert!(app.error.is_none(), "{style:?}: {:?}", app.error);
+        for label in wanted {
+            assert!(
+                texts.contains(&label),
+                "{style:?} offers {label}: {texts:?}"
+            );
+        }
+        // The Move / Transform header carries a field of its own called Angle, so
+        // the screen's is counted rather than merely looked for: one is always the
+        // header's, and only the halftone styles add the panel's beside it.
+        let angles = texts.iter().filter(|label| **label == "Angle").count();
+        assert_eq!(
+            angles,
+            if style.is_halftone() { 2 } else { 1 },
+            "{style:?} draws a screen angle only where it has a screen: {texts:?}"
+        );
+        for label in unwanted {
+            assert!(
+                !texts.contains(&label),
+                "{style:?} leaves out {label}: {texts:?}"
+            );
+        }
+    }
+    // The style list itself names all ten, under the four headings upstream
+    // breaks them into, and the selected one is named on the closed combo.
+    let mut edit = app.effect.take().unwrap();
+    if let mectov::effects::Filter::Dither { settings } = edit.filter.as_mut().unwrap() {
+        settings.style = mectov::dither::DitherStyle::FloydSteinberg;
+    }
+    app.effect = Some(edit);
+    let closed = tall_panel(&context, &mut app);
+    let texts: Vec<&str> = closed
+        .shapes
+        .iter()
+        .filter_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) => Some(text.galley.text()),
+            _ => None,
+        })
+        .collect();
+    assert!(texts.contains(&"Floyd\u{2013}Steinberg"), "{texts:?}");
+    assert!(texts.contains(&"Pixel size"), "{texts:?}");
+    assert!(texts.contains(&"Pixel shape"), "{texts:?}");
+
+    // The panel keeps the settings the controls reached, and cancelling leaves
+    // the document as it was.
+    let mut edit = app.effect.take().unwrap();
+    if let mectov::effects::Filter::Dither { settings } = edit.filter.as_mut().unwrap() {
+        settings.style = mectov::dither::DitherStyle::Bayer8;
+        settings.pixel_size = 1.0;
+    }
+    app.effect = Some(edit);
+    tall_panel(&context, &mut app);
+    let edit = app.effect.as_ref().unwrap();
+    let Filter::Dither { settings } = edit.filter.as_ref().unwrap() else {
+        panic!("the filter is still the Dither filter");
+    };
+    assert_eq!(settings.style, mectov::dither::DitherStyle::Bayer8);
+    assert_eq!(settings.pixel_size, 1.0);
+    let before = app.session().unwrap().document.layers[0].pixels.clone();
+    let event = egui::Event::Key {
+        key: egui::Key::Escape,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::NONE,
+    };
+    keyboard_frame(&context, &mut app, vec![event], egui::Modifiers::NONE);
+    assert!(app.effect.is_none());
+    assert!(app.dialog.is_none());
+    assert_eq!(app.session().unwrap().document.layers[0].pixels, before);
+}
+
+#[test]
 fn the_camera_raw_filter_panel_pages_through_and_keeps_its_settings() {
     let (context, mut app) = app();
     app.dimensions = [320, 240];
@@ -2023,6 +2149,14 @@ fn tall_frame(context: &egui::Context, app: &mut EditorApp) -> egui::FullOutput 
     );
     assert!(!output.shapes.is_empty());
     output
+}
+
+/// The same, on a second frame. An auto-sized window works out how big it has to
+/// be from the content it laid out, so its panels are only drawn on the frame
+/// after the one it opened on.
+fn tall_panel(context: &egui::Context, app: &mut EditorApp) -> egui::FullOutput {
+    tall_frame(context, app);
+    tall_frame(context, app)
 }
 
 fn pointer_frame(

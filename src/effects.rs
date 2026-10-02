@@ -541,6 +541,12 @@ pub enum Filter {
         distortion: f32,
         vignette: f32,
     },
+    /// A layer turned into dithered pixels. The settings are boxed for the same
+    /// reason the develop sheet's are: a filter's settings are compared on every
+    /// frame to spot a stale preview.
+    Dither {
+        settings: Box<crate::dither::DitherSettings>,
+    },
     /// The develop pipeline as a filter, with the white balance counted in
     /// relative steps the way a rendered image can be counted. The settings are
     /// boxed because a develop sheet is far larger than any other filter's, and
@@ -562,6 +568,7 @@ impl Filter {
             Self::BloomGlow { .. } => "Bloom / Glow",
             Self::TonalContrast { .. } => "Tonal Contrast",
             Self::LensCorrection { .. } => "Lens Correction",
+            Self::Dither { .. } => "Dither",
             Self::CameraRaw { .. } => "Camera Raw Filter",
         }
     }
@@ -572,17 +579,32 @@ pub fn filtered(image: &RgbaImage, filter: &Filter) -> RgbaImage {
 }
 
 /// The same filter, told how far its input has been scaled down. A preview
-/// renders a smaller copy of the layer, and the Camera Raw filter is the one
-/// filter whose controls are distances and sizes rather than amounts, so it
-/// needs to know. Every other filter ignores it.
+/// renders a smaller copy of the layer, and two filters have controls that are
+/// distances and sizes rather than amounts, so they need to know: Camera Raw,
+/// whose glow and vignette are measured in pixels, and Dither, whose chunky
+/// pixels, halftone cells and lines of characters are. Every other filter
+/// ignores it.
 pub fn filtered_at_scale(image: &RgbaImage, filter: &Filter, scale: f32) -> RgbaImage {
+    filtered_at_scale_cancellable(image, filter, scale, &AtomicBool::new(false))
+}
+
+/// The same, carrying the flag a caller can call the pass off with. The ones that
+/// mean it keep it throughout: Dither asks whether it is still wanted on every
+/// scanline, which is what stops a job the user has moved past from running to
+/// the end of a large layer.
+fn filtered_at_scale_cancellable(
+    image: &RgbaImage,
+    filter: &Filter,
+    scale: f32,
+    cancel: &AtomicBool,
+) -> RgbaImage {
     if let Some(result) = crate::gpu::filter(image, filter) {
         return result;
     }
     if crate::gpu::cancelled() {
         return image.clone();
     }
-    filtered_cpu(image, filter, scale, false)
+    filtered_cpu(image, filter, scale, false, cancel)
 }
 
 fn premultiplied_blur(image: &RgbaImage, radius: f32) -> RgbaImage {
@@ -839,6 +861,7 @@ fn filtered_cpu(
     filter: &Filter,
     scale: f32,
     fill_empty_vignette: bool,
+    cancel: &AtomicBool,
 ) -> RgbaImage {
     let (w, h) = image.dimensions();
     let result = match filter {
@@ -878,6 +901,9 @@ fn filtered_cpu(
         }),
         Filter::Vignette { .. } => vignette(image, filter, fill_empty_vignette),
         Filter::BloomGlow { amount, radius } => bloom(image, *amount, *radius),
+        Filter::Dither { settings } => {
+            crate::dither::apply_at_scale(image, settings, scale, cancel)
+        }
         Filter::TonalContrast {
             amount,
             radius,
@@ -1030,6 +1056,28 @@ pub fn apply_filter_with_gpu(
     apply_filter_impl(document, filter, mask_target, scale, cancel, Some(gpu))
 }
 
+/// The Dither filter is the one whose working set is many times the layer it is
+/// handed: a tone plane per channel, the image's own colours in `Original`, the
+/// alpha and the result. Every other filter works inside the raster it was given
+/// and a copy of it, so this is the one whose cost has to be measured against the
+/// memory the machine may spare before the pass begins, rather than found out as
+/// an allocation that cannot be served.
+fn ensure_dither_fits(filter: &Filter, width: u32, height: u32) -> Result<()> {
+    let Filter::Dither { settings } = filter else {
+        return Ok(());
+    };
+    let pixels = u64::from(width) * u64::from(height);
+    let needed = crate::dither::working_set(pixels, settings.colors);
+    let allowed = memory::share(1);
+    ensure!(
+        needed <= allowed,
+        "Dither needs {} for a {width} × {height} layer, and this machine may spare {}",
+        memory::gibibytes(needed),
+        memory::gibibytes(allowed)
+    );
+    Ok(())
+}
+
 fn apply_filter_impl(
     document: &mut Document,
     filter: &Filter,
@@ -1102,6 +1150,7 @@ fn apply_filter_impl(
         original.height() + padding * 2,
     );
     crate::document::validate_size(w, h)?;
+    ensure_dither_fits(filter, w, h)?;
     let mut transform = original_transform;
     if padding > 0 {
         let width = original.width() as f32;
@@ -1142,8 +1191,10 @@ fn apply_filter_impl(
             Filter::MotionBlur { distance, angle } => {
                 motion_blur(&expanded, *distance, *angle, cancel)?
             }
-            Filter::Vignette { .. } if empty_layer => filtered_cpu(&expanded, filter, 1.0, true),
-            _ => filtered_at_scale(&expanded, filter, scale),
+            Filter::Vignette { .. } if empty_layer => {
+                filtered_cpu(&expanded, filter, 1.0, true, cancel)
+            }
+            _ => filtered_at_scale_cancellable(&expanded, filter, scale, cancel),
         }
     };
     ensure!(!cancel.load(Ordering::Relaxed), "Filter cancelled");
@@ -1764,6 +1815,49 @@ mod tests {
         }));
         let eroded = morphology(&alpha, 5, 5, 1, false);
         assert!(eroded.iter().all(|value| *value == 0.0));
+    }
+
+    /// Dither is the one filter whose working set is many times the layer it is
+    /// handed, so it is the one measured against the memory the machine may spare
+    /// before the pass begins. The guard is asked in pixels, so this can ask it
+    /// about a layer far too large to allocate in a test.
+    #[test]
+    fn a_dither_larger_than_the_machine_may_spare_is_refused() {
+        let allowed = memory::share(1);
+        let bytes = crate::dither::bytes_per_pixel(crate::dither::DitherColors::BlackWhite);
+        // Kept inside a u32 so the boundary can be named on any machine.
+        let fits = (allowed / bytes).min(u64::from(u32::MAX) - 1) as u32;
+        let dither = Filter::Dither {
+            settings: Box::new(crate::dither::DitherSettings::default()),
+        };
+        assert!(
+            ensure_dither_fits(&dither, fits, 1).is_ok(),
+            "a layer inside the budget is allowed"
+        );
+        let error = ensure_dither_fits(&dither, fits + 1, 1)
+            .expect_err("a layer past it is refused")
+            .to_string();
+        assert!(
+            error.contains("Dither") && error.contains(&memory::gibibytes(allowed)),
+            "the refusal names the filter and the budget it missed: {error}"
+        );
+        // Original keeps three tone planes and the image's own colours, so the
+        // same layer costs more there and is refused sooner.
+        let original = Filter::Dither {
+            settings: Box::new(crate::dither::DitherSettings {
+                colors: crate::dither::DitherColors::Original,
+                ..Default::default()
+            }),
+        };
+        assert!(
+            ensure_dither_fits(&original, fits, 1).is_err(),
+            "the same pixels in Original are past the budget"
+        );
+        // Every other filter works inside the raster it was given and a copy of
+        // it, so none is refused for the size of the layer alone.
+        assert!(
+            ensure_dither_fits(&Filter::GaussianBlur { radius: 4.0 }, u32::MAX, u32::MAX).is_ok()
+        );
     }
 
     #[test]

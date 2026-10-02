@@ -1,6 +1,7 @@
 pub mod backdrop;
 pub mod blend;
 pub mod color;
+pub mod dither;
 pub mod document;
 pub mod effects;
 pub mod geometry;

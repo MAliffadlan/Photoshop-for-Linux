@@ -15,7 +15,10 @@ pub fn filter(image: &RgbaImage, filter: &crate::effects::Filter) -> Option<Rgba
     use crate::effects::Filter;
     // The Camera Raw filter develops through the camera pipeline, which the
     // shader has no path for, so the CPU engine runs it instead.
-    if matches!(filter, Filter::CameraRaw { .. }) {
+    // Error diffusion is a scanline chain, and Compositor's own dither runs on the
+    // CPU for the same reason a camera file's does: the shader would have to
+    // carry the whole layer's tone to answer one pixel.
+    if matches!(filter, Filter::CameraRaw { .. } | Filter::Dither { .. }) {
         return None;
     }
     let size = [image.width(), image.height()];
@@ -149,9 +152,9 @@ pub fn filter(image: &RgbaImage, filter: &crate::effects::Filter) -> Option<Rgba
                     )?
                     .ok_or_else(|| anyhow::anyhow!("Image exceeds GPU texture limits"));
             }
-            // Unreachable: the variant above is answered before this point, and
-            // the match has to be total.
-            Filter::CameraRaw { .. } => image.as_raw().clone(),
+            // Unreachable: both variants are answered before this point, and the
+            // match has to be total.
+            Filter::CameraRaw { .. } | Filter::Dither { .. } => image.as_raw().clone(),
         };
         Ok(RgbaImage::from_raw(size[0], size[1], bytes).unwrap())
     })

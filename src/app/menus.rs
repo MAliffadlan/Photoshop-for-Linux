@@ -394,6 +394,12 @@ impl EditorApp {
                                             distortion: 0.0,
                                             vignette: 0.0,
                                         },
+                                        Filter::Dither {
+                                            settings: Box::new(mectov::dither::DitherSettings {
+                                                pixel_size: 2.0,
+                                                ..Default::default()
+                                            }),
+                                        },
                                         // Develop already owns a camera file, so the
                                         // filter is offered for the layers it does not
                                         // cover, which is everything but a RAW one.

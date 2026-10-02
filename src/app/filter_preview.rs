@@ -116,10 +116,13 @@ impl EditorApp {
             }
         }
 
-        // The Camera Raw filter's preview is a smaller copy of the layer, drawn at
-        // the layer's own transform, so the frame Apply is pressed on renders it
-        // again at full resolution rather than committing the proxy.
-        if apply && matches!(filter, Filter::CameraRaw { .. }) {
+        // The two filters that preview on a smaller copy of the layer are drawn
+        // at the layer's own transform, so the frame Apply is pressed on has to
+        // render the layer again at its own resolution rather than commit the
+        // proxy: Camera Raw's develop pipeline is told the scale, and Dither's
+        // chunky pixels, halftone cells and lines of characters are distances in
+        // layer pixels. A preview of either is a preview only, never the result.
+        if apply && matches!(filter, Filter::CameraRaw { .. } | Filter::Dither { .. }) {
             preview.ready = None;
         }
 
@@ -137,13 +140,15 @@ impl EditorApp {
             // runs on a smaller copy of the layer and leaves its transform
             // alone: the canvas draws whatever buffer a layer holds at the size
             // its transform says.
-            // A preview renders a smaller copy of the layer, and the Camera Raw
-            // filter's controls are distances and sizes, so the copy has to say
-            // how far it was scaled down for the preview to match what Apply
-            // renders at full resolution.
+            // Two filters are told how far their copy was scaled down, because
+            // their controls are distances and sizes counted in layer pixels:
+            // Camera Raw's glow and vignette, and Dither's chunky pixels,
+            // halftone cells and lines of characters. They are also the two that
+            // read every pixel they are handed, which is why they are the two
+            // that preview on a proxy at all.
             let mut scale = 1.0_f32;
             if !preview.applying
-                && let Filter::CameraRaw { .. } = filter
+                && matches!(filter, Filter::CameraRaw { .. } | Filter::Dither { .. })
                 && let Some(layer) = document.active_mut()
                 && let Some(pixels) = layer.pixels.as_ref().cloned()
             {
@@ -372,6 +377,132 @@ mod tests {
                 .pixels
                 .as_ref(),
             Some(&full)
+        );
+    }
+
+    /// A layer big enough that the Dither filter's preview has to be a smaller
+    /// copy of it, so the size the preview asks for is the copy's own and the
+    /// proxy path is the one under test.
+    fn dither_setup(width: u32, height: u32, pixel_size: f32) -> (EditorApp, EffectEdit) {
+        let context = egui::Context::default();
+        let mut app = EditorApp::with_context(&context, Vec::new(), false, None);
+        app.dimensions = [width, height];
+        app.new_document();
+        {
+            use image::{Rgba, RgbaImage};
+            let session = app.session_mut().unwrap();
+            session.document.layers.clear();
+            let mut layer = mectov::document::Layer::image(
+                "Photo",
+                RgbaImage::from_fn(width, height, |x, y| {
+                    Rgba([
+                        (30 + x % 200).min(255) as u8,
+                        (60 + y % 180).min(255) as u8,
+                        140,
+                        255,
+                    ])
+                }),
+            );
+            layer.transform.x = 5.0;
+            session.document.insert(layer);
+        }
+        app.start_filter(Filter::Dither {
+            settings: Box::new(mectov::dither::DitherSettings {
+                style: mectov::dither::DitherStyle::Bayer8,
+                pixel_size,
+                ..Default::default()
+            }),
+        });
+        let edit = app.effect.take().unwrap();
+        (app, edit)
+    }
+
+    /// Every aligned block of `block` pixels is one colour, which is what the
+    /// nearest-neighbour blow-up of a chunky pixel leaves behind.
+    fn tiled(image: &image::RgbaImage, block: u32) -> bool {
+        image.pixels().enumerate().all(|(index, pixel)| {
+            let (x, y) = (index as u32 % image.width(), index as u32 / image.width());
+            *pixel == *image.get_pixel(x / block * block, y / block * block)
+        })
+    }
+
+    #[test]
+    fn the_dither_preview_is_a_proxy_and_apply_is_the_layers_own_pixels() {
+        let (mut app, mut edit) = dither_setup(2000, 1200, 8.0);
+        let full = edit
+            .original
+            .layers
+            .first()
+            .and_then(|layer| layer.pixels.clone())
+            .expect("the photo layer");
+        assert_eq!(full.dimensions(), (2000, 1200));
+        let transform = edit.original.layers[0].transform;
+
+        // The preview is a smaller copy at the layer's own transform, so the
+        // canvas draws it in the same place, just coarser.
+        assert!(!wait(&mut app, &mut edit));
+        let preview = app
+            .session()
+            .unwrap()
+            .document
+            .active()
+            .unwrap()
+            .pixels
+            .clone()
+            .unwrap();
+        assert_eq!(preview.dimensions(), (1600, 960));
+        assert_eq!(
+            app.session().unwrap().document.active().unwrap().transform,
+            transform,
+            "the proxy does not move the layer"
+        );
+        // The wiring exactly: the copy the app built, dithered at the scale it
+        // worked out. 2000 over 1600 is 1.25, so the panel's eight-pixel blocks
+        // are 6.4 of the copy's, which the kernel rounds to six. Had the preview
+        // passed the scale on as one, its blocks would be eight of the copy's and
+        // this would not match.
+        let proxy = mectov::raw::preview_source(&full, 1600);
+        let settings = mectov::dither::DitherSettings {
+            style: mectov::dither::DitherStyle::Bayer8,
+            pixel_size: 8.0,
+            ..Default::default()
+        };
+        assert_eq!(
+            *preview,
+            mectov::dither::apply_at_scale(&proxy, &settings, 1.25, &AtomicBool::new(false)),
+            "the preview is the proxy dithered at the preview's own scale"
+        );
+        assert!(
+            tiled(&preview, 6),
+            "and its chunky pixels are the copy's own six"
+        );
+
+        // Apply cannot reuse a proxy, so it dithers the layer again at its own
+        // resolution, commits exactly one edit, and closes the dialog.
+        let revision = app.session().unwrap().history.revision;
+        let mut edit = edit;
+        assert!(
+            !app.update_filter_preview(&mut edit, false, true),
+            "a worker starts"
+        );
+        assert!(edit.filter_preview.applying, "apply is under way");
+        assert!(wait(&mut app, &mut edit), "apply closes the dialog");
+        let session = app.session().unwrap();
+        assert_eq!(session.history.revision, revision + 1);
+        let applied = session.document.active().unwrap().pixels.clone().unwrap();
+        assert_eq!(
+            applied.dimensions(),
+            (2000, 1200),
+            "applied at full resolution"
+        );
+        assert!(
+            tiled(&applied, 8),
+            "and blocked at the panel's own eight, not the preview's six"
+        );
+        assert_eq!(
+            *applied,
+            mectov::dither::apply(&full, &settings),
+            "which is exactly what the filter makes of the layer itself"
         );
     }
 

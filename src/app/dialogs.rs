@@ -4,6 +4,7 @@ use std::{io::Cursor, sync::Arc};
 use anyhow::Context as _;
 use egui::{Color32, RichText, Stroke, vec2};
 use mectov::{
+    dither::{DitherColors, DitherSettings, DitherStyle, PixelShape},
     document::{Adjustment, Layer, LayerEffects, Point},
     effects::{self, Filter},
     io, operations,
@@ -965,6 +966,9 @@ impl EditorApp {
                                 )
                                 .changed();
                         }
+                        Filter::Dither { settings } => {
+                            changed |= dither_panel(ui, settings);
+                        }
                         Filter::CameraRaw {
                             settings,
                             temperature,
@@ -1311,6 +1315,103 @@ impl EditorApp {
             _ => {}
         }
     }
+}
+
+/// Filter > Dither. Compositor's panel, in its own order: the style, the pixels
+/// it draws, then the controls that style uses. Diffusion, ordered and mark
+/// styles have nothing in common but the tone and the colours, so a control that
+/// means nothing to the chosen style is left out rather than shown dead.
+fn dither_panel(ui: &mut egui::Ui, settings: &mut DitherSettings) -> bool {
+    let mut changed = false;
+    let style = settings.style;
+    egui::ComboBox::from_id_salt("dither_style")
+        .selected_text(style.name())
+        .show_ui(ui, |ui| {
+            for (heading, styles) in DitherStyle::GROUPS {
+                if let Some(heading) = heading {
+                    ui.separator();
+                    ui.label(RichText::new(heading).small().color(theme::MUTED));
+                }
+                for option in styles {
+                    changed |= ui
+                        .selectable_value(&mut settings.style, *option, option.name())
+                        .changed();
+                }
+            }
+        });
+    changed |= widget_row(ui, "Pixel size", &mut settings.pixel_size, 1.0..=32.0);
+    let mut shape = settings.pixel_shape;
+    ui.horizontal(|ui| {
+        ui.add_sized([105.0, 20.0], egui::Label::new("Pixel shape"));
+        for option in PixelShape::ALL {
+            changed |= ui
+                .selectable_value(&mut shape, option, option.name())
+                .changed();
+        }
+    });
+    if shape != settings.pixel_shape {
+        settings.pixel_shape = shape;
+        changed = true;
+    }
+
+    if style.diffuses() {
+        changed |= widget_row(ui, "Diffusion", &mut settings.diffusion, 0.0..=100.0);
+    }
+    if style.has_tones() {
+        changed |= widget_row(ui, "Levels", &mut settings.levels, 2.0..=8.0);
+    }
+    if style.is_halftone() {
+        changed |= widget_row(ui, "Cell size", &mut settings.cell_size, 4.0..=64.0);
+        changed |= widget_row(ui, "Angle", &mut settings.angle, -90.0..=90.0);
+    }
+    if style == DitherStyle::Ascii {
+        changed |= widget_row(ui, "Text size", &mut settings.text_size, 6.0..=64.0);
+        ui.horizontal(|ui| {
+            ui.add_sized([105.0, 20.0], egui::Label::new("Characters"));
+            let mut characters = settings.characters.clone();
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut characters).desired_width(ui.available_width()),
+            );
+            if response.changed() {
+                settings.characters = characters
+                    .chars()
+                    .filter(|c| !c.is_control())
+                    .take(64)
+                    .collect();
+                changed = true;
+            }
+        });
+    }
+    changed |= widget_row(ui, "Density", &mut settings.density, -100.0..=100.0);
+    changed |= widget_row(ui, "Contrast", &mut settings.contrast, -100.0..=100.0);
+
+    let mut colors = settings.colors;
+    ui.horizontal(|ui| {
+        ui.add_sized([105.0, 20.0], egui::Label::new("Colors"));
+        for option in DitherColors::ALL {
+            changed |= ui
+                .selectable_value(&mut colors, option, option.name())
+                .changed();
+        }
+    });
+    if colors != settings.colors {
+        settings.colors = colors;
+        changed = true;
+    }
+    if settings.colors == DitherColors::TwoColors {
+        ui.horizontal(|ui| {
+            ui.add_sized([105.0, 20.0], egui::Label::new("Dark / light"));
+            changed |= effect_color(ui, &mut settings.dark);
+            ui.label("/");
+            changed |= effect_color(ui, &mut settings.light);
+        });
+    }
+    // The mark styles stand for the light tones on the dark colour by default,
+    // which is glowing dots on a black screen; the tone styles ignore it.
+    if style.draws_marks() {
+        changed |= widgets::checkbox(ui, &mut settings.light_on_dark, "Light on dark").changed();
+    }
+    changed
 }
 
 fn effect_color(ui: &mut egui::Ui, color: &mut [f32; 3]) -> bool {
