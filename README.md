@@ -10,7 +10,7 @@ mectov started as my Rust port of [Compositor](https://github.com/robbietilton/C
 
 - Compose with layers, groups, masks, blend modes, editable text, shapes, and live layer effects.
 - Retouch with selections, brushes, smoothing, clone stamp, healing, filters, and adjustment layers.
-- Create standalone Vignette, Bloom / Glow, and Tonal Contrast filters alongside the core image filters.
+- Create standalone Vignette, Bloom / Glow, Tonal Contrast, and Dither filters alongside the core image filters.
 - Develop camera RAW files — Nikon NEF/NRW, Canon, Sony, Fujifilm, DNG and more — and return to their RAW settings at any time.
 - Save editable `.mectov` projects, import Compositor packages, SVG/SVGZ, and 8-bit RGB PSD/PSB, and export PNG, JPEG, TIFF, or WebP.
 
